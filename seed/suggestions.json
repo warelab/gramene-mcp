@@ -1,0 +1,51 @@
+[
+  {
+    "id": "s1", "category": "Species", "display_name": "Arabidopsis thaliana",
+    "fq_field": "taxonomy__ancestors", "fq_value": "3702",
+    "name": "Arabidopsis thaliana", "ids": ["arabidopsis_thaliana"],
+    "num_genes": 27655, "relevance": 1.0,
+    "taxon_id": [3702], "taxon_freq": [27655]
+  },
+  {
+    "id": "s2", "category": "Species", "display_name": "Zea mays",
+    "fq_field": "taxonomy__ancestors", "fq_value": "4577",
+    "name": "Zea mays", "ids": ["zea_mays"],
+    "num_genes": 46430, "relevance": 1.0,
+    "taxon_id": [4577], "taxon_freq": [46430]
+  },
+  {
+    "id": "s3", "category": "Species", "display_name": "Oryza sativa",
+    "fq_field": "taxonomy__ancestors", "fq_value": "39947",
+    "name": "Oryza sativa Japonica Group", "ids": ["oryza_sativa"],
+    "num_genes": 39049, "relevance": 1.0,
+    "taxon_id": [39947], "taxon_freq": [39049]
+  },
+  {
+    "id": "s4", "category": "GO", "display_name": "kinase activity",
+    "fq_field": "GO__ancestors", "fq_value": "16301",
+    "name": "kinase activity", "ids": ["GO:0016301"], "int_id": 16301,
+    "num_genes": 4200, "relevance": 0.8,
+    "taxon_id": [3702, 4577, 39947], "taxon_freq": [1200, 1800, 1200]
+  },
+  {
+    "id": "s5", "category": "GO", "display_name": "protein binding",
+    "fq_field": "GO__ancestors", "fq_value": "5515",
+    "name": "protein binding", "ids": ["GO:0005515"], "int_id": 5515,
+    "num_genes": 8900, "relevance": 0.9,
+    "taxon_id": [3702, 4577, 39947], "taxon_freq": [2500, 3800, 2600]
+  },
+  {
+    "id": "s6", "category": "PO", "display_name": "leaf",
+    "fq_field": "PO__ancestors", "fq_value": "9025",
+    "name": "leaf", "ids": ["PO:0025034"], "int_id": 9025,
+    "num_genes": 12000, "relevance": 0.7,
+    "taxon_id": [3702, 4577, 39947], "taxon_freq": [3500, 5000, 3500]
+  },
+  {
+    "id": "s7", "category": "Gene", "display_name": "NAC001",
+    "fq_field": "id", "fq_value": "AT1G01010",
+    "name": "NAC001", "ids": ["AT1G01010"], "synonym": ["NAC domain protein 1"],
+    "num_genes": 1, "relevance": 1.0,
+    "taxon_id": [3702], "taxon_freq": [1]
+  }
+]

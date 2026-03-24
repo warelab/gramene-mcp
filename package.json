@@ -1,4 +1,16 @@
 {
+  "name": "gramene-mcp",
+  "version": "0.3.0",
+  "description": "MCP server bridging Claude to Gramene Solr search and MongoDB",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "start:squam": "node --env-file=.env.squam server.mjs",
+    "dev": "node --watch server.mjs",
+    "dev:squam": "node --env-file=.env.squam --watch server.mjs",
+    "test": "node --test 'test/**/*.test.mjs'"
+  },
   "dependencies": {
     "mongodb": "^7.1.0"
   }

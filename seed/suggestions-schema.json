@@ -1,0 +1,23 @@
+{
+  "add-field": [
+    {"name": "category",     "type": "string",       "indexed": true,  "stored": true,  "required": true},
+    {"name": "display_name", "type": "string",       "indexed": false, "stored": true,  "required": true},
+    {"name": "fq_field",     "type": "string",       "indexed": false, "stored": true,  "required": true},
+    {"name": "fq_value",     "type": "string",       "indexed": false, "stored": true,  "required": true},
+    {"name": "num_genes",    "type": "pint",         "indexed": false, "stored": true,  "required": true},
+    {"name": "relevance",    "type": "pfloat",       "indexed": true,  "stored": true,  "required": true},
+    {"name": "int_id",       "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "subcategory",  "type": "string",       "indexed": false, "stored": true},
+    {"name": "taxon_id",     "type": "pint",         "indexed": true,  "stored": true,  "multiValued": true, "required": true},
+    {"name": "taxon_freq",   "type": "pint",         "indexed": false, "stored": true,  "multiValued": true, "required": true},
+    {"name": "name",         "type": "text_general", "indexed": true,  "stored": true},
+    {"name": "ids",          "type": "text_general", "indexed": true,  "stored": false, "multiValued": true},
+    {"name": "synonym",      "type": "text_general", "indexed": true,  "stored": false, "multiValued": true},
+    {"name": "text",         "type": "text_general", "indexed": true,  "stored": false, "multiValued": true},
+    {"name": "description",  "type": "text_general", "indexed": true,  "stored": false},
+    {"name": "def",          "type": "text_general", "indexed": true,  "stored": false},
+    {"name": "abstract",     "type": "text_general", "indexed": true,  "stored": false},
+    {"name": "comment",      "type": "text_general", "indexed": true,  "stored": false},
+    {"name": "xref",         "type": "string",       "indexed": true,  "stored": false, "multiValued": true}
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "add-field": [
+    {"name": "name",                    "type": "text_general", "indexed": true,  "stored": true},
+    {"name": "description",             "type": "text_general", "indexed": true,  "stored": true},
+    {"name": "summary",                 "type": "text_general", "indexed": true,  "stored": true},
+    {"name": "annotations",             "type": "text_general", "indexed": true,  "stored": true,  "multiValued": true},
+    {"name": "synonyms",                "type": "text_general", "indexed": true,  "stored": true,  "multiValued": true},
+    {"name": "biotype",                 "type": "string",       "indexed": true,  "stored": true},
+    {"name": "db_type",                 "type": "string",       "indexed": true,  "stored": true},
+    {"name": "system_name",             "type": "string",       "indexed": true,  "stored": true},
+    {"name": "region",                  "type": "string",       "indexed": true,  "stored": true},
+    {"name": "map",                     "type": "string",       "indexed": true,  "stored": true},
+    {"name": "gene_tree",               "type": "string",       "indexed": true,  "stored": true},
+    {"name": "pan_tree",                "type": "string",       "indexed": true,  "stored": true},
+    {"name": "taxon_id",                "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "start",                   "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "end",                     "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "strand",                  "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "compara_idx",             "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "compara_idx_multi",       "type": "pint",         "indexed": true,  "stored": true,  "multiValued": true,  "docValues": true},
+    {"name": "gene_idx",                "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "gene_idx_multi",          "type": "pint",         "indexed": true,  "stored": true,  "multiValued": true},
+    {"name": "gene_tree_root_taxon_id", "type": "pint",         "indexed": true,  "stored": true},
+    {"name": "pan_tree_root_taxon_id",  "type": "pint",         "indexed": true,  "stored": true}
+  ],
+  "add-dynamic-field": [
+    {"name": "compara_neighbors_*", "type": "pint", "indexed": true, "stored": true, "multiValued": true, "docValues": true},
+    {"name": "*__ancestors",        "type": "pint", "indexed": true, "stored": true, "multiValued": true, "docValues": true},
+    {"name": "homology__*",         "type": "string", "indexed": true, "stored": true, "multiValued": true},
+    {"name": "transcript__*",       "type": "pint",   "indexed": true, "stored": true}
+  ]
+}

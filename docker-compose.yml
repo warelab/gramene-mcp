@@ -1,0 +1,35 @@
+# Development environment for gramene-mcp
+# Usage:  ./seed/setup-test-env.sh       # start + seed everything
+#         ./seed/setup-test-env.sh --down # tear down
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+      - ./seed/mongo-init.js:/docker-entrypoint-initdb.d/init.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ping:1})", "--quiet"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  solr:
+    image: solr:9
+    ports:
+      - "8983:8983"
+    volumes:
+      - solr-data:/var/solr
+      - ./seed:/opt/seed:ro
+    command: ["solr-precreate", "genes"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8983/solr/admin/cores?action=STATUS || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+volumes:
+  mongo-data:
+  solr-data:
