@@ -9,6 +9,7 @@ import { MongoClient } from "mongodb";
  *   MCP_PORT             Listen port             (default: 8787)
  *   MCP_ALLOWED_ORIGINS  Comma-separated origins (default: localhost only)
  *   MCP_MAX_BODY_BYTES   Max request body size   (default: 1048576 / 1 MB)
+ *   MCP_LOG              Set to "false" to disable JSON logging to stderr  (default: true)
  *
  *   SOLR_BASE_URL        Solr base URL           (default: http://localhost:8983/solr)
  *   SOLR_GENES_CORE      Solr genes core name    (default: genes)
@@ -36,6 +37,14 @@ const ALLOWED_ORIGINS = new Set(
     .filter(Boolean)
 );
 const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.has("*");
+
+// --- Logging ---
+// Writes a single JSON line to stderr. Set MCP_LOG=false to suppress.
+const LOGGING_ENABLED = process.env.MCP_LOG !== "false";
+function log(event) {
+  if (!LOGGING_ENABLED) return;
+  process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
+}
 
 // --- Mongo ---
 // MongoClient v5+ auto-connects on first operation; no manual connect needed.
@@ -884,14 +893,20 @@ async function handleJsonRpc(msg) {
     }
 
     const entry = TOOL_REGISTRY[name];
-    if (!entry) return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
+    if (!entry) {
+      log({ event: "tool_call", tool: name, status: "unknown_tool" });
+      return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
+    }
 
+    const t0 = Date.now();
     try {
       const result = await entry.handler(toolArgs);
+      log({ event: "tool_call", tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0 });
       return jsonRpcResult(id, {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       });
     } catch (e) {
+      log({ event: "tool_call", tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0 });
       return jsonRpcError(id, -32000, `Tool error: ${e?.message || String(e)}`);
     }
   }
