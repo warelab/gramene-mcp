@@ -35,6 +35,7 @@ const ALLOWED_ORIGINS = new Set(
     .map((s) => s.trim())
     .filter(Boolean)
 );
+const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.has("*");
 
 // --- Mongo ---
 // MongoClient v5+ auto-connects on first operation; no manual connect needed.
@@ -92,6 +93,7 @@ const LOCALHOST_PATTERNS = [
 function originAllowed(req) {
   const origin = req.headers.origin;
   if (!origin) return true;                      // no Origin header → allow
+  if (ALLOW_ALL_ORIGINS) return true;            // MCP_ALLOWED_ORIGINS=* → allow all
   if (ALLOWED_ORIGINS.size > 0) return ALLOWED_ORIGINS.has(origin);
   return LOCALHOST_PATTERNS.some((p) => origin.startsWith(p));
 }
