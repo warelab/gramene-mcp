@@ -55,11 +55,31 @@ which fields or collections are relevant to a question.
 **Use for:** Translating a gene name, gene ID, pathway name, species name, or
 ontology term into a Solr filter query (`fq_field` + `fq_value`).
 
-Pass `term` for a simple lookup. Each result document contains:
+Each result document contains:
 - `display_name` — human-readable label
-- `fq_field` — the Solr field to filter on (e.g., `gene_tree`, `taxonomy__ancestors`, `GO__ancestors`)
-- `fq_value` — the value to match (e.g., a gene tree ID or integer ontology ID)
+- `fq_field` — the Solr field to filter on (e.g., `gene_tree`, `taxonomy__ancestors`, `pathways__ancestors`, `GO__ancestors`)
+- `fq_value` — the value to match (an integer ID or string)
 - `num_genes` — how many genes match this filter
+
+**Two modes:**
+
+- `term: "lipoxygenase"` — builds a boosted full-text query across name, IDs,
+  synonyms, and text. Best for gene names, protein families, and ontology terms
+  where you want ranked fuzzy matching. Results are ranked by relevance, so
+  InterPro and GO terms tend to dominate the top results.
+
+- `q: 'name:"Jasmonic acid biosynthesis"'` — raw Solr query for **exact name
+  lookups**. Use this for **pathways and species**, which rarely surface at the
+  top of a `term` search due to ranking competition from InterPro/GO entries.
+
+**Critical pattern — genes in a pathway for a species:**
+```
+1. solr_suggest(q='name:"<pathway name>"')   → fq_field=pathways__ancestors, fq_value=<N>
+2. solr_suggest(q='name:"<species name>"')   → fq_field=taxonomy__ancestors,  fq_value=<M>
+3. solr_search(fq=["pathways__ancestors:<N>", "taxonomy__ancestors:<M>"])
+```
+This is more precise than description-based or GO-based searches because it uses
+curated Plant Reactome annotations.
 
 **Example:** To find all sorghum genes in the lipoxygenase family, call
 `solr_suggest` with `term: "lipoxygenase"`, pick the gene-tree result, then use
@@ -248,7 +268,33 @@ solr_suggest(term: "drought tolerance")
 solr_search_bool(filter: AND[ taxon, fq_field:fq_value ], fl: "id,name,gene_tree")
 ```
 
-### 2. Explore a gene family across species
+### 2. Find pathway genes in a species (with optional tissue expression filter)
+
+Use exact name queries (`q=`) for pathways and species — `term=` will be
+dominated by InterPro/GO results and may not surface Reactome entries.
+
+```
+# Step 1 — resolve the pathway
+solr_suggest(q='name:"Jasmonic acid biosynthesis"')
+  → fq_field=pathways__ancestors, fq_value=1119332
+
+# Step 2 — resolve the species (use taxonomy__ancestors for all accessions)
+solr_suggest(q='name:"Sorghum bicolor"')
+  → fq_field=taxonomy__ancestors, fq_value=4558
+
+# Step 3 — fetch genes
+solr_search(fq=["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+            fl="id,name,description,biotype")
+
+# Step 4 (optional) — filter by tissue expression
+expression_for_genes(gene_ids=[...], po_terms=[9051])   # 9051 = spikelet
+  → rank by baseline TPM in tissue of interest
+```
+
+Plant Reactome pathway annotations are more precise than GO or description-based
+searches: they capture the specific enzymatic steps curated for that pathway.
+
+### 3. Explore a gene family across species
 ```
 solr_suggest(term: "lipoxygenase")
   → get gene tree fq_field/fq_value
