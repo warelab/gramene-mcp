@@ -257,18 +257,50 @@ const KB_RELATIONS = {
           dynamicField: true,
           description: "IDs of the ±N flanking genes (e.g. compara_neighbors_10). Values are compara_idx_multi values of neighbors. Use as the 'from' field in {!graph} traversals"
         },
-        gene_tree: {
-          type: "string",
-          description: "Gene tree identifier; use as seed query for graph traversal, e.g. gene_tree:SB10GT_332720"
-        },
         pan_tree: {
           type: "string",
           description: "Pan-gene tree identifier"
         },
+        // Homology fields (Ensembl Compara classification)
+        // 'homologs' = all genes in the same gene tree → use gene_tree field
+        // 'orthologs' = subset of homologs separated by speciation events
+        // 'paralogs'  = subset of homologs separated by duplication events
+        gene_tree: {
+          type: "string",
+          description: "Gene family tree stable ID (e.g. SB10GT_332720). All genes sharing this ID are homologs (orthologs + paralogs). Use gene_tree:<id> to retrieve the full homolog set."
+        },
+        gene_tree_root_taxon_id: {
+          type: "pint",
+          description: "NCBI taxon ID of the root node of the gene family tree. Indicates the deepest clade covered by this homolog set."
+        },
+        homology__all_orthologs: {
+          type: "string[]",
+          description: "Union of all ortholog types across all species — genes inferred to descend from the same ancestral gene via speciation (not duplication). Use this field when any ortholog is acceptable regardless of duplication history."
+        },
+        homology__ortholog_one2one: {
+          type: "string[]",
+          description: "Highest-confidence orthologs: strict 1:1 relationship — exactly one gene in each species. Implies no lineage-specific duplications since the speciation event. Preferred for cross-species functional inference (e.g. homology__ortholog_one2one:SORBI_3006G095600)."
+        },
+        homology__ortholog_one2many: {
+          type: "string[]",
+          description: "1:many orthologs — one gene in this species, multiple orthologs in the target species (duplication occurred in the target lineage after speciation). Lower confidence for 1:1 functional equivalence."
+        },
+        homology__ortholog_many2many: {
+          type: "string[]",
+          description: "Many:many orthologs — duplications occurred in both lineages after speciation. Lowest-confidence ortholog type; may include functional divergence."
+        },
+        homology__within_species_paralog: {
+          type: "string[]",
+          description: "Intra-species paralogs — genes in the same species that diverged by gene duplication. Use to find paralogous gene families within a genome."
+        },
+        homology__gene_split: {
+          type: "string[]",
+          description: "Gene-split pairs — two gene models that together represent one ancestral gene, typically due to assembly fragmentation. The split partners share a gene tree and are listed here."
+        },
         "homology__*": {
           type: "string[]",
           dynamicField: true,
-          description: "Homology relationships, e.g. homology__oryza_sativa"
+          description: "Other dynamic homology relationship fields following the homology__<type> pattern. The specific fields above cover all types currently populated in Gramene."
         },
         system_name: {
           type: "string",
@@ -314,7 +346,7 @@ const KB_RELATIONS = {
       pathways: { key: "_id", type: "int", labelField: "name",
         description: "Pathway definitions." },
       genes: { key: "_id", type: "string", labelField: "name",
-        description: "Gene metadata. _id = gene stable ID. Has location {region, start, end, strand, map}, xrefs, biotype, taxon_id, system_name, gene_idx." },
+        description: "Gene metadata. _id = gene stable ID. Has location {region, start, end, strand, map}, xrefs, biotype, taxon_id, system_name, gene_idx. Homology subdocument: homology.gene_tree = {id, representative: {closest: {id, description, percent_identity, taxon_id}, model: {...}}, root_taxon_id}. Homology.homologous_genes mirrors the Solr homology__* fields keyed by relationship type (ortholog_one2one, ortholog_one2many, ortholog_many2many, within_species_paralog, gene_split), each containing an array of {id, system_name, ...} objects." },
       genetree: { key: "_id", type: "string",
         description: "Compara gene trees. _id = tree stable ID (e.g. SB10GT_332720). Hierarchical node structure with taxon_id, node_type, children." },
       qtls: { key: "_id", type: "string",

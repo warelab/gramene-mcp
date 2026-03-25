@@ -303,7 +303,78 @@ solr_search_bool(filter: { term: { field: "gene_tree", value: <id> } },
   → list all species members
 ```
 
-### 4. Presence/Absence Variation (PAV) and Copy Number Variation (CNV)
+### 4. Querying orthologs, paralogs, and homologs
+
+**Terminology (Ensembl Compara):**
+- **Homologs** = all genes in the same gene family tree (orthologs + paralogs + gene splits).
+  Query with `gene_tree:<id>` — returns the complete gene family.
+- **Orthologs** = homologs separated by a *speciation* event (different species).
+  Use `homology__all_orthologs` for any ortholog, or typed fields for specific confidence levels.
+- **Paralogs** = homologs separated by a *duplication* event (same or different species).
+  Use `homology__within_species_paralog` for intra-genome paralogs.
+
+**Solr fields for homology queries:**
+
+| Field | Relationship | Confidence |
+|-------|-------------|------------|
+| `gene_tree:<id>` | All homologs (full gene family) | — |
+| `homology__all_orthologs` | All orthologs across all species | — |
+| `homology__ortholog_one2one` | Strict 1:1 orthologs | Highest |
+| `homology__ortholog_one2many` | 1:many — duplicated in target | Medium |
+| `homology__ortholog_many2many` | Many:many — duplicated in both | Lower |
+| `homology__within_species_paralog` | Intra-species paralogs | — |
+| `homology__gene_split` | Assembly-fragmented gene pairs | — |
+
+**Examples:**
+
+```
+# Find all sorghum genes that are 1:1 orthologs of a rice gene
+solr_search(q="homology__ortholog_one2one:Os04g0447100",
+            fq=["taxonomy__ancestors:4558"])
+
+# Get all orthologs of a sorghum gene (any type, any species)
+solr_search(q="id:SORBI_3006G095600", fl="id,gene_tree,homology__all_orthologs")
+  → use gene_tree ID to retrieve all homologs, or all_orthologs list for orthologs only
+
+# Get all members of a gene family across all species
+solr_search(q="gene_tree:SB10GT_332720", fl="id,name,system_name", rows=200)
+
+# Find species-specific orthologs (combine ortholog field with taxonomy filter)
+solr_search(q="gene_tree:<tree_id>",
+            fq=["taxonomy__ancestors:39947"],   # 39947 = Oryza sativa
+            fl="id,name,system_name,homology__ortholog_one2one")
+
+# Get paralogs within sorghum
+solr_search(q="homology__within_species_paralog:SORBI_3006G095600",
+            fq=["taxonomy__ancestors:4558"])
+```
+
+**Recommendation:** Use `homology__ortholog_one2one` when you need high-confidence
+functional equivalents for cross-species inference. Use `gene_tree:<id>` when you
+want the full gene family including all paralogs.
+
+**MongoDB homology structure** (from `mongo_find` on the `genes` collection):
+```json
+{
+  "homology": {
+    "gene_tree": {
+      "id": "SB10GT_332720",
+      "root_taxon_id": 33090,
+      "representative": {
+        "closest": { "id": "Os04g0447100", "percent_identity": 78.4, "taxon_id": 39947 },
+        "model":   { "id": "AT1G17420",   "percent_identity": 65.1, "taxon_id": 3702 }
+      }
+    },
+    "homologous_genes": {
+      "ortholog_one2one":  [ { "id": "Os04g0447100", "system_name": "oryza_sativa_japonica", ... } ],
+      "ortholog_one2many": [ ... ],
+      "within_species_paralog": [ ... ]
+    }
+  }
+}
+```
+
+### 5. Presence/Absence Variation (PAV) and Copy Number Variation (CNV)
 
 Use Solr faceting on `system_name` to count how many gene copies exist per
 genome assembly. This reveals whether a gene is present in all, some, or none
@@ -315,9 +386,9 @@ list of genomes that should have homology data — use this as the denominator
 when interpreting absence.
 
 ```
-# Step 1 — find a rice ortholog for the sorghum query gene
-solr_search(q="id:SORBI_3006G095600", fl="id,gene_tree,homology__oryza_sativa")
-  → get gene_tree id and/or the rice ortholog id from homology__oryza_sativa
+# Step 1 — get the gene tree and a rice ortholog for the sorghum query gene
+solr_search(q="id:SORBI_3006G095600", fl="id,gene_tree,homology__ortholog_one2one")
+  → get gene_tree id; homology__ortholog_one2one lists 1:1 orthologs (use for rice if present)
 
 # Step 2 — find which genomes were in the Compara analysis
 mongo_find(collection: "maps", filter: { in_compara: true },
@@ -350,7 +421,7 @@ family × genome assembly — in one round-trip.
 ```
 # Step 1 — get the gene tree of the query gene (and optionally a rice ortholog)
 solr_search(q="id:SORBI_3006G095600",
-            fl="id,gene_tree,system_name,homology__oryza_sativa")
+            fl="id,gene_tree,system_name,homology__ortholog_one2one")
 
 # Step 2 — single graph+pivot query across all sorghum genomes
 solr_search(
@@ -435,10 +506,15 @@ Score each gene on:
 
 ### 7. Cross-species comparison for a gene of interest
 ```
-solr_search(q: "id:<gene_id>", fl: "gene_tree,compara_idx_multi")
+# Get the gene's tree and its 1:1 orthologs (highest confidence)
+solr_search(q="id:<gene_id>", fl="id,gene_tree,homology__ortholog_one2one,compara_idx_multi")
+  → homology__ortholog_one2one lists direct 1:1 orthologs across all species
+
+# Or retrieve the full ortholog set via graph traversal (includes all types)
 solr_graph(from: "compara_neighbors_10", to: "compara_idx_multi",
-           seed_q: "id:<gene_id>", fl: "id,name,system_name")
-  → collect orthologs
+           seed_q: "gene_tree:<tree_id>", fl: "id,name,system_name")
+  → collect all homologs/orthologs
+
 expression_for_genes(gene_ids: <orthologs>, experiment_type: "Baseline")
   → compare tissue expression profiles across species
 ```
@@ -472,10 +548,11 @@ mongo_lookup_by_ids(collection: "pathways", ids: <pathway IDs>)
   for many genes across many experiments. Use `po_terms` and `experiment_type`
   filters to keep responses focused on the biologically relevant subset.
 
-- **Dynamic Solr fields:** Fields matching `compara_neighbors_*`,
-  `*__ancestors`, and `homology__*` are dynamic patterns. The specific
-  instantiation (e.g., `compara_neighbors_10`) refers to ±10 flanking genes.
-  Use `kb_relations` to see the full dynamic field documentation.
+- **Dynamic Solr fields:** Fields matching `compara_neighbors_*` and
+  `*__ancestors` are dynamic patterns. `compara_neighbors_10` = ±10 flanking genes.
+  Homology fields (`homology__ortholog_one2one`, `homology__all_orthologs`, etc.)
+  are keyed by **relationship type** (not by species). Use `kb_relations` to see
+  the full field documentation including all supported homology types.
 
 - **QTL intervals from the database** are in `qtls` collection and link TO
   terms via the `terms` array (string IDs like `"TO:0000396"`). Convert to
