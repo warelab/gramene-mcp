@@ -189,6 +189,40 @@ Key parameters:
 
 ---
 
+### `vep_for_gene`
+**Use for:** Finding germplasm accessions that carry predicted loss-of-function
+(LOF) alleles in a gene of interest, based on Ensembl VEP annotations.
+
+Key parameters:
+- `gene_ids` — list of gene stable IDs (max 50)
+- `include_germplasm_details` — set `false` for counts only; `true` (default)
+  enriches each accession with `pub_id`, `stock_center`, `subpopulation`, and
+  a genebank URL if available
+
+**What the result contains:**
+- `summary.total_lof_accessions` — total unique accessions with any LOF allele
+- `summary.ems_accessions` — EMS mutagenesis knockout lines (intentional)
+- `summary.nat_accessions` — natural diversity accessions (selection-relevant)
+- `groups[]` — per-consequence / per-study breakdown with full accession list
+
+**VEP consequence types (high-impact):**
+- `stop gained` — premature stop codon (likely null allele)
+- `splice acceptor variant` — disrupts splice site (likely frameshift/skipping)
+- `splice donor variant` — disrupts donor splice site
+- `frameshift variant` — insertion/deletion causing reading frame shift
+- `start lost` — loss of start codon
+
+**Study types:**
+- `EMS` — ethyl-methanesulfonate chemical mutagenesis (induced knockouts)
+- `NAT` — natural accessions (1001 Genomes, SAP, landrace collections, etc.)
+
+**Interpreting results for research:**
+- EMS homozygous stop-gained → confirmed null allele, suitable for phenotyping
+- NAT heterozygous → segregating natural LOF, useful for GWAS/association
+- `genebank_url` → direct link to order seed from stock center (ARS-GRIN, IRRI, ICRISAT)
+
+---
+
 ### `mongo_find`
 **Use for:** Looking up documents from any MongoDB collection by filter,
 including ontology term lookups, QTL records, assay metadata, gene metadata,
@@ -525,6 +559,56 @@ solr_search(q: "gene_tree:<id>", fl: "id,pathways__ancestors", rows: 200)
   → collect all pathway ancestor IDs across members
 mongo_lookup_by_ids(collection: "pathways", ids: <pathway IDs>)
   → list pathway names and identify enrichment
+```
+
+### 9. Find germplasm with predicted loss-of-function alleles in a gene
+
+The `vep_for_gene` tool retrieves all VEP__ Solr dynamic fields for a gene and
+decodes the study/consequence/zygosity metadata embedded in the field name. It
+also enriches accession IDs with germplasm metadata from MongoDB.
+
+```
+# Direct query for a known gene
+vep_for_gene(gene_ids=["SORBI_3006G095600"])
+
+# Response structure:
+# genes.SORBI_3006G095600.summary:
+#   total_lof_accessions: 937
+#   ems_accessions: 5        ← EMS knockout lines
+#   nat_accessions: 935      ← natural accessions
+#
+# genes.SORBI_3006G095600.groups[]:
+# [
+#   { consequence: "splice acceptor variant", zygosity: "heterozygous",
+#     species: "sorghum_bicolor", study_label: "USDA Lubbock EMS",
+#     study_type: "EMS", count: 2,
+#     accessions: [{ ens_id: "ARS97", pub_id: "ARS97",
+#                    stock_center: "ARS",
+#                    genebank_url: "https://npgsweb.ars-grin.gov/..." }] },
+#   { consequence: "stop gained", zygosity: "homozygous",
+#     study_label: "Sorghum Genomics Toolbox", study_type: "NAT", count: 928,
+#     accessions: [...] }
+# ]
+```
+
+**Typical research questions:**
+- "Are there knockout lines for gene X?" → check `ems_accessions` and filter
+  groups where `study_type=EMS` and `zygosity=homozygous`
+- "Which natural populations carry LOF alleles?" → filter `study_type=NAT`
+- "Can I order seed?" → check `genebank_url` in accession entries for ARS-GRIN,
+  IRRI, ICRISAT links
+
+**Combining with expression and pathway data:**
+```
+# 1. Find genes in a pathway
+solr_search(fq=["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+            fl="id,name")
+
+# 2. For candidate genes, get LOF germplasm
+vep_for_gene(gene_ids=["SORBI_3006G095600", "SORBI_3007G151100", ...])
+
+# 3. Prioritize genes with EMS homozygous knockouts + high tissue expression
+expression_for_genes(gene_ids=[...], po_terms=[9051])  # 9051=spikelet
 ```
 
 ---

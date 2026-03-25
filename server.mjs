@@ -313,6 +313,22 @@ const KB_RELATIONS = {
         capabilities: {
           type: "string[]",
           description: "Data types available for this gene. Values include: 'expression' (RNA-seq data in the expression collection), 'pathways' (Plant Reactome annotation), 'homology' (Compara gene trees), 'pubs' (literature), 'regulation' (regulatory features), 'variation' (genetic variants). Use as a filter to restrict to genes with specific data: fq=['capabilities:expression']."
+        },
+        // VEP (Variant Effect Prediction) loss-of-function fields
+        // Field name encoding: VEP__{consequence}__{zygosity}__{species}__{study_id}__attr_ss
+        // Merged totals:       VEP__merged__{EMS|NAT}__attr_ss
+        "VEP__*__attr_ss": {
+          type: "string[]",
+          dynamicField: true,
+          description: "Ensembl VEP predicted loss-of-function alleles. Each field name encodes the consequence (e.g. stop_gained, splice_acceptor_variant), zygosity (het/homo), species (e.g. sorghum_bicolor), and study_id. Values are germplasm ens_id strings. Use the vep_for_gene tool to retrieve and decode these fields with full germplasm metadata."
+        },
+        "VEP__merged__EMS__attr_ss": {
+          type: "string[]",
+          description: "Union of all EMS (ethyl-methanesulfonate) mutagenesis germplasm with any LOF allele in this gene. Useful for counting total EMS knockout lines."
+        },
+        "VEP__merged__NAT__attr_ss": {
+          type: "string[]",
+          description: "Union of all natural diversity germplasm with any LOF allele in this gene. Useful for counting total natural accessions with LOF variants."
         }
       }
     },
@@ -359,6 +375,8 @@ const KB_RELATIONS = {
         description: "Expression values per gene. _id = gene stable ID. Dynamic keys are experiment accessions; values are arrays of {group, value} (Baseline: TPM/FPKM) or {group, l2fc, p_value} (Differential). Use expression_for_genes tool to join with assay/experiment metadata." },
       maps: { key: "_id", type: "string",
         description: "Genome assembly metadata. _id = assembly map name (e.g. GCA_000003195.3), matching the 'map' field in the Solr genes core. Key field: in_compara (boolean) — true if this genome was included in the Compara gene tree analysis and therefore has homology/PAV data. Use this to distinguish genomes with homology info from those without before interpreting PAV/CNV facet results." },
+      germplasm: { key: "_id", type: "string",
+        description: "Germplasm accession metadata. _id = germplasm ens_id (e.g. 'SGT_PI514460', 'ARS105') matching values in VEP__* Solr fields. Fields: pub_id (public accession name/ID), stock_center (genebank code: ARS, IRRI, ICRISAT, sorbmutdb, NCBI, etc.), germplasm_dbid (numeric ID for stock center hyperlink), subpop (subpopulation classification), pop_id (study ID matching VEP field name). Used by vep_for_gene to enrich germplasm IDs with links and metadata." },
     }
   }
 };
@@ -659,6 +677,193 @@ async function tool_expression_for_genes(args) {
     experiment_count: experiments.length,
     genes,
   };
+}
+
+// --- VEP (Variant Effect Prediction) tool ---
+
+// Study/population metadata keyed by species → study_id
+// Derived from Gramene/SorghumBase front-end VEP.js
+const VEP_STUDY_INFO = {
+  sorghum_bicolor: {
+    "1": { label: "Purdue EMS",              type: "EMS" },
+    "2": { label: "USDA Lubbock EMS",        type: "EMS" },
+    "3": { label: "Lozano",                  type: "NAT" },
+    "4": { label: "USDA Lubbock EMS",        type: "EMS" },
+    "5": { label: "Boatwright SAP",          type: "NAT" },
+    "7": { label: "Kumar BAP",               type: "NAT" },
+    "8": { label: "Lasky landraces",         type: "NAT" },
+    "9": { label: "Sorghum Genomics Toolbox",type: "NAT" },
+  },
+  zea_maysb73: {
+    "15": { label: "MaizeGDB 2024",          type: "NAT" },
+  },
+  oryza_sativa: {
+    "7":  { label: "Rice 3K",                type: "NAT" },
+    "20": { label: "19K-RGP",               type: "NAT" },
+    "29": { label: "Rice USDA mini core",    type: "NAT" },
+    "38": { label: "RAPDB 2024",             type: "NAT" },
+  },
+  oryza_aus:           { "20": { label: "19K-RGP", type: "NAT" } },
+  oryza_sativa117425:  { "20": { label: "19K-RGP", type: "NAT" } },
+  oryza_sativair64rs2: { "20": { label: "19K-RGP", type: "NAT" } },
+  oryza_sativamh63:    { "20": { label: "19K-RGP", type: "NAT" } },
+};
+
+// Stock-center genebank URL templates
+const VEP_GENEBANK_URLS = {
+  ARS:      "https://npgsweb.ars-grin.gov/gringlobal/accessiondetail.aspx?id=",
+  IRRI:     "https://www.irri.org/genesys-rice#/a/",
+  xIRRI:    "https://gringlobal.irri.org/gringlobal/accessiondetail?id=",
+  ICRISAT:  "https://genebank.icrisat.org/IND/PassportSummary?ID=",
+  sorbmutdb:"https://www.depts.ttu.edu/igcast/sorbmutdb.php",
+  maizeGDB: "https://wgs.maizegdb.org/",
+  NCBI:     "https://www.ncbi.nlm.nih.gov/biosample/?term=",
+};
+
+/**
+ * Parse a VEP__ Solr dynamic field name into its semantic parts.
+ * Returns null for unknown/malformed names.
+ * Regular:  VEP__{consequence}__{zygosity}__{species}__{study_id}__attr_ss
+ * Merged:   VEP__merged__{type}__attr_ss
+ */
+function parseVepFieldName(fieldName) {
+  if (!fieldName.startsWith("VEP__")) return null;
+  const parts = fieldName.split("__");
+  // parts[0] = "VEP", last = "attr_ss"
+  if (parts[1] === "merged") {
+    // VEP__merged__{EMS|NAT}__attr_ss
+    return { merged: true, type: parts[2] };
+  }
+  if (parts.length >= 6) {
+    const [, consequence, zygosity, species, study_id] = parts;
+    const studyMap = VEP_STUDY_INFO[species] || {};
+    const studyInfo = studyMap[study_id] || { label: `Study ${study_id}`, type: "unknown" };
+    return {
+      merged: false,
+      consequence: consequence.replaceAll("_", " "),
+      zygosity: zygosity === "het" ? "heterozygous" : "homozygous",
+      species,
+      study_id,
+      study_label: studyInfo.label,
+      study_type: studyInfo.type,
+    };
+  }
+  return null;
+}
+
+async function tool_vep_for_gene(args) {
+  const { gene_ids, include_germplasm_details = true } = args || {};
+  if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
+    throw new Error("vep_for_gene requires a non-empty 'gene_ids' array");
+  }
+  if (gene_ids.length > 50) {
+    throw new Error("vep_for_gene: max 50 gene_ids per call");
+  }
+
+  // 1. Fetch VEP__ dynamic fields from Solr
+  const q = gene_ids.length === 1
+    ? `id:${gene_ids[0]}`
+    : `id:(${gene_ids.join(" OR ")})`;
+  const solrResp = await solrFetch(SOLR_GENES_CORE, "select", {
+    q,
+    fl: "id,VEP__*",
+    rows: gene_ids.length,
+  });
+
+  const solrDocs = solrResp?.response?.docs ?? [];
+
+  // 2. Collect all germplasm ens_ids across all genes (for MongoDB lookup)
+  const allEnsIds = new Set();
+  for (const doc of solrDocs) {
+    for (const [field, values] of Object.entries(doc)) {
+      if (field.startsWith("VEP__") && Array.isArray(values)) {
+        values.forEach((v) => allEnsIds.add(v));
+      }
+    }
+  }
+
+  // 3. Look up germplasm metadata from MongoDB (if any IDs found)
+  let germplasmMap = {};  // ens_id → germplasm doc
+  if (allEnsIds.size > 0 && include_germplasm_details) {
+    const d = db();
+    const germDocs = await d.collection("germplasm")
+      .find({ _id: { $in: [...allEnsIds] } })
+      .toArray();
+    for (const g of germDocs) {
+      germplasmMap[g._id] = g;
+    }
+  }
+
+  // 4. Build structured result per gene
+  const result = {};
+  for (const doc of solrDocs) {
+    const geneId = doc.id;
+    const groups = [];
+    let emsTotal = 0, natTotal = 0;
+
+    for (const [field, values] of Object.entries(doc)) {
+      if (!field.startsWith("VEP__") || !Array.isArray(values)) continue;
+      const parsed = parseVepFieldName(field);
+      if (!parsed) continue;
+
+      if (parsed.merged) {
+        // Merged totals for summary
+        if (parsed.type === "EMS") emsTotal = values.length;
+        else if (parsed.type === "NAT") natTotal = values.length;
+        continue;
+      }
+
+      // Enrich with germplasm metadata when available
+      const accessions = values.map((ens_id) => {
+        const g = germplasmMap[ens_id];
+        if (!g) return { ens_id };
+        const entry = { ens_id, pub_id: g.pub_id, stock_center: g.stock_center };
+        if (g.germplasm_dbid && g.germplasm_dbid !== "0") {
+          const url = VEP_GENEBANK_URLS[g.stock_center];
+          if (url) entry.genebank_url = `${url}${g.germplasm_dbid}`;
+        }
+        if (g.subpop && g.subpop !== "?") entry.subpopulation = g.subpop;
+        return entry;
+      });
+
+      groups.push({
+        consequence:  parsed.consequence,
+        zygosity:     parsed.zygosity,
+        species:      parsed.species,
+        study_label:  parsed.study_label,
+        study_type:   parsed.study_type,
+        count:        accessions.length,
+        accessions,
+      });
+    }
+
+    // Sort groups: EMS first, then by consequence, then zygosity
+    groups.sort((a, b) => {
+      const typeOrd = (a.study_type === "EMS" ? 0 : 1) - (b.study_type === "EMS" ? 0 : 1);
+      if (typeOrd !== 0) return typeOrd;
+      return a.consequence.localeCompare(b.consequence) || a.zygosity.localeCompare(b.zygosity);
+    });
+
+    result[geneId] = {
+      summary: {
+        total_lof_accessions: emsTotal + natTotal,
+        ems_accessions: emsTotal,
+        nat_accessions: natTotal,
+        group_count: groups.length,
+        germplasm_metadata_available: Object.keys(germplasmMap).length > 0,
+      },
+      groups,
+    };
+  }
+
+  // Note any requested genes with no VEP data
+  for (const gid of gene_ids) {
+    if (!result[gid]) {
+      result[gid] = { summary: { total_lof_accessions: 0, note: "no VEP data in index" }, groups: [] };
+    }
+  }
+
+  return { gene_count: Object.keys(result).length, genes: result };
 }
 
 async function tool_solr_search(args) {
@@ -1085,6 +1290,49 @@ const TOOL_REGISTRY = {
       },
     },
     handler: tool_expression_for_genes,
+  },
+
+  vep_for_gene: {
+    definition: {
+      name: "vep_for_gene",
+      description: [
+        `Retrieve predicted loss-of-function (LOF) germplasm alleles for one or more genes.`,
+        ``,
+        `Uses Ensembl VEP (Variant Effect Prediction) annotations indexed in Solr dynamic`,
+        `fields (VEP__*). For each gene, returns germplasm accessions that carry predicted`,
+        `high-impact variants grouped by:`,
+        `  - VEP consequence (e.g. 'stop gained', 'splice acceptor variant')`,
+        `  - Zygosity (homozygous / heterozygous)`,
+        `  - Study/population (e.g. 'Sorghum Genomics Toolbox', 'Boatwright SAP', 'Purdue EMS')`,
+        `  - Study type (EMS = ethyl-methanesulfonate mutagenesis; NAT = natural diversity)`,
+        ``,
+        `Also returns the merged EMS and NAT totals from VEP__merged__EMS/NAT__attr_ss.`,
+        ``,
+        `Germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) is enriched`,
+        `from the MongoDB 'germplasm' collection when available.`,
+        ``,
+        `Use cases:`,
+        `  - "Which accessions have a predicted stop-gained in SORBI_3006G095600?"`,
+        `  - "Are there EMS knockout lines for this gene?"`,
+        `  - "Find natural accessions with a LOF allele in this gene for association studies"`,
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          gene_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Gene stable IDs to query (max 50). E.g. ['SORBI_3006G095600'].",
+          },
+          include_germplasm_details: {
+            type: "boolean",
+            description: "Whether to enrich accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from MongoDB. Default true. Set false for a count-only summary.",
+          },
+        },
+        required: ["gene_ids"],
+      },
+    },
+    handler: tool_vep_for_gene,
   },
 };
 

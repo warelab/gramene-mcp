@@ -743,3 +743,110 @@ describe("solr_search — facet pivot", () => {
     }
   });
 });
+
+// ─── vep_for_gene ─────────────────────────────────────────────────────
+
+describe("vep_for_gene — tool registration", () => {
+  it("vep_for_gene appears in tools/list", async () => {
+    const res = await rpc("tools/list");
+    const tools = res.result?.tools ?? [];
+    const vepTool = tools.find((t) => t.name === "vep_for_gene");
+    assert.ok(vepTool, "Expected vep_for_gene in tools/list");
+    assert.ok(typeof vepTool.description === "string" && vepTool.description.length > 10,
+      "Expected non-empty description");
+  });
+
+  it("vep_for_gene requires gene_ids param", async () => {
+    const res = await rpc("tools/call", { name: "vep_for_gene", arguments: {} });
+    // Should return an error (either tool-level or JSON-RPC)
+    const hasError = res.error != null
+      || res.result?.content?.[0]?.text?.includes("requires")
+      || res.result?.isError === true;
+    assert.ok(hasError, "Expected an error when gene_ids is missing");
+  });
+});
+
+describe("vep_for_gene — live data (SORBI_3006G095600)", () => {
+  it("returns a result object with expected structure", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId] },
+    });
+    const data = toolResult(res);
+    assert.ok(data, "Expected a result");
+    assert.ok(data.gene_count >= 1, "Expected gene_count >= 1");
+    assert.ok(data.genes, "Expected genes object in result");
+    assert.ok(data.genes[REAL.geneId], `Expected entry for ${REAL.geneId}`);
+  });
+
+  it("summary has total_lof_accessions > 0 for a known LOF gene", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId] },
+    });
+    const summary = toolResult(res).genes[REAL.geneId].summary;
+    assert.ok(typeof summary.total_lof_accessions === "number",
+      "Expected numeric total_lof_accessions");
+    assert.ok(summary.total_lof_accessions > 0,
+      `Expected > 0 LOF accessions for ${REAL.geneId}`);
+  });
+
+  it("summary includes separate ems_accessions and nat_accessions counts", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId] },
+    });
+    const summary = toolResult(res).genes[REAL.geneId].summary;
+    assert.ok(typeof summary.ems_accessions === "number", "Expected numeric ems_accessions");
+    assert.ok(typeof summary.nat_accessions === "number", "Expected numeric nat_accessions");
+  });
+
+  it("groups array has expected shape (consequence, zygosity, study_label, accessions)", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId] },
+    });
+    const gene = toolResult(res).genes[REAL.geneId];
+    assert.ok(Array.isArray(gene.groups), "Expected groups array");
+    assert.ok(gene.groups.length > 0, "Expected at least one group");
+    const g = gene.groups[0];
+    assert.ok(typeof g.consequence === "string",  "Expected string consequence");
+    assert.ok(typeof g.zygosity   === "string",   "Expected string zygosity");
+    assert.ok(typeof g.study_label === "string",  "Expected string study_label");
+    assert.ok(typeof g.study_type  === "string",  "Expected string study_type (EMS|NAT)");
+    assert.ok(typeof g.count === "number",        "Expected numeric count");
+    assert.ok(Array.isArray(g.accessions),        "Expected accessions array");
+    assert.ok(g.accessions.length > 0,            "Expected at least one accession");
+    assert.ok(typeof g.accessions[0].ens_id === "string",
+      "Expected ens_id string on each accession");
+  });
+
+  it("zygosity values are 'homozygous' or 'heterozygous'", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId] },
+    });
+    const groups = toolResult(res).genes[REAL.geneId].groups;
+    for (const g of groups) {
+      assert.ok(
+        g.zygosity === "homozygous" || g.zygosity === "heterozygous",
+        `Unexpected zygosity value: "${g.zygosity}"`
+      );
+    }
+  });
+
+  it("include_germplasm_details=false returns accessions without metadata enrichment", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene",
+      arguments: { gene_ids: [REAL.geneId], include_germplasm_details: false },
+    });
+    const gene = toolResult(res).genes[REAL.geneId];
+    assert.ok(gene.summary.total_lof_accessions > 0, "Expected accessions even without details");
+    // With include_germplasm_details=false, accessions should only have ens_id
+    if (gene.groups.length > 0 && gene.groups[0].accessions.length > 0) {
+      const acc = gene.groups[0].accessions[0];
+      assert.ok(typeof acc.ens_id === "string", "Expected ens_id");
+      assert.ok(!acc.pub_id, "Expected no pub_id when details disabled");
+    }
+  });
+});
