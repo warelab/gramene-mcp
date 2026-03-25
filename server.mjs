@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { MongoClient } from "mongodb";
 
 /**
@@ -101,6 +102,23 @@ function computeStats(events) {
     .sort((a, b) => b.calls - a.calls)
     .map(t => ({ ...t, avgMs: t.calls ? Math.round(t.totalMs / t.calls) : 0 }));
 
+  // Per-session aggregation
+  const bySession = {};
+  for (const e of events) {
+    if (!e.session) continue;
+    const s = bySession[e.session] || (bySession[e.session] = {
+      session: e.session, calls: 0, errors: 0, firstSeen: e.ts, lastSeen: e.ts, tools: {}
+    });
+    s.calls++;
+    if (e.status !== "ok") s.errors++;
+    if (e.ts > s.lastSeen) s.lastSeen = e.ts;
+    if (e.ts < s.firstSeen) s.firstSeen = e.ts;
+    s.tools[e.tool] = (s.tools[e.tool] || 0) + 1;
+  }
+  const sessions = Object.values(bySession)
+    .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen))
+    .slice(0, 50); // cap at 50 most recent sessions
+
   return {
     total: events.length,
     errors,
@@ -109,10 +127,30 @@ function computeStats(events) {
     calls1h,
     calls24h,
     byTool: toolStats,
+    sessions,
     recent: events.slice(-100).reverse(),
     source: LOG_FILE ? "file" : "memory",
     buffered: logBuffer.length,
   };
+}
+
+// --- Session tracking ---
+// Sessions are created on 'initialize' and identified by a UUID returned in the
+// X-MCP-Session response header. Clients echo it back on subsequent requests.
+// Sessions older than SESSION_TTL_MS are pruned on each new initialize.
+const SESSION_TTL_MS = 24 * 3600_000; // 24 hours
+const activeSessions = new Map(); // id -> { created, lastSeen, calls, errors }
+
+function getOrCreateSession(sessionId) {
+  if (sessionId && activeSessions.has(sessionId)) return sessionId;
+  return null;
+}
+
+function pruneOldSessions() {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [id, s] of activeSessions) {
+    if (new Date(s.lastSeen).getTime() < cutoff) activeSessions.delete(id);
+  }
 }
 
 // --- Mongo ---
@@ -940,7 +978,7 @@ const TOOL_REGISTRY = {
 const TOOLS = Object.values(TOOL_REGISTRY).map((t) => t.definition);
 
 // --- MCP request handler ---
-async function handleJsonRpc(msg) {
+async function handleJsonRpc(msg, sessionId = null) {
   const { jsonrpc, id, method, params } = msg || {};
   if (jsonrpc !== "2.0" || typeof method !== "string") {
     return jsonRpcError(id ?? null, -32600, "Invalid Request");
@@ -983,12 +1021,12 @@ async function handleJsonRpc(msg) {
     const t0 = Date.now();
     try {
       const result = await entry.handler(toolArgs);
-      log({ event: "tool_call", tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0 });
+      log({ event: "tool_call", tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcResult(id, {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       });
     } catch (e) {
-      log({ event: "tool_call", tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0 });
+      log({ event: "tool_call", tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcError(id, -32000, `Tool error: ${e?.message || String(e)}`);
     }
   }
@@ -1027,6 +1065,7 @@ function dashboardHtml() {
   th{text-align:left;padding:6px 10px;border-bottom:2px solid #e5e7eb;color:#6b7280;font-weight:600;font-size:.75rem;text-transform:uppercase}
   td{padding:6px 10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-family:monospace}
   td.tool{font-weight:600;color:#1d4ed8;font-family:system-ui,sans-serif}
+  td.session{font-size:.75rem;color:#6b7280;font-family:monospace}
   td.ok{color:#16a34a}td.error{color:#dc2626}
   tr:hover td{background:#f9fafb}
   .meta{font-size:.78rem;color:#9ca3af;margin-top:12px;text-align:right}
@@ -1043,8 +1082,13 @@ function dashboardHtml() {
   <div id="bars"></div>
 </section>
 <section>
+  <h2>Sessions <span style="font-size:.8rem;font-weight:400;color:#9ca3af">(last 50 active)</span></h2>
+  <table><thead><tr><th>Session ID</th><th>Started</th><th>Last Active</th><th>Calls</th><th>Errors</th><th>Tools Used</th></tr></thead>
+  <tbody id="sessions"></tbody></table>
+</section>
+<section>
   <h2>Recent Calls (last 100)</h2>
-  <table><thead><tr><th>Time</th><th>Tool</th><th>Status</th><th>ms</th><th>Args</th></tr></thead>
+  <table><thead><tr><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>ms</th><th>Args</th></tr></thead>
   <tbody id="recent"></tbody></table>
 </section>
 <p class="meta" id="meta"></p>
@@ -1081,10 +1125,28 @@ async function load() {
         '</div>';
     }).join('');
 
+    document.getElementById('sessions').innerHTML = (d.sessions||[]).length
+      ? d.sessions.map(s => {
+          const sid = s.session ? s.session.slice(0,8) + '…' : '—';
+          const tools = Object.entries(s.tools).sort((a,b)=>b[1]-a[1]).map(([t,n])=>t+(n>1?'×'+n:'')).join(', ');
+          return '<tr>' +
+            '<td class="session" title="' + (s.session||'') + '">' + sid + '</td>' +
+            '<td>' + new Date(s.firstSeen).toLocaleString() + '</td>' +
+            '<td>' + new Date(s.lastSeen).toLocaleTimeString() + '</td>' +
+            '<td>' + s.calls + '</td>' +
+            '<td class="' + (s.errors?'error':'ok') + '">' + (s.errors||'0') + '</td>' +
+            '<td style="font-size:.78rem;color:#4b5563">' + tools + '</td>' +
+            '</tr>';
+        }).join('')
+      : '<tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:16px">No session data yet — sessions are tracked via X-MCP-Session header</td></tr>';
+
     document.getElementById('recent').innerHTML = d.recent.map(e => {
       const args = e.args ? JSON.stringify(e.args, null, 0).slice(0, 200) : '';
       const t = new Date(e.ts).toLocaleTimeString();
-      return '<tr><td>' + t + '</td><td class="tool">' + (e.tool||'') + '</td>' +
+      const sid = e.session ? e.session.slice(0,8) + '…' : '—';
+      return '<tr><td>' + t + '</td>' +
+        '<td class="session" title="' + (e.session||'') + '">' + sid + '</td>' +
+        '<td class="tool">' + (e.tool||'') + '</td>' +
         '<td class="' + (e.status==='ok'?'ok':'error') + '">' + e.status + '</td>' +
         '<td>' + (e.ms||'') + '</td>' +
         '<td class="args">' + args.replace(/</g,'&lt;') + '</td></tr>';
@@ -1142,10 +1204,24 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== "POST") return send(res, 405, { error: "Method Not Allowed" });
 
     const msg = await readJson(req);
-    const reply = await handleJsonRpc(msg);
 
-    if (reply === null) return send(res, 202, null);   // notification → no body
-    return send(res, 200, reply);
+    // Session management: assign on initialize, validate on subsequent calls.
+    let sessionId = req.headers["x-mcp-session"] || null;
+    if (msg?.method === "initialize") {
+      pruneOldSessions();
+      sessionId = randomUUID();
+      activeSessions.set(sessionId, { created: new Date().toISOString(), lastSeen: new Date().toISOString() });
+      log({ event: "session_start", session: sessionId });
+    } else {
+      sessionId = getOrCreateSession(sessionId);
+      if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();
+    }
+
+    const sessionHeaders = sessionId ? { "X-MCP-Session": sessionId } : {};
+    const reply = await handleJsonRpc(msg, sessionId);
+
+    if (reply === null) return send(res, 202, null, sessionHeaders);   // notification → no body
+    return send(res, 200, reply, sessionHeaders);
   } catch (e) {
     return send(res, 400, jsonRpcError(null, -32700, "Parse error", String(e?.message || e)));
   }
