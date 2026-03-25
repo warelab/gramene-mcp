@@ -577,3 +577,88 @@ describe("expression_for_genes", () => {
     assert.ok(res.error, "Expected error for empty gene_ids");
   });
 });
+
+// ─── Facet counting ───────────────────────────────────────────────────
+
+describe("solr_search — facets", () => {
+  it("facet on system_name returns facet_counts", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { field: "system_name", mincount: 1, limit: -1 },
+      },
+    });
+    const data = toolResult(res);
+    const facetFields = data?.facet_counts?.facet_fields;
+    assert.ok(facetFields, "Expected facet_counts.facet_fields in response");
+    assert.ok(Array.isArray(facetFields.system_name), "Expected system_name facet array");
+    assert.ok(facetFields.system_name.length > 0, "Expected at least one facet value");
+  });
+
+  it("facet counts alternate between label and count", async () => {
+    // Solr returns facets as a flat [label, count, label, count, ...] array
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { field: "system_name", mincount: 1, limit: -1 },
+      },
+    });
+    const pairs = toolResult(res).facet_counts.facet_fields.system_name;
+    // Even indices should be strings (genome names), odd indices should be numbers (counts)
+    for (let i = 0; i < Math.min(pairs.length, 10); i++) {
+      if (i % 2 === 0) assert.equal(typeof pairs[i], "string", `Expected string at index ${i}`);
+      else             assert.equal(typeof pairs[i], "number", `Expected number at index ${i}`);
+    }
+  });
+
+  it("rows:0 with facet returns no docs but has facet_counts", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        fl: "id",
+        facet: { field: "system_name", mincount: 1, limit: 5 },
+      },
+    });
+    const data = toolResult(res);
+    assert.equal(data.response.docs.length, 0, "Expected 0 docs with rows:0");
+    assert.ok(data.response.numFound > 0,    "Expected numFound > 0");
+    assert.ok(data.facet_counts,             "Expected facet_counts present");
+  });
+
+  it("facet limit caps number of values returned", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { field: "system_name", mincount: 1, limit: 3 },
+      },
+    });
+    const pairs = toolResult(res).facet_counts.facet_fields.system_name;
+    // limit:3 means at most 3 label/count pairs = at most 6 elements
+    assert.ok(pairs.length <= 6, `Expected at most 6 elements with limit:3, got ${pairs.length}`);
+  });
+
+  it("PAV workflow — maps in_compara query returns assembly list", async () => {
+    // The maps collection should have entries with in_compara boolean
+    const res = await rpc("tools/call", {
+      name: "mongo_find",
+      arguments: {
+        collection: "maps",
+        filter: { in_compara: true },
+        projection: { _id: 1, in_compara: 1 },
+        limit: 5,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.count > 0,    "Expected at least one in_compara map");
+    assert.ok(data.docs.length > 0, "Expected docs in result");
+    assert.ok(data.docs[0].in_compara === true, "Expected in_compara:true on each doc");
+  });
+});

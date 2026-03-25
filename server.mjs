@@ -269,6 +269,18 @@ const KB_RELATIONS = {
           type: "string[]",
           dynamicField: true,
           description: "Homology relationships, e.g. homology__oryza_sativa"
+        },
+        system_name: {
+          type: "string",
+          description: "Genome assembly identifier, e.g. 'sorghum_bicolor_btx623'. Facet on this field to count genes per genome — essential for PAV/CNV analysis across a pangenome."
+        },
+        map: {
+          type: "string",
+          description: "Assembly map name (e.g. GCA_000003195.3). Matches maps._id in MongoDB."
+        },
+        capabilities: {
+          type: "string[]",
+          description: "Data types available for this gene. Values include: 'expression' (RNA-seq data in the expression collection), 'pathways' (Plant Reactome annotation), 'homology' (Compara gene trees), 'pubs' (literature), 'regulation' (regulatory features), 'variation' (genetic variants). Use as a filter to restrict to genes with specific data: fq=['capabilities:expression']."
         }
       }
     },
@@ -313,6 +325,8 @@ const KB_RELATIONS = {
         description: "Assay group metadata. _id = '{experiment}.{group}'. Has characteristic[] and factor[] arrays with {type, label, ontology?, id?, int_id?}. The int_id is the integer PO/EFO term ID for filtering by tissue or condition." },
       expression: { key: "_id", type: "string",
         description: "Expression values per gene. _id = gene stable ID. Dynamic keys are experiment accessions; values are arrays of {group, value} (Baseline: TPM/FPKM) or {group, l2fc, p_value} (Differential). Use expression_for_genes tool to join with assay/experiment metadata." },
+      maps: { key: "_id", type: "string",
+        description: "Genome assembly metadata. _id = assembly map name (e.g. GCA_000003195.3), matching the 'map' field in the Solr genes core. Key field: in_compara (boolean) — true if this genome was included in the Compara gene tree analysis and therefore has homology/PAV data. Use this to distinguish genomes with homology info from those without before interpreting PAV/CNV facet results." },
     }
   }
 };
@@ -339,13 +353,27 @@ async function solrFetch(core, endpoint, args) {
     start = 0,
     sort,
     defType,
+    facet,
   } = args || {};
 
   if (!q || typeof q !== "string") {
     throw new Error(`Solr ${endpoint} requires a non-empty string 'q'`);
   }
 
-  const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType });
+  // Classic Solr field faceting — expand the 'facet' convenience object into
+  // individual URL params (facet=true, facet.field=X, facet.mincount=N, etc.)
+  const facetParams = {};
+  if (facet) {
+    facetParams["facet"] = "true";
+    if (facet.field) {
+      facetParams["facet.field"] = Array.isArray(facet.field) ? facet.field : [facet.field];
+    }
+    if (facet.mincount !== undefined) facetParams["facet.mincount"] = String(facet.mincount);
+    if (facet.limit    !== undefined) facetParams["facet.limit"]    = String(facet.limit);
+    if (facet.missing  !== undefined) facetParams["facet.missing"]  = facet.missing ? "true" : "false";
+  }
+
+  const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType, ...facetParams });
   const r = await fetch(url, { headers: { Accept: "application/json" } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
@@ -710,6 +738,22 @@ const SOLR_QUERY_SCHEMA = {
     start: { type: "integer", minimum: 0, description: "Offset for pagination" },
     sort: { type: "string", description: "Sort clause, e.g. 'score desc'" },
     defType: { type: "string", description: "Query parser type, e.g. 'edismax'" },
+    facet: {
+      type: "object",
+      description: [
+        "Field facet counting. Returns facet_counts.facet_fields in the response.",
+        "Use to count genes per category without fetching all documents (set rows:0).",
+        "Example — count orthologs per sorghum genome for PAV/CNV analysis:",
+        '  { "field": "system_name", "mincount": 0, "limit": -1 }',
+        "Fields: field (string or string[]), mincount (int, default 1), limit (int, -1=all), missing (bool).",
+      ].join("\n"),
+      properties: {
+        field:    { description: "Field name(s) to facet on. Use an array for multiple fields." },
+        mincount: { type: "integer", description: "Minimum count to include in results (0 = include zeros, 1 = default)" },
+        limit:    { type: "integer", description: "Max facet values to return per field (-1 = unlimited)" },
+        missing:  { type: "boolean", description: "Include a count for documents missing this field" },
+      },
+    },
   },
   required: ["q"],
 };
@@ -718,7 +762,11 @@ const TOOL_REGISTRY = {
   solr_search: {
     definition: {
       name: "solr_search",
-      description: `Query the Solr genes core (${SOLR_GENES_CORE}) via /query endpoint. Returns matching gene documents.`,
+      description: [
+        `Query the Solr genes core (${SOLR_GENES_CORE}) via /query endpoint. Returns matching gene documents.`,
+        `Supports field faceting via the 'facet' parameter — use with rows:0 to get counts without fetching docs.`,
+        `Key facet use case: PAV/CNV analysis — facet on 'system_name' to count orthologs per genome assembly.`,
+      ].join("\n"),
       inputSchema: SOLR_QUERY_SCHEMA,
     },
     handler: tool_solr_search,

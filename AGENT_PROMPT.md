@@ -303,7 +303,43 @@ solr_search_bool(filter: { term: { field: "gene_tree", value: <id> } },
   → list all species members
 ```
 
-### 3. QTL candidate gene ranking
+### 4. Presence/Absence Variation (PAV) and Copy Number Variation (CNV)
+
+Use Solr faceting on `system_name` to count how many gene copies exist per
+genome assembly. This reveals whether a gene is present in all, some, or none
+of the sequenced genomes (PAV) and whether any genomes carry duplications (CNV).
+
+**Important caveat:** not all genomes were included in the Compara gene tree
+analysis. Check the `maps` MongoDB collection (`in_compara: true`) to get the
+list of genomes that should have homology data — use this as the denominator
+when interpreting absence.
+
+```
+# Step 1 — find a rice ortholog for the sorghum query gene
+solr_search(q="id:SORBI_3006G095600", fl="id,gene_tree,homology__oryza_sativa")
+  → get gene_tree id and/or the rice ortholog id from homology__oryza_sativa
+
+# Step 2 — find which genomes were in the Compara analysis
+mongo_find(collection: "maps", filter: { in_compara: true },
+           projection: { _id: 1, name: 1 })
+  → reference set of assembly map names
+
+# Step 3 — facet on system_name over all orthologs in the gene tree
+solr_search(q="gene_tree:<tree_id>", rows=0,
+            facet={ field: "system_name", mincount: 0, limit: -1 })
+  → response.facet_counts.facet_fields.system_name = [genome, count, ...]
+
+# Step 4 — interpret
+# count=0 → gene absent in that genome (PAV)
+# count=1 → single copy (expected)
+# count>1 → duplication / CNV
+# genome not in facet results but in_compara=true → absent (PAV)
+```
+
+The `capabilities` field can also be checked per gene to confirm data availability:
+`fq=["capabilities:expression"]` restricts to genes with RNA-seq data.
+
+### 5. QTL candidate gene ranking
 
 **Step 1 — Find the QTL interval:**
 ```
@@ -355,7 +391,7 @@ Score each gene on:
 - Conserved expression pattern across orthologous species (0–2 pts)
 - Known function in related species from literature (flag)
 
-### 4. Cross-species comparison for a gene of interest
+### 6. Cross-species comparison for a gene of interest
 ```
 solr_search(q: "id:<gene_id>", fl: "gene_tree,compara_idx_multi")
 solr_graph(from: "compara_neighbors_10", to: "compara_idx_multi",
@@ -365,7 +401,7 @@ expression_for_genes(gene_ids: <orthologs>, experiment_type: "Baseline")
   → compare tissue expression profiles across species
 ```
 
-### 5. Pathway enrichment for a gene set
+### 7. Pathway enrichment for a gene set
 ```
 solr_search(q: "gene_tree:<id>", fl: "id,pathways__ancestors", rows: 200)
   → collect all pathway ancestor IDs across members
