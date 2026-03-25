@@ -361,7 +361,7 @@ async function solrFetch(core, endpoint, args) {
   }
 
   // Classic Solr field faceting — expand the 'facet' convenience object into
-  // individual URL params (facet=true, facet.field=X, facet.mincount=N, etc.)
+  // individual URL params (facet=true, facet.field=X, facet.pivot=A,B, etc.)
   const facetParams = {};
   if (facet) {
     facetParams["facet"] = "true";
@@ -371,6 +371,12 @@ async function solrFetch(core, endpoint, args) {
     if (facet.mincount !== undefined) facetParams["facet.mincount"] = String(facet.mincount);
     if (facet.limit    !== undefined) facetParams["facet.limit"]    = String(facet.limit);
     if (facet.missing  !== undefined) facetParams["facet.missing"]  = facet.missing ? "true" : "false";
+    // Pivot faceting: facet.pivot=field1,field2 gives nested counts.
+    // Pass a comma-separated string (one pivot) or array of strings (multiple pivots).
+    if (facet.pivot) {
+      facetParams["facet.pivot"] = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
+    }
+    if (facet.pivot_mincount !== undefined) facetParams["facet.pivot.mincount"] = String(facet.pivot_mincount);
   }
 
   const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType, ...facetParams });
@@ -741,17 +747,35 @@ const SOLR_QUERY_SCHEMA = {
     facet: {
       type: "object",
       description: [
-        "Field facet counting. Returns facet_counts.facet_fields in the response.",
-        "Use to count genes per category without fetching all documents (set rows:0).",
-        "Example — count orthologs per sorghum genome for PAV/CNV analysis:",
-        '  { "field": "system_name", "mincount": 0, "limit": -1 }',
-        "Fields: field (string or string[]), mincount (int, default 1), limit (int, -1=all), missing (bool).",
+        "Field facet counting. Returns facet_counts.facet_fields (flat) or facet_counts.facet_pivot (nested).",
+        "Use with rows:0 to get counts without fetching documents.",
+        "",
+        "Flat facet — count genes per genome:",
+        '  { "field": "system_name", "mincount": 1, "limit": -1 }',
+        "",
+        "Pivot facet — nested counts (e.g. per gene family per genome):",
+        '  { "pivot": "gene_tree,system_name", "pivot_mincount": 1 }',
+        "Returns facet_counts.facet_pivot['gene_tree,system_name'] — an array of",
+        "{ field, value, count, pivot: [{field, value, count}, ...] } objects.",
+        "",
+        "Combined graph + pivot — single query for CNV across a genomic neighborhood:",
+        '  q="{!graph from=compara_neighbors_10 to=compara_idx_multi}gene_tree:<id>"',
+        '  fq=["taxonomy__ancestors:4558"]  // restrict to sorghum genomes',
+        '  rows=0',
+        '  facet={ "pivot": "gene_tree,system_name", "pivot_mincount": 1 }',
+        "→ for each gene family in the region, shows copy count per genome assembly.",
+        "",
+        "Fields: field (string|string[]), mincount, limit, missing,",
+        "        pivot (comma-separated field string or array of such strings),",
+        "        pivot_mincount (int, minimum count per pivot leaf, default 1).",
       ].join("\n"),
       properties: {
-        field:    { description: "Field name(s) to facet on. Use an array for multiple fields." },
-        mincount: { type: "integer", description: "Minimum count to include in results (0 = include zeros, 1 = default)" },
-        limit:    { type: "integer", description: "Max facet values to return per field (-1 = unlimited)" },
-        missing:  { type: "boolean", description: "Include a count for documents missing this field" },
+        field:          { description: "Field name(s) for flat faceting. String or array of strings." },
+        mincount:       { type: "integer", description: "Min count for flat facet values (0=include zeros, 1=default)" },
+        limit:          { type: "integer", description: "Max flat facet values per field (-1 = unlimited)" },
+        missing:        { type: "boolean", description: "Include count for documents missing this field" },
+        pivot:          { description: "Pivot (nested) facet: comma-separated fields e.g. 'gene_tree,system_name'. Can also be an array for multiple independent pivots." },
+        pivot_mincount: { type: "integer", description: "Min count for pivot facet leaf nodes (default 1)" },
       },
     },
   },
@@ -764,8 +788,17 @@ const TOOL_REGISTRY = {
       name: "solr_search",
       description: [
         `Query the Solr genes core (${SOLR_GENES_CORE}) via /query endpoint. Returns matching gene documents.`,
-        `Supports field faceting via the 'facet' parameter — use with rows:0 to get counts without fetching docs.`,
-        `Key facet use case: PAV/CNV analysis — facet on 'system_name' to count orthologs per genome assembly.`,
+        `Supports field faceting (flat) and pivot faceting (nested) via the 'facet' parameter.`,
+        `Use rows:0 with facets to get counts without fetching documents.`,
+        ``,
+        `Key pattern — neighborhood CNV in a single query:`,
+        `  Combine a {!graph} traversal in 'q' with facet.pivot on gene_tree,system_name.`,
+        `  This expands to all genes in the ±N flanking region of every ortholog in the`,
+        `  gene tree, then counts copies per gene family per genome — revealing PAV/CNV`,
+        `  across an entire pangenome neighborhood in one round-trip.`,
+        `  q="{!graph from=compara_neighbors_10 to=compara_idx_multi}gene_tree:<id>"`,
+        `  fq=["taxonomy__ancestors:4558"], rows=0`,
+        `  facet={ pivot: "gene_tree,system_name", pivot_mincount: 1 }`,
       ].join("\n"),
       inputSchema: SOLR_QUERY_SCHEMA,
     },

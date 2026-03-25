@@ -662,3 +662,84 @@ describe("solr_search — facets", () => {
     assert.ok(data.docs[0].in_compara === true, "Expected in_compara:true on each doc");
   });
 });
+
+// ─── Facet pivot ─────────────────────────────────────────────────────
+
+describe("solr_search — facet pivot", () => {
+  it("pivot on gene_tree,system_name returns facet_pivot structure", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
+      },
+    });
+    const data = toolResult(res);
+    const pivotKey = "gene_tree,system_name";
+    assert.ok(data?.facet_counts?.facet_pivot, "Expected facet_counts.facet_pivot");
+    assert.ok(Array.isArray(data.facet_counts.facet_pivot[pivotKey]),
+      `Expected facet_pivot["${pivotKey}"] to be an array`);
+  });
+
+  it("pivot entries have value, count, and nested pivot array", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
+      },
+    });
+    const entries = toolResult(res).facet_counts.facet_pivot["gene_tree,system_name"];
+    assert.ok(entries.length > 0, "Expected at least one gene_tree pivot entry");
+    const first = entries[0];
+    assert.equal(first.field, "gene_tree",       "Expected field='gene_tree' on top-level entry");
+    assert.equal(typeof first.value, "string",   "Expected string value (tree ID)");
+    assert.equal(typeof first.count, "number",   "Expected numeric count");
+    assert.ok(Array.isArray(first.pivot),        "Expected nested pivot array");
+    assert.ok(first.pivot.length > 0,            "Expected at least one system_name in nested pivot");
+    assert.equal(first.pivot[0].field, "system_name", "Expected field='system_name' on nested entry");
+    assert.equal(typeof first.pivot[0].count, "number", "Expected numeric count on nested entry");
+  });
+
+  it("graph traversal + pivot — neighborhood CNV single query", async () => {
+    // The key CNV workflow: {!graph} expands to neighborhood, pivot counts per genome
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `{!graph from=compara_neighbors_10 to=compara_idx_multi}gene_tree:${REAL.geneTree}`,
+        fq: ["taxonomy__ancestors:4558"],
+        rows: 0,
+        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.response.numFound > 0, "Expected genes found via graph traversal");
+    const pivotEntries = data.facet_counts?.facet_pivot?.["gene_tree,system_name"];
+    assert.ok(Array.isArray(pivotEntries) && pivotEntries.length > 0,
+      "Expected pivot entries from graph+pivot query");
+    // Should cover multiple gene families (neighbors) and multiple genomes
+    const totalGenomesAcrossAll = pivotEntries.reduce((s, e) => s + (e.pivot?.length ?? 0), 0);
+    assert.ok(totalGenomesAcrossAll > 1, "Expected multiple genome entries across gene families");
+  });
+
+  it("pivot_mincount=1 excludes absent genomes from pivot results", async () => {
+    const res = await rpc("tools/call", {
+      name: "solr_search",
+      arguments: {
+        q: `gene_tree:${REAL.geneTree}`,
+        rows: 0,
+        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
+      },
+    });
+    const entries = toolResult(res).facet_counts.facet_pivot["gene_tree,system_name"];
+    // With pivot_mincount=1, every nested entry must have count >= 1
+    for (const entry of entries) {
+      for (const nested of (entry.pivot || [])) {
+        assert.ok(nested.count >= 1,
+          `Expected count >= 1 with pivot_mincount=1, got ${nested.count} for ${nested.value}`);
+      }
+    }
+  });
+});

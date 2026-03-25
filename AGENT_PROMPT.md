@@ -339,7 +339,49 @@ solr_search(q="gene_tree:<tree_id>", rows=0,
 The `capabilities` field can also be checked per gene to confirm data availability:
 `fq=["capabilities:expression"]` restricts to genes with RNA-seq data.
 
-### 5. QTL candidate gene ranking
+### 5. Genomic neighborhood CNV — single query with graph traversal + pivot facet
+
+The most powerful approach to neighborhood copy-number variation uses a single
+Solr query that combines a `{!graph}` traversal with `facet.pivot`. This
+expands from the gene tree of a reference gene to all orthologs across genomes,
+then walks to their flanking neighbors, and returns counts grouped by gene
+family × genome assembly — in one round-trip.
+
+```
+# Step 1 — get the gene tree of the query gene (and optionally a rice ortholog)
+solr_search(q="id:SORBI_3006G095600",
+            fl="id,gene_tree,system_name,homology__oryza_sativa")
+
+# Step 2 — single graph+pivot query across all sorghum genomes
+solr_search(
+  q="{!graph from=compara_neighbors_10 to=compara_idx_multi maxDepth=1}gene_tree:<tree_id>",
+  fq=["taxonomy__ancestors:4558"],
+  rows=0,
+  facet={ "pivot": "gene_tree,system_name", "pivot_mincount": 1 }
+)
+```
+
+Response: `facet_counts.facet_pivot["gene_tree,system_name"]` — array of:
+```json
+{ "field": "gene_tree", "value": "SB10GT_332720", "count": 92,
+  "pivot": [
+    { "field": "system_name", "value": "sorghum_bicolor_btx623", "count": 1 },
+    { "field": "system_name", "value": "sorghum_bicolor_tx430",  "count": 2 }
+  ]
+}
+```
+
+**Interpretation:**
+- `count=1` across all in_compara genomes → single-copy conserved gene
+- genome absent from pivot + `in_compara=true` → gene absent (PAV)
+- `count>1` in any genome → tandem duplication / CNV
+
+Cross-reference `mongo_find(collection:"maps", filter:{in_compara:true})` to
+get the full set of genomes expected to have homology data (the denominator).
+To seed from a **rice ortholog** instead (for a cross-species neighborhood),
+look up the rice gene's tree ID first, then use that as the seed.
+
+### 6. QTL candidate gene ranking
 
 **Step 1 — Find the QTL interval:**
 ```
@@ -391,7 +433,7 @@ Score each gene on:
 - Conserved expression pattern across orthologous species (0–2 pts)
 - Known function in related species from literature (flag)
 
-### 6. Cross-species comparison for a gene of interest
+### 7. Cross-species comparison for a gene of interest
 ```
 solr_search(q: "id:<gene_id>", fl: "gene_tree,compara_idx_multi")
 solr_graph(from: "compara_neighbors_10", to: "compara_idx_multi",
@@ -401,7 +443,7 @@ expression_for_genes(gene_ids: <orthologs>, experiment_type: "Baseline")
   → compare tissue expression profiles across species
 ```
 
-### 7. Pathway enrichment for a gene set
+### 8. Pathway enrichment for a gene set
 ```
 solr_search(q: "gene_tree:<id>", fl: "id,pathways__ancestors", rows: 200)
   → collect all pathway ancestor IDs across members
