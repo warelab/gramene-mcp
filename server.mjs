@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import http from "node:http";
 import { MongoClient } from "mongodb";
 
@@ -10,6 +11,8 @@ import { MongoClient } from "mongodb";
  *   MCP_ALLOWED_ORIGINS  Comma-separated origins (default: localhost only)
  *   MCP_MAX_BODY_BYTES   Max request body size   (default: 1048576 / 1 MB)
  *   MCP_LOG              Set to "false" to disable JSON logging to stderr  (default: true)
+ *   MCP_LOG_FILE         Path to append JSON log lines (persists across restarts)
+ *   MCP_LOG_BUFFER_SIZE  Max tool_call events kept in memory for the dashboard (default: 10000)
  *
  *   SOLR_BASE_URL        Solr base URL           (default: http://localhost:8983/solr)
  *   SOLR_GENES_CORE      Solr genes core name    (default: genes)
@@ -40,10 +43,76 @@ const ALLOW_ALL_ORIGINS = ALLOWED_ORIGINS.has("*");
 
 // --- Logging ---
 // Writes a single JSON line to stderr. Set MCP_LOG=false to suppress.
+// Optionally appends to MCP_LOG_FILE for dashboard persistence across restarts.
 const LOGGING_ENABLED = process.env.MCP_LOG !== "false";
+const LOG_FILE = process.env.MCP_LOG_FILE || null;
+const LOG_BUFFER_SIZE = Number(process.env.MCP_LOG_BUFFER_SIZE || "10000");
+
+// In-memory ring buffer — only tool_call events are stored here.
+const logBuffer = [];
+
 function log(event) {
   if (!LOGGING_ENABLED) return;
-  process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
+  const entry = { ts: new Date().toISOString(), ...event };
+  process.stderr.write(JSON.stringify(entry) + "\n");
+  if (entry.event === "tool_call") {
+    logBuffer.push(entry);
+    if (logBuffer.length > LOG_BUFFER_SIZE) logBuffer.shift();
+  }
+  if (LOG_FILE) {
+    fs.appendFile(LOG_FILE, JSON.stringify(entry) + "\n", () => {});
+  }
+}
+
+// Read tool_call events from MCP_LOG_FILE (returns array, newest-last).
+async function readLogFile() {
+  if (!LOG_FILE) return [];
+  try {
+    const text = await fs.promises.readFile(LOG_FILE, "utf8");
+    return text.split("\n")
+      .filter(Boolean)
+      .map(line => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(e => e && e.event === "tool_call");
+  } catch {
+    return [];
+  }
+}
+
+// Compute dashboard stats from an array of tool_call events.
+function computeStats(events) {
+  const byTool = {};
+  let errors = 0;
+  let totalMs = 0;
+  const cutoff1h = Date.now() - 3600_000;
+  const cutoff24h = Date.now() - 86_400_000;
+  let calls1h = 0, calls24h = 0;
+
+  for (const e of events) {
+    const t = byTool[e.tool] || (byTool[e.tool] = { tool: e.tool, calls: 0, errors: 0, totalMs: 0 });
+    t.calls++;
+    if (e.status !== "ok") { t.errors++; errors++; }
+    if (e.ms) { t.totalMs += e.ms; totalMs += e.ms; }
+    const ts = new Date(e.ts).getTime();
+    if (ts >= cutoff1h) calls1h++;
+    if (ts >= cutoff24h) calls24h++;
+  }
+
+  const toolStats = Object.values(byTool)
+    .sort((a, b) => b.calls - a.calls)
+    .map(t => ({ ...t, avgMs: t.calls ? Math.round(t.totalMs / t.calls) : 0 }));
+
+  return {
+    total: events.length,
+    errors,
+    errorRate: events.length ? ((errors / events.length) * 100).toFixed(1) : "0.0",
+    avgMs: events.length ? Math.round(totalMs / events.length) : 0,
+    calls1h,
+    calls24h,
+    byTool: toolStats,
+    recent: events.slice(-100).reverse(),
+    source: LOG_FILE ? "file" : "memory",
+    buffered: logBuffer.length,
+  };
 }
 
 // --- Mongo ---
@@ -927,12 +996,148 @@ async function handleJsonRpc(msg) {
   return jsonRpcError(id, -32601, `Method not found: ${method}`);
 }
 
+// --- Dashboard HTML ---
+function dashboardHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gramene MCP Usage</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:system-ui,sans-serif;background:#f5f7fa;color:#1a1a2e;padding:24px}
+  h1{font-size:1.4rem;font-weight:700;margin-bottom:4px;color:#1a1a2e}
+  .subtitle{font-size:.85rem;color:#666;margin-bottom:24px}
+  .cards{display:flex;flex-wrap:wrap;gap:16px;margin-bottom:28px}
+  .card{background:#fff;border-radius:10px;padding:18px 22px;flex:1;min-width:140px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .card .label{font-size:.75rem;color:#888;text-transform:uppercase;letter-spacing:.05em}
+  .card .value{font-size:2rem;font-weight:700;margin-top:4px;color:#2563eb}
+  .card .value.warn{color:#dc2626}
+  section{background:#fff;border-radius:10px;padding:20px 24px;margin-bottom:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  section h2{font-size:1rem;font-weight:600;margin-bottom:16px;color:#374151}
+  .bar-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:.85rem}
+  .bar-label{width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#374151}
+  .bar-track{flex:1;background:#e5e7eb;border-radius:4px;height:18px;overflow:hidden}
+  .bar-fill{height:100%;background:#2563eb;border-radius:4px;transition:width .4s}
+  .bar-fill.has-errors{background:#f59e0b}
+  .bar-count{width:80px;text-align:right;color:#6b7280}
+  .bar-ms{width:70px;text-align:right;color:#9ca3af;font-size:.78rem}
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  th{text-align:left;padding:6px 10px;border-bottom:2px solid #e5e7eb;color:#6b7280;font-weight:600;font-size:.75rem;text-transform:uppercase}
+  td{padding:6px 10px;border-bottom:1px solid #f3f4f6;vertical-align:top;font-family:monospace}
+  td.tool{font-weight:600;color:#1d4ed8;font-family:system-ui,sans-serif}
+  td.ok{color:#16a34a}td.error{color:#dc2626}
+  tr:hover td{background:#f9fafb}
+  .meta{font-size:.78rem;color:#9ca3af;margin-top:12px;text-align:right}
+  .refresh{font-size:.78rem;color:#6b7280;float:right;margin-top:-2px}
+  .args{max-width:380px;white-space:pre-wrap;word-break:break-all;color:#4b5563;font-size:.75rem}
+</style>
+</head>
+<body>
+<h1>Gramene MCP — Usage Dashboard</h1>
+<p class="subtitle" id="subtitle">Loading…</p>
+<div class="cards" id="cards"></div>
+<section>
+  <h2>Calls by Tool <span class="refresh" id="countdown"></span></h2>
+  <div id="bars"></div>
+</section>
+<section>
+  <h2>Recent Calls (last 100)</h2>
+  <table><thead><tr><th>Time</th><th>Tool</th><th>Status</th><th>ms</th><th>Args</th></tr></thead>
+  <tbody id="recent"></tbody></table>
+</section>
+<p class="meta" id="meta"></p>
+<script>
+let countdown = 30;
+async function load() {
+  try {
+    const d = await fetch('/mcp/usage/data').then(r => r.json());
+    document.getElementById('subtitle').textContent =
+      new Date().toLocaleString() + ' — ' + d.total + ' total calls tracked (' + d.source + ')';
+
+    document.getElementById('cards').innerHTML = [
+      ['Total calls', d.total, false],
+      ['Last hour', d.calls1h, false],
+      ['Last 24h', d.calls24h, false],
+      ['Error rate', d.errorRate + '%', d.errors > 0],
+      ['Avg resp', d.avgMs + 'ms', false],
+      ['Tools used', d.byTool.length, false],
+    ].map(([label, value, warn]) =>
+      '<div class="card"><div class="label">' + label + '</div>' +
+      '<div class="value' + (warn ? ' warn' : '') + '">' + value + '</div></div>'
+    ).join('');
+
+    const maxCalls = d.byTool[0]?.calls || 1;
+    document.getElementById('bars').innerHTML = d.byTool.map(t => {
+      const pct = (t.calls / maxCalls * 100).toFixed(1);
+      const hasErr = t.errors > 0;
+      return '<div class="bar-row">' +
+        '<div class="bar-label" title="' + t.tool + '">' + t.tool + '</div>' +
+        '<div class="bar-track"><div class="bar-fill' + (hasErr ? ' has-errors' : '') +
+          '" style="width:' + pct + '%"></div></div>' +
+        '<div class="bar-count">' + t.calls + (t.errors ? ' <span style="color:#dc2626">(' + t.errors + ' err)</span>' : '') + '</div>' +
+        '<div class="bar-ms">' + t.avgMs + 'ms</div>' +
+        '</div>';
+    }).join('');
+
+    document.getElementById('recent').innerHTML = d.recent.map(e => {
+      const args = e.args ? JSON.stringify(e.args, null, 0).slice(0, 200) : '';
+      const t = new Date(e.ts).toLocaleTimeString();
+      return '<tr><td>' + t + '</td><td class="tool">' + (e.tool||'') + '</td>' +
+        '<td class="' + (e.status==='ok'?'ok':'error') + '">' + e.status + '</td>' +
+        '<td>' + (e.ms||'') + '</td>' +
+        '<td class="args">' + args.replace(/</g,'&lt;') + '</td></tr>';
+    }).join('');
+
+    document.getElementById('meta').textContent =
+      'Source: ' + d.source + (d.source==='memory' ? ' (' + d.buffered + ' events buffered)' : '') +
+      ' · MCP_LOG_FILE ' + (d.source==='file' ? 'enabled' : 'not set — history lost on restart');
+  } catch(e) {
+    document.getElementById('subtitle').textContent = 'Error loading data: ' + e.message;
+  }
+}
+
+function tick() {
+  countdown--;
+  document.getElementById('countdown').textContent = 'refreshing in ' + countdown + 's';
+  if (countdown <= 0) { countdown = 30; load(); }
+}
+
+load();
+setInterval(tick, 1000);
+</script>
+</body>
+</html>`;
+}
+
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {
   try {
     if (!originAllowed(req)) return send(res, 403, null);
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    // Dashboard routes (GET only, no CORS restriction needed — read-only)
+    if (url.pathname === "/mcp/usage" && req.method === "GET") {
+      const html = dashboardHtml();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
+      return res.end(html);
+    }
+
+    if (url.pathname === "/mcp/usage/data" && req.method === "GET") {
+      const events = LOG_FILE ? await readLogFile() : logBuffer;
+      const stats = computeStats(events);
+      const body = JSON.stringify(stats);
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": Buffer.byteLength(body),
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+      });
+      return res.end(body);
+    }
+
     if (url.pathname !== "/mcp") return send(res, 404, { error: "Not Found" });
     if (req.method !== "POST") return send(res, 405, { error: "Method Not Allowed" });
 
