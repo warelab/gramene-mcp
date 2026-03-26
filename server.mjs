@@ -914,6 +914,229 @@ async function tool_vep_for_gene(args) {
   return { gene_count: Object.keys(result).length, genes: result };
 }
 
+// --- Enrichment analysis helpers: hypergeometric test + multiple testing ---
+
+// Log-gamma via Lanczos approximation (sufficient precision for enrichment p-values)
+function lnGamma(z) {
+  if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - lnGamma(1 - z);
+  z -= 1;
+  const g = 7;
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ];
+  let x = c[0];
+  for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
+  const t = z + g + 0.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+}
+
+function lnBinomial(n, k) {
+  if (k < 0 || k > n) return -Infinity;
+  return lnGamma(n + 1) - lnGamma(k + 1) - lnGamma(n - k + 1);
+}
+
+/**
+ * Hypergeometric survival function: P(X >= k)
+ * N = population size (background), K = successes in population (bg with term),
+ * n = draws (foreground size), k = observed successes (fg with term).
+ */
+function hypergeomSF(k, N, K, n) {
+  if (k <= 0) return 1;
+  const maxI = Math.min(K, n);
+  if (k > maxI) return 0;
+
+  // Sum P(X = i) for i = k..min(K,n) using log-space for numerical stability
+  const lnDenom = lnBinomial(N, n);
+  let pSum = 0;
+  for (let i = k; i <= maxI; i++) {
+    const lnP = lnBinomial(K, i) + lnBinomial(N - K, n - i) - lnDenom;
+    pSum += Math.exp(lnP);
+    if (pSum > 1) return 1; // numerical ceiling
+  }
+  return Math.min(pSum, 1);
+}
+
+/**
+ * Benjamini–Hochberg FDR correction.
+ * Takes array of {p, ...rest}, returns same with added `p_adjusted` field.
+ */
+function benjaminiHochberg(results) {
+  const m = results.length;
+  if (m === 0) return results;
+  // Sort by raw p ascending
+  const indexed = results.map((r, i) => ({ ...r, _origIdx: i }));
+  indexed.sort((a, b) => a.p - b.p);
+  // Step-up: p_adj[i] = min( p[i] * m / (i+1), p_adj[i+1] )
+  indexed[m - 1].p_adjusted = Math.min(indexed[m - 1].p * m / m, 1);
+  for (let i = m - 2; i >= 0; i--) {
+    indexed[i].p_adjusted = Math.min(indexed[i].p * m / (i + 1), indexed[i + 1].p_adjusted, 1);
+  }
+  // Restore original order
+  const out = new Array(m);
+  for (const r of indexed) {
+    const { _origIdx, ...rest } = r;
+    out[_origIdx] = rest;
+  }
+  return out;
+}
+
+/**
+ * Parse Solr flat facet field response: [value, count, value, count, ...]
+ * into a Map of value → count.
+ */
+function parseFacetField(arr) {
+  const map = new Map();
+  if (!Array.isArray(arr)) return map;
+  for (let i = 0; i < arr.length; i += 2) {
+    const val = arr[i];
+    const cnt = arr[i + 1];
+    if (cnt > 0) map.set(val, cnt);
+  }
+  return map;
+}
+
+async function tool_enrichment_analysis(args) {
+  const {
+    foreground_fq,
+    background_fq,
+    field = "GO__ancestors",
+    p_threshold = 0.05,
+    correction = "bh",
+    min_foreground_count = 2,
+    max_terms = 200,
+  } = args || {};
+
+  if (!Array.isArray(foreground_fq) || foreground_fq.length === 0) {
+    throw new Error("enrichment_analysis requires a non-empty 'foreground_fq' array");
+  }
+  if (!Array.isArray(background_fq) || background_fq.length === 0) {
+    throw new Error("enrichment_analysis requires a non-empty 'background_fq' array");
+  }
+
+  // Allowed ontology/annotation fields for enrichment
+  const ALLOWED_FIELDS = new Set([
+    "GO__ancestors", "PO__ancestors", "TO__ancestors",
+    "domains__ancestors", "pathways__ancestors",
+  ]);
+  if (!ALLOWED_FIELDS.has(field)) {
+    throw new Error(`enrichment_analysis: field must be one of ${[...ALLOWED_FIELDS].join(", ")}`);
+  }
+
+  // The corresponding MongoDB collection for term name lookups
+  const FIELD_TO_COLLECTION = {
+    "GO__ancestors":        "GO",
+    "PO__ancestors":        "PO",
+    "TO__ancestors":        "TO",
+    "domains__ancestors":   "domains",
+    "pathways__ancestors":  "pathways",
+  };
+
+  // 1. Foreground facet: all terms in the foreground set
+  const fgResp = await solrFetch(SOLR_GENES_CORE, "select", {
+    q: "*:*",
+    fq: [...foreground_fq, `${field}:[* TO *]`], // must have at least one term
+    rows: 0,
+    facet: { field, mincount: 1, limit: -1 },
+  });
+  const fgTotal = fgResp?.response?.numFound ?? 0;
+  const fgFacets = parseFacetField(
+    fgResp?.facet_counts?.facet_fields?.[field]
+  );
+
+  if (fgTotal === 0) {
+    return { error: "No foreground genes found matching the filters.", foreground_count: 0 };
+  }
+
+  // 2. Background facet: all terms in the background set
+  const bgResp = await solrFetch(SOLR_GENES_CORE, "select", {
+    q: "*:*",
+    fq: [...background_fq, `${field}:[* TO *]`],
+    rows: 0,
+    facet: { field, mincount: 1, limit: -1 },
+  });
+  const bgTotal = bgResp?.response?.numFound ?? 0;
+  const bgFacets = parseFacetField(
+    bgResp?.facet_counts?.facet_fields?.[field]
+  );
+
+  if (bgTotal === 0) {
+    return { error: "No background genes found matching the filters.", background_count: 0 };
+  }
+
+  // 3. Compute hypergeometric p-value for each foreground term
+  let results = [];
+  for (const [termId, fgCount] of fgFacets.entries()) {
+    if (fgCount < min_foreground_count) continue;
+    const bgCount = bgFacets.get(termId) || 0;
+    if (bgCount === 0) continue; // shouldn't happen but guard
+
+    const p = hypergeomSF(fgCount, bgTotal, bgCount, fgTotal);
+    const foldEnrichment = (fgCount / fgTotal) / (bgCount / bgTotal);
+
+    results.push({
+      term_id: Number(termId),
+      foreground_count: fgCount,
+      foreground_fraction: parseFloat((fgCount / fgTotal).toFixed(4)),
+      background_count: bgCount,
+      background_fraction: parseFloat((bgCount / bgTotal).toFixed(4)),
+      fold_enrichment: parseFloat(foldEnrichment.toFixed(2)),
+      p,
+    });
+  }
+
+  // 4. Multiple testing correction
+  if (correction === "bh" || correction === "benjamini-hochberg") {
+    results = benjaminiHochberg(results);
+  } else {
+    // Bonferroni
+    const m = results.length;
+    for (const r of results) {
+      r.p_adjusted = Math.min(r.p * m, 1);
+    }
+  }
+
+  // 5. Filter by adjusted p-value threshold, sort by p_adjusted
+  results = results
+    .filter((r) => r.p_adjusted <= p_threshold)
+    .sort((a, b) => a.p_adjusted - b.p_adjusted);
+
+  // Cap at max_terms
+  if (results.length > max_terms) results = results.slice(0, max_terms);
+
+  // Round p-values for readable output
+  for (const r of results) {
+    r.p = parseFloat(r.p.toExponential(3));
+    r.p_adjusted = parseFloat(r.p_adjusted.toExponential(3));
+  }
+
+  // 6. Look up term names from MongoDB
+  if (results.length > 0) {
+    const collection = FIELD_TO_COLLECTION[field];
+    const termIds = results.map((r) => r.term_id);
+    const d = db();
+    const termDocs = await d.collection(collection)
+      .find({ _id: { $in: termIds } }, { projection: { _id: 1, name: 1 } })
+      .toArray();
+    const nameMap = Object.fromEntries(termDocs.map((t) => [t._id, t.name]));
+    for (const r of results) {
+      r.term_name = nameMap[r.term_id] || null;
+    }
+  }
+
+  return {
+    foreground_count: fgTotal,
+    background_count: bgTotal,
+    field,
+    correction,
+    p_threshold,
+    terms_tested: fgFacets.size,
+    significant_terms: results.length,
+    terms: results,
+  };
+}
+
 async function tool_solr_search(args) {
   return solrFetch(SOLR_GENES_CORE, "query", args);
 }
@@ -1425,6 +1648,80 @@ const TOOL_REGISTRY = {
       },
     },
     handler: tool_vep_for_gene,
+  },
+
+  enrichment_analysis: {
+    definition: {
+      name: "enrichment_analysis",
+      description: [
+        `Gene set enrichment analysis using hypergeometric test on ontology/pathway`,
+        `annotation fields.`,
+        ``,
+        `Compares the frequency of annotation terms between a foreground gene set`,
+        `(e.g. genes in a QTL interval, pathway, or user-defined list) and a background`,
+        `set (typically all annotated genes in the same genome). Identifies terms that`,
+        `are statistically overrepresented in the foreground.`,
+        ``,
+        `Both foreground and background are defined by Solr filter queries (fq arrays).`,
+        `The tool automatically:`,
+        `  1. Facet-counts the annotation field in both sets`,
+        `  2. Computes hypergeometric p-values for each term`,
+        `  3. Applies Benjamini–Hochberg FDR correction (or Bonferroni)`,
+        `  4. Looks up term names from MongoDB`,
+        `  5. Returns significant terms sorted by adjusted p-value`,
+        ``,
+        `Supported annotation fields:`,
+        `  - GO__ancestors     — Gene Ontology (biological process, molecular function, cellular component)`,
+        `  - PO__ancestors     — Plant Ontology (anatomy/development)`,
+        `  - TO__ancestors     — Trait Ontology`,
+        `  - domains__ancestors — Protein domains (InterPro)`,
+        `  - pathways__ancestors — Plant Reactome pathways`,
+        ``,
+        `Example — GO enrichment for jasmonic acid pathway genes in sorghum:`,
+        `  foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"]`,
+        `  background_fq: ["taxonomy__ancestors:4558"]`,
+        `  field: "GO__ancestors"`,
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          foreground_fq: {
+            type: "array",
+            items: { type: "string" },
+            description: "Solr fq clauses defining the foreground gene set. E.g. ['pathways__ancestors:1119332', 'taxonomy__ancestors:4558'].",
+          },
+          background_fq: {
+            type: "array",
+            items: { type: "string" },
+            description: "Solr fq clauses defining the background gene set. Typically just the genome filter, e.g. ['taxonomy__ancestors:4558']. Should be a superset of the foreground.",
+          },
+          field: {
+            type: "string",
+            enum: ["GO__ancestors", "PO__ancestors", "TO__ancestors", "domains__ancestors", "pathways__ancestors"],
+            description: "Annotation field to test for enrichment. Default: GO__ancestors.",
+          },
+          p_threshold: {
+            type: "number",
+            description: "Adjusted p-value threshold. Terms with p_adjusted > this are excluded. Default: 0.05.",
+          },
+          correction: {
+            type: "string",
+            enum: ["bh", "bonferroni"],
+            description: "Multiple testing correction: 'bh' = Benjamini–Hochberg FDR (default, recommended), 'bonferroni' = stricter family-wise error rate.",
+          },
+          min_foreground_count: {
+            type: "integer",
+            description: "Minimum number of foreground genes annotated with a term to include it. Default: 2.",
+          },
+          max_terms: {
+            type: "integer",
+            description: "Maximum enriched terms to return (sorted by p_adjusted). Default: 200.",
+          },
+        },
+        required: ["foreground_fq", "background_fq"],
+      },
+    },
+    handler: tool_enrichment_analysis,
   },
 };
 

@@ -850,3 +850,151 @@ describe("vep_for_gene — live data (SORBI_3006G095600)", () => {
     }
   });
 });
+
+// ─── enrichment_analysis ──────────────────────────────────────────────
+
+describe("enrichment_analysis — tool registration", () => {
+  it("enrichment_analysis appears in tools/list", async () => {
+    const res = await rpc("tools/list");
+    const tools = res.result?.tools ?? [];
+    const tool = tools.find((t) => t.name === "enrichment_analysis");
+    assert.ok(tool, "Expected enrichment_analysis in tools/list");
+    assert.ok(tool.inputSchema?.properties?.foreground_fq, "Expected foreground_fq in schema");
+    assert.ok(tool.inputSchema?.properties?.background_fq, "Expected background_fq in schema");
+    assert.ok(tool.inputSchema?.properties?.field, "Expected field in schema");
+  });
+
+  it("requires foreground_fq and background_fq params", async () => {
+    const res = await rpc("tools/call", { name: "enrichment_analysis", arguments: {} });
+    const hasError = res.error != null
+      || res.result?.content?.[0]?.text?.includes("requires")
+      || res.result?.isError === true;
+    assert.ok(hasError, "Expected error when fq params missing");
+  });
+});
+
+describe("enrichment_analysis — GO enrichment for jasmonic acid pathway genes", () => {
+  it("returns enriched GO terms for JA pathway genes vs sorghum background", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        p_threshold: 0.05,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data, "Expected a result");
+    assert.ok(data.foreground_count > 0, "Expected foreground genes > 0");
+    assert.ok(data.background_count > 0, "Expected background genes > 0");
+    assert.ok(data.background_count > data.foreground_count,
+      "Background should be larger than foreground");
+    assert.ok(data.terms_tested > 0, "Expected some terms tested");
+    assert.ok(data.significant_terms > 0,
+      "Expected at least one significant GO term for JA pathway genes");
+  });
+
+  it("enriched terms have expected shape and are sorted by p_adjusted", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+      },
+    });
+    const terms = toolResult(res).terms;
+    assert.ok(terms.length > 0, "Expected significant terms");
+    const t = terms[0];
+    assert.ok(typeof t.term_id === "number", "Expected numeric term_id");
+    assert.ok(typeof t.term_name === "string" && t.term_name.length > 0,
+      "Expected resolved term_name");
+    assert.ok(typeof t.foreground_count === "number", "Expected foreground_count");
+    assert.ok(typeof t.background_count === "number", "Expected background_count");
+    assert.ok(typeof t.fold_enrichment === "number", "Expected fold_enrichment");
+    assert.ok(typeof t.p === "number", "Expected p-value");
+    assert.ok(typeof t.p_adjusted === "number", "Expected p_adjusted");
+
+    // Should be sorted by p_adjusted ascending
+    for (let i = 1; i < terms.length; i++) {
+      assert.ok(terms[i].p_adjusted >= terms[i-1].p_adjusted,
+        `Terms should be sorted by p_adjusted: ${terms[i-1].p_adjusted} > ${terms[i].p_adjusted}`);
+    }
+  });
+
+  it("fold_enrichment > 1 for significantly enriched terms", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+      },
+    });
+    const terms = toolResult(res).terms;
+    for (const t of terms) {
+      assert.ok(t.fold_enrichment > 1,
+        `Expected fold_enrichment > 1 for enriched term "${t.term_name}", got ${t.fold_enrichment}`);
+    }
+  });
+
+  it("p_adjusted <= p_threshold for all returned terms", async () => {
+    const threshold = 0.01;
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        p_threshold: threshold,
+      },
+    });
+    const terms = toolResult(res).terms;
+    for (const t of terms) {
+      assert.ok(t.p_adjusted <= threshold,
+        `Expected p_adjusted <= ${threshold}, got ${t.p_adjusted} for "${t.term_name}"`);
+    }
+  });
+});
+
+describe("enrichment_analysis — pathway enrichment for a gene family", () => {
+  it("returns pathway enrichment for a gene tree vs sorghum background", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: [`gene_tree:${REAL.geneTree}`],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "pathways__ancestors",
+        p_threshold: 0.05,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.foreground_count > 0, "Expected foreground genes");
+    assert.ok(data.background_count > data.foreground_count,
+      "Background should be larger");
+    // May or may not have significant terms — just verify structure
+    assert.ok(typeof data.significant_terms === "number",
+      "Expected significant_terms count");
+    assert.ok(Array.isArray(data.terms), "Expected terms array");
+  });
+});
+
+describe("enrichment_analysis — domain enrichment", () => {
+  it("finds enriched InterPro domains for JA pathway genes", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "domains__ancestors",
+        p_threshold: 0.05,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.foreground_count > 0, "Expected foreground genes");
+    // JA biosynthesis genes should have enriched lipoxygenase/AOS domains
+    assert.ok(data.significant_terms > 0,
+      "Expected enriched domains for JA pathway genes");
+  });
+});

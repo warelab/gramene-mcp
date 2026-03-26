@@ -223,6 +223,42 @@ Key parameters:
 
 ---
 
+### `enrichment_analysis`
+**Use for:** Gene set enrichment analysis — finding statistically overrepresented
+ontology terms, pathways, or domains in a foreground gene set compared to a
+background set.
+
+Both sets are defined by Solr filter queries. The tool:
+1. Facet-counts the chosen annotation field in foreground and background
+2. Computes hypergeometric p-values per term
+3. Applies multiple testing correction (Benjamini–Hochberg FDR by default)
+4. Resolves term IDs to names from MongoDB
+5. Returns significant enriched terms sorted by adjusted p-value
+
+Key parameters:
+- `foreground_fq` — Solr fq clauses defining the gene set of interest
+- `background_fq` — Solr fq clauses for all annotated genes in the same genome
+- `field` — annotation field: `GO__ancestors` (default), `PO__ancestors`,
+  `TO__ancestors`, `domains__ancestors`, or `pathways__ancestors`
+- `p_threshold` — adjusted p-value cutoff (default 0.05)
+- `correction` — `"bh"` (Benjamini–Hochberg, default) or `"bonferroni"`
+- `min_foreground_count` — min foreground genes per term (default 2)
+
+**Output per significant term:**
+- `term_id` / `term_name` — ontology ID and resolved name
+- `foreground_count` / `foreground_fraction` — hits in the foreground set
+- `background_count` / `background_fraction` — hits in the background
+- `fold_enrichment` — foreground fraction / background fraction
+- `p` / `p_adjusted` — raw and corrected p-values
+
+**When to use enrichment vs. facet counting:**
+- Use `enrichment_analysis` when you need statistical significance (p-values)
+  comparing foreground vs. background
+- Use `solr_search` with `facet.field` when you just want to count terms
+  without a statistical test (e.g., "what pathways are these genes in?")
+
+---
+
 ### `mongo_find`
 **Use for:** Looking up documents from any MongoDB collection by filter,
 including ontology term lookups, QTL records, assay metadata, gene metadata,
@@ -553,13 +589,59 @@ expression_for_genes(gene_ids: <orthologs>, experiment_type: "Baseline")
   → compare tissue expression profiles across species
 ```
 
-### 8. Pathway enrichment for a gene set
+### 8. Gene set enrichment analysis (GO, PO, pathways, domains)
+
+Use the `enrichment_analysis` tool to find statistically overrepresented
+terms comparing a foreground gene set to a genome-wide background.
+
 ```
-solr_search(q: "gene_tree:<id>", fl: "id,pathways__ancestors", rows: 200)
-  → collect all pathway ancestor IDs across members
-mongo_lookup_by_ids(collection: "pathways", ids: <pathway IDs>)
-  → list pathway names and identify enrichment
+# GO enrichment for jasmonic acid pathway genes in sorghum vs all sorghum genes
+enrichment_analysis(
+  foreground_fq=["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+  background_fq=["taxonomy__ancestors:4558"],
+  field="GO__ancestors",
+  p_threshold=0.05
+)
+
+# Result: significant GO terms sorted by p_adjusted
+# { term_id: 6633, term_name: "fatty acid biosynthetic process",
+#   foreground_count: 7, background_count: 421,
+#   fold_enrichment: 76.5, p: 1.2e-12, p_adjusted: 3.4e-10 }
 ```
+
+**Common enrichment patterns:**
+```
+# GO enrichment for genes in a QTL interval
+enrichment_analysis(
+  foreground_fq=["region:3", "start:[52000000 TO 58000000]",
+                  "taxonomy__ancestors:4558"],
+  background_fq=["taxonomy__ancestors:4558"],
+  field="GO__ancestors"
+)
+
+# Pathway enrichment for a gene family
+enrichment_analysis(
+  foreground_fq=["gene_tree:SB10GT_332720"],
+  background_fq=["taxonomy__ancestors:4558"],
+  field="pathways__ancestors"
+)
+
+# Domain enrichment for drought-responsive DE genes
+enrichment_analysis(
+  foreground_fq=["capabilities:expression", "GO__ancestors:9414",
+                  "taxonomy__ancestors:4558"],
+  background_fq=["taxonomy__ancestors:4558"],
+  field="domains__ancestors"
+)
+```
+
+**Interpreting results:**
+- `fold_enrichment` > 2 with p_adjusted < 0.05 → strong signal
+- Check both `foreground_count` and `background_count` — high fold enrichment
+  from a single gene may not be biologically meaningful
+- Run on multiple annotation fields (GO, pathways, domains) for a complete picture
+- The background should be all annotated genes in the **same genome** to avoid
+  species composition bias
 
 ### 9. Find germplasm with predicted loss-of-function alleles in a gene
 
