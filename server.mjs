@@ -306,6 +306,22 @@ const KB_RELATIONS = {
           type: "string",
           description: "Genome assembly identifier, e.g. 'sorghum_bicolor_btx623'. Facet on this field to count genes per genome — essential for PAV/CNV analysis across a pangenome."
         },
+        transcript__length: {
+          type: "pint",
+          description: "Length in base pairs of the canonical transcript (longest CDS-containing isoform). Suitable for range faceting to generate transcript length distributions. E.g. range facet with start=0, end=30000, gap=500."
+        },
+        transcript__count: {
+          type: "pint",
+          description: "Number of annotated transcript isoforms for this gene locus."
+        },
+        transcript__exons: {
+          type: "pint",
+          description: "Number of exons in the canonical transcript. Range facet with start=1, end=50, gap=1 gives exon count distribution."
+        },
+        "protein__length": {
+          type: "pint[]",
+          description: "Lengths in amino acids of all annotated protein isoforms for this gene. Array because genes may have multiple isoforms."
+        },
         map: {
           type: "string",
           description: "Assembly map name (e.g. GCA_000003195.3). Matches maps._id in MongoDB."
@@ -404,6 +420,7 @@ async function solrFetch(core, endpoint, args) {
     sort,
     defType,
     facet,
+    stats,
   } = args || {};
 
   if (!q || typeof q !== "string") {
@@ -427,9 +444,40 @@ async function solrFetch(core, endpoint, args) {
       facetParams["facet.pivot"] = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
     }
     if (facet.pivot_mincount !== undefined) facetParams["facet.pivot.mincount"] = String(facet.pivot_mincount);
+    // Range faceting: distribute numeric values into fixed-width buckets.
+    // facet.range = { field, start, end, gap, include?, other?, hardend? }
+    // Returns facet_counts.facet_ranges.<field>.counts as [bucket_start, count, ...]
+    if (facet.range) {
+      const ranges = Array.isArray(facet.range) ? facet.range : [facet.range];
+      for (const r of ranges) {
+        if (!r.field) continue;
+        facetParams["facet.range"]            = [...(facetParams["facet.range"] || []), r.field];
+        facetParams[`f.${r.field}.facet.range.start`] = String(r.start ?? 0);
+        facetParams[`f.${r.field}.facet.range.end`]   = String(r.end);
+        facetParams[`f.${r.field}.facet.range.gap`]   = String(r.gap);
+        if (r.include) facetParams[`f.${r.field}.facet.range.include`] = r.include;
+        if (r.other)   facetParams[`f.${r.field}.facet.range.other`]   = r.other;
+        if (r.hardend !== undefined) facetParams[`f.${r.field}.facet.range.hardend`] = r.hardend ? "true" : "false";
+      }
+    }
   }
 
-  const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType, ...facetParams });
+  // Solr field statistics: min, max, sum, mean, stddev, percentiles, count, missing.
+  // stats = { field: "field_name" } or { field: ["f1","f2"], percentiles: "25,50,75,95" }
+  const statsParams = {};
+  if (stats) {
+    statsParams["stats"] = "true";
+    const fields = Array.isArray(stats.field) ? stats.field : [stats.field];
+    statsParams["stats.field"] = fields;
+    if (stats.percentiles) {
+      // Apply percentile config to each field
+      for (const f of fields) {
+        statsParams[`f.${f}.stats.percentiles`] = String(stats.percentiles);
+      }
+    }
+  }
+
+  const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType, ...facetParams, ...statsParams });
   const r = await fetch(url, { headers: { Accept: "application/json" } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
@@ -1013,6 +1061,50 @@ const SOLR_QUERY_SCHEMA = {
         missing:        { type: "boolean", description: "Include count for documents missing this field" },
         pivot:          { description: "Pivot (nested) facet: comma-separated fields e.g. 'gene_tree,system_name'. Can also be an array for multiple independent pivots." },
         pivot_mincount: { type: "integer", description: "Min count for pivot facet leaf nodes (default 1)" },
+        range: {
+          description: [
+            "Range facet — distributes numeric field values into equal-width buckets.",
+            "Returns facet_counts.facet_ranges.<field>.counts as [bucket_start, count, ...] pairs.",
+            "Use with rows:0 to get counts only.",
+            "",
+            "Single range example — transcript length distribution:",
+            '  { "range": { "field": "transcript__length", "start": 0, "end": 20000, "gap": 500, "other": "after" } }',
+            "Result: facet_counts.facet_ranges.transcript__length.counts = [0, 42, 500, 381, ...]",
+            "",
+            "Multiple ranges (array) — length and exon count together:",
+            '  { "range": [',
+            '      { "field": "transcript__length", "start": 0, "end": 30000, "gap": 1000 },',
+            '      { "field": "transcript__exons",  "start": 0, "end": 50,    "gap": 1 }',
+            '  ] }',
+            "",
+            "Fields per range object:",
+            "  field    (string, required) — Solr numeric field to bucket",
+            "  start    (number) — range start (default 0)",
+            "  end      (number, required) — range end (exclusive)",
+            "  gap      (number, required) — bucket width",
+            "  other    ('before'|'after'|'between'|'none'|'all') — extra count buckets",
+            "  include  ('lower'|'upper'|'edge'|'outer'|'all') — bucket boundary inclusion",
+            "  hardend  (boolean) — if true, last bucket ends exactly at 'end'",
+          ].join("\n"),
+        },
+      },
+    },
+    stats: {
+      type: "object",
+      description: [
+        "Solr field statistics. Returns min, max, sum, mean, stddev, count, missing for numeric fields.",
+        "Result is in response.stats.stats_fields.<field_name>.",
+        "Use with rows:0 to get statistics without fetching documents.",
+        "",
+        "Examples:",
+        '  stats: { "field": "transcript__length" }',
+        '  stats: { "field": ["transcript__length", "protein__length"], "percentiles": "10,25,50,75,90,95" }',
+        "",
+        "Percentiles require the Solr TDigest stats component and return a map of {pct: value}.",
+      ].join("\n"),
+      properties: {
+        field:       { description: "Field name or array of field names to compute statistics for." },
+        percentiles: { type: "string", description: "Comma-separated percentile values to compute, e.g. '25,50,75,95'. Requires TDigest support." },
       },
     },
   },
