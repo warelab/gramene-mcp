@@ -998,3 +998,111 @@ describe("enrichment_analysis — domain enrichment", () => {
       "Expected enriched domains for JA pathway genes");
   });
 });
+
+// ─── enrichment_analysis — include_ancestors DAG ──────────────────────
+
+describe("enrichment_analysis — include_ancestors DAG", () => {
+  it("include_ancestors=true returns a dag object with nodes and roots", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: true,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.dag, "Expected dag object in response");
+    assert.ok(data.dag.node_count > 0, "Expected node_count > 0");
+    assert.ok(Array.isArray(data.dag.root_ids), "Expected root_ids array");
+    assert.ok(data.dag.root_ids.length > 0, "Expected at least one root");
+    assert.ok(typeof data.dag.nodes === "object", "Expected nodes object");
+  });
+
+  it("DAG nodes have required structure (id, name, is_a, children)", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: true,
+      },
+    });
+    const nodes = toolResult(res).dag.nodes;
+    for (const [id, node] of Object.entries(nodes)) {
+      assert.ok(typeof node.id === "number", `Expected numeric id, got ${typeof node.id}`);
+      assert.ok(typeof node.name === "string", `Expected string name for ${id}`);
+      assert.ok(Array.isArray(node.is_a), `Expected is_a array for ${id}`);
+      assert.ok(Array.isArray(node.children), `Expected children array for ${id}`);
+    }
+  });
+
+  it("DAG includes more nodes than enriched terms (ancestor context)", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: true,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(data.dag.node_count >= data.significant_terms,
+      "DAG should have at least as many nodes as enriched terms (plus ancestor context)");
+  });
+
+  it("enriched DAG nodes have fold_enrichment and p_adjusted", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: true,
+      },
+    });
+    const nodes = toolResult(res).dag.nodes;
+    const enrichedNodes = Object.values(nodes).filter((n) => n.enriched);
+    assert.ok(enrichedNodes.length > 0, "Expected at least one enriched node");
+    for (const n of enrichedNodes) {
+      assert.ok(typeof n.fold_enrichment === "number", `Expected fold_enrichment on enriched node ${n.id}`);
+      assert.ok(typeof n.p_adjusted === "number", `Expected p_adjusted on enriched node ${n.id}`);
+      assert.ok(typeof n.foreground_count === "number", `Expected foreground_count on enriched node ${n.id}`);
+    }
+  });
+
+  it("root nodes have no parents (is_a is empty)", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: true,
+      },
+    });
+    const { nodes, root_ids } = toolResult(res).dag;
+    for (const rid of root_ids) {
+      assert.ok(nodes[rid], `Root ${rid} should exist in nodes`);
+      assert.deepStrictEqual(nodes[rid].is_a, [],
+        `Root node ${rid} should have empty is_a`);
+    }
+  });
+
+  it("include_ancestors=false does NOT return a dag object", async () => {
+    const res = await rpc("tools/call", {
+      name: "enrichment_analysis",
+      arguments: {
+        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+        background_fq: ["taxonomy__ancestors:4558"],
+        field: "GO__ancestors",
+        include_ancestors: false,
+      },
+    });
+    const data = toolResult(res);
+    assert.ok(!data.dag, "Expected NO dag when include_ancestors=false");
+  });
+});

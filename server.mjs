@@ -1006,6 +1006,7 @@ async function tool_enrichment_analysis(args) {
     correction = "bh",
     min_foreground_count = 2,
     max_terms = 200,
+    include_ancestors = false,
   } = args || {};
 
   if (!Array.isArray(foreground_fq) || foreground_fq.length === 0) {
@@ -1111,17 +1112,111 @@ async function tool_enrichment_analysis(args) {
     r.p_adjusted = parseFloat(r.p_adjusted.toExponential(3));
   }
 
-  // 6. Look up term names from MongoDB
+  // 6. Look up term names from MongoDB (and build DAG if requested)
+  const collName = FIELD_TO_COLLECTION[field];
+  const d = db();
+  const enrichedIds = new Set(results.map((r) => r.term_id));
+
   if (results.length > 0) {
-    const collection = FIELD_TO_COLLECTION[field];
-    const termIds = results.map((r) => r.term_id);
-    const d = db();
-    const termDocs = await d.collection(collection)
-      .find({ _id: { $in: termIds } }, { projection: { _id: 1, name: 1 } })
-      .toArray();
-    const nameMap = Object.fromEntries(termDocs.map((t) => [t._id, t.name]));
-    for (const r of results) {
-      r.term_name = nameMap[r.term_id] || null;
+    if (include_ancestors) {
+      // Collect all ancestor IDs from enriched terms
+      const allAncestorIds = new Set();
+      // First fetch enriched term docs to get their ancestors arrays
+      const enrichedDocs = await d.collection(collName)
+        .find({ _id: { $in: [...enrichedIds] } })
+        .toArray();
+      for (const doc of enrichedDocs) {
+        if (Array.isArray(doc.ancestors)) {
+          doc.ancestors.forEach((a) => allAncestorIds.add(a));
+        }
+        allAncestorIds.add(doc._id);
+      }
+
+      // Fetch all ancestor terms (many may already be in enrichedDocs)
+      const missingIds = [...allAncestorIds].filter((id) => !enrichedIds.has(id));
+      const ancestorDocs = missingIds.length > 0
+        ? await d.collection(collName)
+            .find({ _id: { $in: missingIds } })
+            .toArray()
+        : [];
+
+      const allDocs = [...enrichedDocs, ...ancestorDocs];
+      const docMap = Object.fromEntries(allDocs.map((t) => [t._id, t]));
+
+      // Attach names to enriched results
+      for (const r of results) {
+        r.term_name = docMap[r.term_id]?.name || null;
+      }
+
+      // Build enrichment lookup for quick access
+      const enrichmentMap = Object.fromEntries(results.map((r) => [r.term_id, r]));
+
+      // Build DAG nodes — each node has id, name, namespace, is_a (parents),
+      // children (derived), and enrichment stats if significant
+      const dagNodes = {};
+      const childrenMap = {};  // parent_id → Set of child_ids
+
+      for (const doc of allDocs) {
+        const id = doc._id;
+        const parents = Array.isArray(doc.is_a) ? doc.is_a.filter((p) => allAncestorIds.has(p)) : [];
+        const node = {
+          id,
+          name: doc.name || `${field.replace("__ancestors","")}:${id}`,
+          namespace: doc.namespace || null,
+          is_a: parents,
+          children: [],
+        };
+        if (enrichmentMap[id]) {
+          node.enriched = true;
+          node.fold_enrichment = enrichmentMap[id].fold_enrichment;
+          node.p_adjusted = enrichmentMap[id].p_adjusted;
+          node.foreground_count = enrichmentMap[id].foreground_count;
+          node.background_count = enrichmentMap[id].background_count;
+        }
+        dagNodes[id] = node;
+
+        for (const pid of parents) {
+          if (!childrenMap[pid]) childrenMap[pid] = new Set();
+          childrenMap[pid].add(id);
+        }
+      }
+
+      // Wire up children arrays
+      for (const [pid, kids] of Object.entries(childrenMap)) {
+        if (dagNodes[pid]) dagNodes[pid].children = [...kids].sort((a, b) => a - b);
+      }
+
+      // Identify roots: nodes with no parents within the DAG
+      const roots = Object.values(dagNodes)
+        .filter((n) => n.is_a.length === 0)
+        .map((n) => n.id)
+        .sort((a, b) => a - b);
+
+      // Return with DAG
+      return {
+        foreground_count: fgTotal,
+        background_count: bgTotal,
+        field,
+        correction,
+        p_threshold,
+        terms_tested: fgFacets.size,
+        significant_terms: results.length,
+        terms: results,
+        dag: {
+          node_count: Object.keys(dagNodes).length,
+          root_ids: roots,
+          nodes: dagNodes,
+        },
+      };
+    } else {
+      // No DAG requested — just resolve names
+      const termDocs = await d.collection(collName)
+        .find({ _id: { $in: [...enrichedIds] } }, { projection: { _id: 1, name: 1 } })
+        .toArray();
+      const nameMap = Object.fromEntries(termDocs.map((t) => [t._id, t.name]));
+      for (const r of results) {
+        r.term_name = nameMap[r.term_id] || null;
+      }
     }
   }
 
@@ -1716,6 +1811,17 @@ const TOOL_REGISTRY = {
           max_terms: {
             type: "integer",
             description: "Maximum enriched terms to return (sorted by p_adjusted). Default: 200.",
+          },
+          include_ancestors: {
+            type: "boolean",
+            description: [
+              "When true, fetches all ancestor terms of the enriched terms from MongoDB",
+              "and returns a 'dag' object containing the ontology subgraph connecting the",
+              "enriched terms to their root(s). Each DAG node has: id, name, namespace,",
+              "is_a (parent IDs), children (child IDs), and enrichment stats if significant.",
+              "Use this to build an interactive ontology browser showing the enriched terms",
+              "in their full hierarchical context. Default: false.",
+            ].join(" "),
           },
         },
         required: ["foreground_fq", "background_fq"],

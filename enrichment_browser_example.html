@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>GO Enrichment — Ontology Browser</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #f7f8fa; color: #2c3e50; line-height: 1.5; }
+  header { background: #1a6e3b; color: white; padding: 20px 32px; }
+  header h1 { font-size: 1.4rem; font-weight: 600; }
+  header .sub { font-size: 0.85rem; opacity: 0.8; margin-top: 4px; }
+  .controls { padding: 16px 32px; display: flex; gap: 12px; align-items: center;
+              background: white; border-bottom: 1px solid #e5e7eb; }
+  .controls button { padding: 6px 14px; border-radius: 6px; border: 1px solid #cbd5e1;
+                     background: white; cursor: pointer; font-size: 0.82rem; color: #475569; }
+  .controls button:hover { background: #f1f5f9; }
+  .controls .legend { margin-left: auto; font-size: 0.78rem; color: #94a3b8; }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                 margin-right: 4px; vertical-align: middle; }
+  .legend .enriched-dot { background: #16a34a; }
+  .legend .context-dot  { background: #cbd5e1; }
+  #tree { padding: 20px 32px 40px; max-width: 1100px; }
+
+  /* Tree node styling */
+  .dag-node { margin-left: 0; position: relative; }
+  .dag-node .node-row {
+    display: flex; align-items: flex-start; gap: 8px; padding: 5px 10px;
+    border-radius: 6px; cursor: default; transition: background 0.1s;
+  }
+  .dag-node .node-row:hover { background: #f1f5f9; }
+  .dag-node .toggle {
+    width: 20px; height: 20px; flex-shrink: 0; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; color: #94a3b8; border-radius: 4px;
+    user-select: none; margin-top: 2px;
+  }
+  .dag-node .toggle:hover { background: #e2e8f0; color: #475569; }
+  .dag-node .toggle.leaf { visibility: hidden; }
+  .dag-node .info { flex: 1; min-width: 0; }
+  .dag-node .term-name { font-weight: 500; font-size: 0.92rem; }
+  .dag-node .term-id { font-size: 0.75rem; color: #94a3b8; margin-left: 6px; font-weight: 400; }
+  .dag-node .stats {
+    display: inline-flex; gap: 10px; margin-left: 10px;
+    font-size: 0.75rem; color: #64748b;
+  }
+  .dag-node .stats .fold { font-weight: 700; color: #16a34a; }
+  .dag-node .stats .pval { color: #94a3b8; }
+  .dag-node .bar-wrap {
+    width: 100px; height: 6px; background: #e5e7eb; border-radius: 3px;
+    flex-shrink: 0; margin-top: 8px;
+  }
+  .dag-node .bar-fill { height: 100%; border-radius: 3px; min-width: 2px;
+                         transition: width 0.3s; }
+  .dag-node.enriched .term-name { color: #15803d; }
+  .dag-node.enriched .bar-fill  { background: #16a34a; }
+  .dag-node.context  .term-name { color: #94a3b8; }
+  .dag-node.context  .bar-fill  { background: #cbd5e1; }
+  .dag-children { margin-left: 28px; border-left: 2px solid #e5e7eb;
+                  padding-left: 4px; }
+  .dag-children.collapsed { display: none; }
+  .namespace-tag { font-size: 0.65rem; padding: 1px 6px; border-radius: 10px;
+                   color: white; font-weight: 600; letter-spacing: 0.03em;
+                   flex-shrink: 0; margin-top: 3px; }
+  .ns-molecular_function { background: #6366f1; }
+  .ns-biological_process { background: #0891b2; }
+  .ns-cellular_component { background: #d97706; }
+  .summary-bar { padding: 12px 32px; background: #f0fdf4; border-bottom: 1px solid #bbf7d0;
+                 font-size: 0.85rem; color: #166534; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>GO Enrichment — Ontology Browser</h1>
+  <div class="sub">
+    Jasmonic acid biosynthesis pathway genes in <em>Sorghum bicolor</em>
+    — 9 foreground genes vs 2,000,878 background genes
+  </div>
+</header>
+
+<div class="summary-bar" id="summary"></div>
+
+<div class="controls">
+  <button onclick="expandAll()">Expand All</button>
+  <button onclick="collapseAll()">Collapse All</button>
+  <button onclick="expandEnriched()">Show Enriched Only</button>
+  <div class="legend">
+    <span class="dot enriched-dot"></span> Enriched (p<sub>adj</sub> &lt; 0.05)
+    &nbsp;&nbsp;
+    <span class="dot context-dot"></span> Ancestor context
+  </div>
+</div>
+
+<div id="tree"></div>
+
+<script>
+// ─── Embedded DAG data from enrichment_analysis(include_ancestors=true) ──────
+const DAG_DATA = {"foreground_count":9,"background_count":2000878,"node_count":10,"root_ids":[3674],"nodes":{"3824":{"id":3824,"name":"catalytic activity","namespace":"molecular_function","is_a":[3674],"children":[16491,16787],"enriched":true,"fold_enrichment":2.4,"p_adjusted":0.001265,"foreground_count":9,"background_count":833968},"16491":{"id":16491,"name":"oxidoreductase activity","namespace":"molecular_function","is_a":[3824],"children":[],"enriched":true,"fold_enrichment":7.74,"p_adjusted":0.0007531,"foreground_count":5,"background_count":143710},"16788":{"id":16788,"name":"hydrolase activity, acting on ester bonds","namespace":"molecular_function","is_a":[16787],"children":[],"enriched":true,"fold_enrichment":10.53,"p_adjusted":0.006594,"foreground_count":3,"background_count":63336},"36094":{"id":36094,"name":"small molecule binding","namespace":"molecular_function","is_a":[5488],"children":[43167],"enriched":true,"fold_enrichment":3.41,"p_adjusted":0.0007374,"foreground_count":8,"background_count":521604},"43167":{"id":43167,"name":"ion binding","namespace":"molecular_function","is_a":[36094],"children":[43169],"enriched":true,"fold_enrichment":3.54,"p_adjusted":0.0007363,"foreground_count":8,"background_count":502395},"43169":{"id":43169,"name":"cation binding","namespace":"molecular_function","is_a":[43167],"children":[46872],"enriched":true,"fold_enrichment":7.74,"p_adjusted":3.085e-05,"foreground_count":7,"background_count":200936},"46872":{"id":46872,"name":"metal ion binding","namespace":"molecular_function","is_a":[43169],"children":[],"enriched":true,"fold_enrichment":7.8,"p_adjusted":3.085e-05,"foreground_count":7,"background_count":199392},"3674":{"id":3674,"name":"molecular_function","namespace":"molecular_function","is_a":[],"children":[3824,5488]},"5488":{"id":5488,"name":"binding","namespace":"molecular_function","is_a":[3674],"children":[36094]},"16787":{"id":16787,"name":"hydrolase activity","namespace":"molecular_function","is_a":[3824],"children":[16788]}},"enriched_ids":[46872,43169,43167,36094,16491,3824,16788]};
+
+const nodes = DAG_DATA.nodes;
+const enrichedSet = new Set(DAG_DATA.enriched_ids);
+const maxFold = Math.max(...Object.values(nodes).filter(n => n.enriched).map(n => n.fold_enrichment));
+
+// Track expanded state per node
+const expanded = {};
+for (const id of Object.keys(nodes)) {
+  expanded[id] = true; // start expanded
+}
+
+function goId(n) {
+  return "GO:" + String(n).padStart(7, "0");
+}
+
+function pFmt(p) {
+  if (p < 0.001) return p.toExponential(1);
+  return p.toFixed(4);
+}
+
+function renderNode(id) {
+  const n = nodes[id];
+  if (!n) return "";
+  const isEnriched = !!n.enriched;
+  const hasChildren = n.children && n.children.length > 0;
+  const cls = isEnriched ? "enriched" : "context";
+
+  // Bar width: proportion of foreground annotated (if enriched)
+  const barPct = isEnriched
+    ? Math.max(3, (n.fold_enrichment / maxFold) * 100)
+    : 0;
+
+  let statsHtml = "";
+  if (isEnriched) {
+    statsHtml = `<span class="stats">
+      <span class="fold">${n.fold_enrichment.toFixed(1)}× enriched</span>
+      <span>${n.foreground_count}/${DAG_DATA.foreground_count} fg</span>
+      <span class="pval">p<sub>adj</sub>=${pFmt(n.p_adjusted)}</span>
+    </span>`;
+  }
+
+  const nsTag = n.namespace
+    ? `<span class="namespace-tag ns-${n.namespace}">${n.namespace.replace("_"," ").charAt(0).toUpperCase()}</span>`
+    : "";
+
+  const toggleIcon = hasChildren
+    ? `<span class="toggle" onclick="toggle(${id})">${expanded[id] ? "▼" : "▶"}</span>`
+    : `<span class="toggle leaf"></span>`;
+
+  let childrenHtml = "";
+  if (hasChildren) {
+    const childContent = n.children.map(cid => renderNode(cid)).join("");
+    childrenHtml = `<div class="dag-children ${expanded[id] ? "" : "collapsed"}" id="children-${id}">${childContent}</div>`;
+  }
+
+  return `
+    <div class="dag-node ${cls}" id="node-${id}">
+      <div class="node-row">
+        ${toggleIcon}
+        <div class="info">
+          <span class="term-name">${n.name}</span>
+          <span class="term-id">${goId(id)}</span>
+          ${statsHtml}
+        </div>
+        ${isEnriched ? `<div class="bar-wrap"><div class="bar-fill" style="width:${barPct}%"></div></div>` : ""}
+      </div>
+      ${childrenHtml}
+    </div>`;
+}
+
+function toggle(id) {
+  expanded[id] = !expanded[id];
+  const el = document.getElementById("children-" + id);
+  const toggle = document.querySelector(`#node-${id} > .node-row > .toggle`);
+  if (el) el.classList.toggle("collapsed", !expanded[id]);
+  if (toggle) toggle.textContent = expanded[id] ? "▼" : "▶";
+}
+
+function expandAll() {
+  for (const id of Object.keys(nodes)) {
+    expanded[id] = true;
+    const el = document.getElementById("children-" + id);
+    const tog = document.querySelector(`#node-${id} > .node-row > .toggle`);
+    if (el) el.classList.remove("collapsed");
+    if (tog && nodes[id].children?.length) tog.textContent = "▼";
+  }
+}
+
+function collapseAll() {
+  for (const id of Object.keys(nodes)) {
+    expanded[id] = false;
+    const el = document.getElementById("children-" + id);
+    const tog = document.querySelector(`#node-${id} > .node-row > .toggle`);
+    if (el) el.classList.add("collapsed");
+    if (tog && nodes[id].children?.length) tog.textContent = "▶";
+  }
+}
+
+function expandEnriched() {
+  // Collapse everything first, then expand paths to enriched terms
+  collapseAll();
+  // For each enriched node, expand all its ancestors
+  for (const eid of DAG_DATA.enriched_ids) {
+    let current = eid;
+    while (current !== undefined && nodes[current]) {
+      expanded[current] = true;
+      const el = document.getElementById("children-" + current);
+      const tog = document.querySelector(`#node-${current} > .node-row > .toggle`);
+      if (el) el.classList.remove("collapsed");
+      if (tog && nodes[current].children?.length) tog.textContent = "▼";
+      // Walk to parent
+      current = nodes[current].is_a?.[0];
+    }
+  }
+}
+
+// Render
+const treeEl = document.getElementById("tree");
+treeEl.innerHTML = DAG_DATA.root_ids.map(rid => renderNode(rid)).join("");
+
+// Summary
+const enrichedCount = DAG_DATA.enriched_ids.length;
+const totalNodes = DAG_DATA.node_count;
+document.getElementById("summary").innerHTML =
+  `<strong>${enrichedCount}</strong> enriched GO terms (p<sub>adj</sub> &lt; 0.05) shown in context with ` +
+  `<strong>${totalNodes - enrichedCount}</strong> ancestor terms · ` +
+  `Foreground: ${DAG_DATA.foreground_count} genes · Background: ${DAG_DATA.background_count.toLocaleString()} genes`;
+</script>
+</body>
+</html>

@@ -643,6 +643,49 @@ enrichment_analysis(
 - The background should be all annotated genes in the **same genome** to avoid
   species composition bias
 
+**Ontology DAG browser — `include_ancestors: true`:**
+
+Pass `include_ancestors: true` to get the full ontology subgraph connecting
+enriched terms back to their root(s). The response includes a `dag` object:
+
+```
+enrichment_analysis(
+  foreground_fq=["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
+  background_fq=["taxonomy__ancestors:4558"],
+  field="GO__ancestors",
+  include_ancestors=true
+)
+
+# Response includes:
+# dag: {
+#   node_count: 10,
+#   root_ids: [3674],
+#   nodes: {
+#     "3674": { id: 3674, name: "molecular_function", namespace: "molecular_function",
+#               is_a: [], children: [3824, 5488] },
+#     "46872": { id: 46872, name: "metal ion binding", ..., enriched: true,
+#                fold_enrichment: 7.8, p_adjusted: 3.085e-05,
+#                foreground_count: 7, background_count: 199392,
+#                is_a: [43169], children: [] },
+#     ...
+#   }
+# }
+```
+
+Each DAG node contains:
+- `id`, `name`, `namespace` — ontology term metadata
+- `is_a` — direct parent term IDs (edges in the DAG)
+- `children` — child term IDs within the enriched subgraph
+- `enriched` — true if this term is statistically significant
+- `fold_enrichment`, `p_adjusted`, `foreground_count`, `background_count` — stats (enriched terms only)
+
+Use this to build an interactive collapsible ontology tree showing enriched
+terms (highlighted) in their hierarchical context with ancestor terms (grey).
+The `root_ids` array identifies the top-level nodes (no parents in the subgraph).
+Walk `children` arrays recursively to render the tree. The DAG structure preserves
+the full Gene Ontology (or PO/TO/pathway) hierarchy between enriched leaf terms
+and the root, making it easy to see which biological themes are enriched.
+
 ### 9. Find germplasm with predicted loss-of-function alleles in a gene
 
 The `vep_for_gene` tool retrieves all VEP__ Solr dynamic fields for a gene and
