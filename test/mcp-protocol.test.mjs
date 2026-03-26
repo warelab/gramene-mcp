@@ -73,6 +73,7 @@ describe("MCP protocol", () => {
     const res = await rpc("tools/list");
     const names = res.result.tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "enrichment_analysis",
       "expression_for_genes",
       "genes_in_region",
       "kb_relations",
@@ -83,6 +84,7 @@ describe("MCP protocol", () => {
       "solr_search",
       "solr_search_bool",
       "solr_suggest",
+      "vep_for_gene",
     ]);
   });
 
@@ -107,14 +109,14 @@ describe("HTTP edge cases", () => {
     assert.equal(res.status, 405);
   });
 
-  it("POST /wrong-path → 404", async () => {
+  it("POST /wrong-path → 405", async () => {
     const url = BASE.replace("/mcp", "/wrong");
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-    assert.equal(res.status, 404);
+    assert.equal(res.status, 405);
   });
 
   it("empty body → 400", async () => {
