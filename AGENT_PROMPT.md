@@ -164,7 +164,8 @@ via the compara graph.
 - `from`: `compara_neighbors_10` (or `_5`, `_20`, etc.)
 - `to`: `compara_idx_multi`
 - `seed_q`: `gene_tree:<id>` or `id:<gene_id>`
-- `maxDepth`: 1 (direct neighbors only)
+- `maxDepth`: **always pass `maxDepth=1`** — without it the graph traversal recurses
+  deeply and the query can run for minutes or time out entirely
 
 Returns gene documents for all genes that are genomic neighbors of the seed
 gene(s) in any species sharing the same compara alignment. This is the primary
@@ -626,7 +627,8 @@ mongo_lookup_by_ids(collection: "TO", ids: <TO__ancestors from genes>)
 **Step 4 — Find conserved orthologs:**
 ```
 solr_graph(from: "compara_neighbors_10", to: "compara_idx_multi",
-           seed_q: "gene_tree:<id>", fl: "id,system_name,gene_tree")
+           seed_q: "gene_tree:<id>", fl: "id,system_name,gene_tree",
+           maxDepth: 1)
   → collect ortholog gene IDs from other species
 ```
 
@@ -673,7 +675,8 @@ solr_search(q="id:<gene_id>", fl="id,gene_tree,homology__ortholog_one2one,compar
 
 # Or retrieve the full ortholog set via graph traversal (includes all types)
 solr_graph(from: "compara_neighbors_10", to: "compara_idx_multi",
-           seed_q: "gene_tree:<tree_id>", fl: "id,name,system_name")
+           seed_q: "gene_tree:<tree_id>", fl: "id,name,system_name",
+           maxDepth: 1)
   → collect all homologs/orthologs
 
 expression_for_genes(gene_ids: <orthologs>, experiment_type: "Baseline")
