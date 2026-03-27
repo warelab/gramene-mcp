@@ -1360,12 +1360,14 @@ async function tool_pubmed_for_genes(args) {
   }
 
   // Step 1: Fetch PUBMED__xrefs from Solr, filtering to genes with capabilities:pubs
-  const idQuery = gene_ids.map(id => `id:${id}`).join(" OR ");
+  // Use defType=lucene for reliable OR queries across multiple gene IDs
+  const idList = gene_ids.join(" OR ");
   const solrResult = await solrFetch(SOLR_GENES_CORE, "query", {
-    q: idQuery,
+    q: `id:(${idList})`,
     fq: ["capabilities:pubs"],
     fl: "id,name,description,PUBMED__xrefs",
     rows: gene_ids.length,
+    defType: "lucene",
   });
   const docs = solrResult?.response?.docs || [];
 

@@ -1124,7 +1124,7 @@ describe("pubmed_for_genes", () => {
       name: "pubmed_for_genes",
       arguments: {},
     });
-    assert.ok(res.result.isError || res.error, "Should error when gene_ids missing");
+    assert.ok(res.error || res.result?.isError, "Should error when gene_ids missing");
   });
 
   it("returns paper metadata for a gene with known publications", async () => {
