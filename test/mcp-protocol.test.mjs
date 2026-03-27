@@ -80,6 +80,7 @@ describe("MCP protocol", () => {
       "mongo_find",
       "mongo_list_collections",
       "mongo_lookup_by_ids",
+      "pubmed_for_genes",
       "solr_graph",
       "solr_search",
       "solr_search_bool",
@@ -1106,5 +1107,104 @@ describe("enrichment_analysis — include_ancestors DAG", () => {
     });
     const data = toolResult(res);
     assert.ok(!data.dag, "Expected NO dag when include_ancestors=false");
+  });
+});
+
+// ─── pubmed_for_genes ────────────────────────────────────────────────
+
+describe("pubmed_for_genes", () => {
+  it("is registered", async () => {
+    const res = await rpc("tools/list");
+    const names = res.result.tools.map((t) => t.name);
+    assert.ok(names.includes("pubmed_for_genes"), "pubmed_for_genes should be registered");
+  });
+
+  it("requires gene_ids", async () => {
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: {},
+    });
+    assert.ok(res.result.isError || res.error, "Should error when gene_ids missing");
+  });
+
+  it("returns paper metadata for a gene with known publications", async () => {
+    // SORBI_3006G095600 has PUBMED__xrefs: ["31597271"] (Gladman et al. 2019)
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: { gene_ids: ["SORBI_3006G095600"] },
+    });
+    const data = toolResult(res);
+    assert.ok(data.gene_count >= 1, "Should find the gene");
+    assert.ok(data.genes_with_papers >= 1, "Gene should have papers");
+    const gene = data.genes["SORBI_3006G095600"];
+    assert.ok(gene, "Gene entry should exist");
+    assert.ok(gene.count >= 1, "Should have at least 1 paper");
+    const paper = gene.papers[0];
+    assert.ok(paper.pmid, "Paper should have a pmid");
+    assert.ok(paper.title, "Paper should have a title");
+    assert.ok(paper.title.length > 10, "Title should be a real title");
+    assert.ok(paper.authors && paper.authors.length > 0, "Should have authors");
+    assert.ok(paper.journal, "Should have a journal");
+    assert.ok(paper.url.includes("pubmed"), "Should have a PubMed URL");
+  });
+
+  it("returns empty papers for a gene without publications", async () => {
+    // Use a gene that does NOT have capabilities:pubs
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: { gene_ids: ["SORBI_3001G000100"] },
+    });
+    const data = toolResult(res);
+    const gene = data.genes["SORBI_3001G000100"];
+    assert.ok(gene, "Gene entry should exist even without papers");
+    assert.equal(gene.count, 0, "Should have 0 papers");
+  });
+
+  it("include_abstract returns abstract text", async () => {
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: { gene_ids: ["SORBI_3006G095600"], include_abstract: true },
+    });
+    const data = toolResult(res);
+    const gene = data.genes["SORBI_3006G095600"];
+    assert.ok(gene.count >= 1, "Should have papers");
+    const paper = gene.papers[0];
+    assert.ok(paper.abstract, "Should have an abstract when include_abstract=true");
+    assert.ok(paper.abstract.length > 50, "Abstract should be substantial text");
+  });
+
+  it("handles multiple genes in a single call", async () => {
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: {
+        gene_ids: ["SORBI_3006G095600", "SORBI_3001G000100", "SORBI_3009G083300"],
+      },
+    });
+    const data = toolResult(res);
+    assert.equal(Object.keys(data.genes).length, 3, "Should return entries for all 3 genes");
+    assert.ok(data.total_unique_papers >= 1, "Should have at least 1 paper total");
+  });
+
+  it("handles rice genes with DOI-only refs", async () => {
+    // Os01g0102400 has both PMID and DOI refs
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: { gene_ids: ["Os01g0102400"] },
+    });
+    const data = toolResult(res);
+    const gene = data.genes["Os01g0102400"];
+    assert.ok(gene, "Rice gene entry should exist");
+    assert.ok(gene.count >= 1, "Should have at least 1 paper");
+  });
+
+  it("returns DOI and URL fields for papers", async () => {
+    const res = await rpc("tools/call", {
+      name: "pubmed_for_genes",
+      arguments: { gene_ids: ["SORBI_3006G095600"] },
+    });
+    const data = toolResult(res);
+    const paper = data.genes["SORBI_3006G095600"].papers[0];
+    assert.ok(paper.doi, "Paper should have a DOI");
+    assert.ok(paper.url, "Paper should have a URL");
   });
 });

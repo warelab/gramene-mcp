@@ -330,6 +330,15 @@ const KB_RELATIONS = {
           type: "string[]",
           description: "Data types available for this gene. Values include: 'expression' (RNA-seq data in the expression collection), 'pathways' (Plant Reactome annotation), 'homology' (Compara gene trees), 'pubs' (literature), 'regulation' (regulatory features), 'variation' (genetic variants). Use as a filter to restrict to genes with specific data: fq=['capabilities:expression']."
         },
+        // Literature cross-references
+        "PUBMED__xrefs": {
+          type: "string[]",
+          description: "PubMed cross-references for this gene. Values are PMID strings (e.g. '31597271') or DOI strings prefixed with 'DOI:' (e.g. 'DOI:10.1016/j.cj.2016.06.014'). Only present on genes with capabilities:pubs. Use the pubmed_for_genes tool to resolve these to full paper metadata (title, authors, abstract)."
+        },
+        "GenBank__xrefs": {
+          type: "string[]",
+          description: "GenBank protein accession cross-references (e.g. 'EES10882')."
+        },
         // VEP (Variant Effect Prediction) loss-of-function fields
         // Field name encoding: VEP__{consequence}__{zygosity}__{species}__{study_id}__attr_ss
         // Merged totals:       VEP__merged__{EMS|NAT}__attr_ss
@@ -1232,6 +1241,236 @@ async function tool_enrichment_analysis(args) {
   };
 }
 
+// --- PubMed / literature helpers ---
+
+const NCBI_ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
+const NCBI_ESEARCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
+const NCBI_EFETCH_URL   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+
+/**
+ * Fetch paper summaries from NCBI E-utilities for a list of PMIDs.
+ * Returns a Map<pmid_string, {pmid, title, authors, journal, pubdate, doi, url}>.
+ * Batches up to 200 per request.
+ */
+async function fetchPubmedSummaries(pmids) {
+  const results = new Map();
+  if (!pmids.length) return results;
+  const BATCH = 200;
+  for (let i = 0; i < pmids.length; i += BATCH) {
+    const batch = pmids.slice(i, i + BATCH);
+    const url = `${NCBI_ESUMMARY_URL}?db=pubmed&id=${batch.join(",")}&retmode=json`;
+    const res = await fetch(url);
+    if (!res.ok) continue;
+    const data = await res.json();
+    if (!data.result) continue;
+    for (const uid of (data.result.uids || [])) {
+      const rec = data.result[uid];
+      if (!rec || rec.error) continue;
+      let doi = "";
+      if (rec.elocationid) {
+        const m = rec.elocationid.match(/doi:\s*(10\.\S+)/i);
+        if (m) doi = m[1];
+      }
+      if (!doi && rec.articleids) {
+        const d = rec.articleids.find(a => a.idtype === "doi");
+        if (d) doi = d.value;
+      }
+      results.set(String(uid), {
+        pmid: String(uid),
+        title: rec.title || "",
+        authors: (rec.authors || []).map(a => a.name),
+        journal: rec.source || rec.fulljournalname || "",
+        pubdate: rec.pubdate || "",
+        doi,
+        url: `https://pubmed.ncbi.nlm.nih.gov/${uid}/`,
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * Resolve DOIs to PMIDs via NCBI esearch.  Returns Map<doi, pmid_string>.
+ */
+async function resolveDoisToPmids(dois) {
+  const result = new Map();
+  if (!dois.length) return result;
+  // esearch one-at-a-time (DOIs can't reliably be batched in a single term query)
+  for (const doi of dois.slice(0, 50)) {  // cap at 50 to stay polite
+    try {
+      const url = `${NCBI_ESEARCH_URL}?db=pubmed&term=${encodeURIComponent(doi)}[doi]&retmode=json`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const ids = data?.esearchresult?.idlist;
+      if (ids && ids.length === 1) {
+        result.set(doi, ids[0]);
+      }
+    } catch (_) { /* skip failed lookups */ }
+  }
+  return result;
+}
+
+/**
+ * Fetch abstracts for a list of PMIDs.  Returns Map<pmid_string, abstract_text>.
+ */
+async function fetchPubmedAbstracts(pmids) {
+  const results = new Map();
+  if (!pmids.length) return results;
+  const BATCH = 50;
+  for (let i = 0; i < pmids.length; i += BATCH) {
+    const batch = pmids.slice(i, i + BATCH);
+    try {
+      const url = `${NCBI_EFETCH_URL}?db=pubmed&id=${batch.join(",")}&rettype=xml&retmode=xml`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const xml = await res.text();
+      // Simple XML extraction of AbstractText elements per PMID
+      const articleRegex = /<PubmedArticle>[\s\S]*?<\/PubmedArticle>/g;
+      let match;
+      while ((match = articleRegex.exec(xml)) !== null) {
+        const article = match[0];
+        const pmidMatch = article.match(/<PMID[^>]*>(\d+)<\/PMID>/);
+        if (!pmidMatch) continue;
+        const pmid = pmidMatch[1];
+        // Collect all AbstractText segments
+        const absTexts = [];
+        const absRegex = /<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/g;
+        let absMatch;
+        while ((absMatch = absRegex.exec(article)) !== null) {
+          // Strip inline XML tags (e.g. <i>, <b>, <sup>)
+          absTexts.push(absMatch[1].replace(/<[^>]+>/g, ""));
+        }
+        if (absTexts.length) {
+          results.set(pmid, absTexts.join(" "));
+        }
+      }
+    } catch (_) { /* skip failed batches */ }
+  }
+  return results;
+}
+
+async function tool_pubmed_for_genes(args) {
+  const { gene_ids, include_abstract = false } = args || {};
+  if (!gene_ids || !gene_ids.length) {
+    throw Object.assign(new Error("gene_ids is required (non-empty array)"), { code: -32602 });
+  }
+  if (gene_ids.length > 500) {
+    throw Object.assign(new Error("gene_ids limited to 500"), { code: -32602 });
+  }
+
+  // Step 1: Fetch PUBMED__xrefs from Solr, filtering to genes with capabilities:pubs
+  const idQuery = gene_ids.map(id => `id:${id}`).join(" OR ");
+  const solrResult = await solrFetch(SOLR_GENES_CORE, "query", {
+    q: idQuery,
+    fq: ["capabilities:pubs"],
+    fl: "id,name,description,PUBMED__xrefs",
+    rows: gene_ids.length,
+  });
+  const docs = solrResult?.response?.docs || [];
+
+  // Step 2: Collect all PMIDs and DOIs across all genes
+  const allPmids = new Set();
+  const allDois = new Set();
+  const geneRefs = {};  // geneId → { pmids: [], dois: [] }
+
+  for (const doc of docs) {
+    const refs = doc["PUBMED__xrefs"] || [];
+    const pmids = [];
+    const dois = [];
+    for (const ref of refs) {
+      if (ref.startsWith("DOI:")) {
+        dois.push(ref.slice(4));
+        allDois.add(ref.slice(4));
+      } else if (/^\d+$/.test(ref)) {
+        pmids.push(ref);
+        allPmids.add(ref);
+      }
+    }
+    geneRefs[doc.id] = { name: doc.name, description: doc.description, pmids, dois };
+  }
+
+  // Step 3: Resolve DOI-only refs to PMIDs
+  const doiToPmid = await resolveDoisToPmids([...allDois].filter(doi => {
+    // only resolve DOIs that don't already have a PMID from the same gene
+    return true;  // resolve all; we'll merge later
+  }));
+  for (const [doi, pmid] of doiToPmid) {
+    allPmids.add(pmid);
+  }
+
+  // Step 4: Fetch paper metadata from NCBI
+  const summaries = await fetchPubmedSummaries([...allPmids]);
+
+  // Step 5: Optionally fetch abstracts
+  let abstracts = new Map();
+  if (include_abstract) {
+    abstracts = await fetchPubmedAbstracts([...allPmids]);
+  }
+
+  // Step 6: Build per-gene results
+  const genes = {};
+  let totalPapers = 0;
+  const allPaperIds = new Set();
+
+  for (const geneId of gene_ids) {
+    const ref = geneRefs[geneId];
+    if (!ref) {
+      genes[geneId] = { name: null, description: null, papers: [], count: 0 };
+      continue;
+    }
+
+    const papers = [];
+    const seenPmids = new Set();
+
+    // Add papers from direct PMIDs
+    for (const pmid of ref.pmids) {
+      if (seenPmids.has(pmid)) continue;
+      seenPmids.add(pmid);
+      const summary = summaries.get(pmid);
+      if (summary) {
+        const paper = { ...summary };
+        if (include_abstract && abstracts.has(pmid)) {
+          paper.abstract = abstracts.get(pmid);
+        }
+        papers.push(paper);
+        allPaperIds.add(pmid);
+      }
+    }
+
+    // Add papers from DOIs (resolved to PMIDs)
+    for (const doi of ref.dois) {
+      const pmid = doiToPmid.get(doi);
+      if (pmid && !seenPmids.has(pmid)) {
+        seenPmids.add(pmid);
+        const summary = summaries.get(pmid);
+        if (summary) {
+          const paper = { ...summary };
+          if (include_abstract && abstracts.has(pmid)) {
+            paper.abstract = abstracts.get(pmid);
+          }
+          papers.push(paper);
+          allPaperIds.add(pmid);
+        }
+      } else if (!pmid) {
+        // DOI couldn't be resolved — include as DOI-only reference
+        papers.push({ doi, url: `https://doi.org/${doi}`, title: null, unresolved: true });
+        allPaperIds.add(`doi:${doi}`);
+      }
+    }
+
+    genes[geneId] = { name: ref.name || null, description: ref.description || null, papers, count: papers.length };
+    totalPapers += papers.length;
+  }
+
+  return {
+    gene_count: Object.keys(geneRefs).length,
+    genes_with_papers: Object.values(genes).filter(g => g.count > 0).length,
+    total_unique_papers: allPaperIds.size,
+    genes,
+  };
+}
+
 async function tool_solr_search(args) {
   return solrFetch(SOLR_GENES_CORE, "query", args);
 }
@@ -1828,6 +2067,35 @@ const TOOL_REGISTRY = {
       },
     },
     handler: tool_enrichment_analysis,
+  },
+
+  pubmed_for_genes: {
+    definition: {
+      name: "pubmed_for_genes",
+      description: [
+        "Retrieve published literature (PubMed papers) associated with a list of genes.",
+        "Fetches PUBMED__xrefs from the Solr genes index and resolves them to full paper",
+        "metadata (title, authors, journal, date, DOI) via NCBI E-utilities.",
+        "Optionally includes paper abstracts. Handles both PMID and DOI-only references.",
+        "Use this to find what is known about candidate genes from the literature.",
+      ].join(" "),
+      inputSchema: {
+        type: "object",
+        properties: {
+          gene_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "Gene stable IDs to look up papers for (max 500). Include orthologs from other species to find literature on well-studied homologs.",
+          },
+          include_abstract: {
+            type: "boolean",
+            description: "When true, fetches paper abstracts from PubMed XML. Slower but provides full context for each paper. Default: false.",
+          },
+        },
+        required: ["gene_ids"],
+      },
+    },
+    handler: tool_pubmed_for_genes,
   },
 };
 

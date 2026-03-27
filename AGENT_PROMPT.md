@@ -223,6 +223,55 @@ Key parameters:
 
 ---
 
+### `pubmed_for_genes`
+**Use for:** Finding published literature associated with genes. Resolves
+`PUBMED__xrefs` from the Solr genes index to full paper metadata (title,
+authors, journal, date, DOI, abstract) via NCBI E-utilities.
+
+Key parameters:
+- `gene_ids` — list of gene stable IDs (max 500). Include orthologs from
+  well-studied species (rice, Arabidopsis) to find literature on homologs.
+- `include_abstract` — set `true` to fetch full paper abstracts from PubMed
+  XML (slower). Default: `false` (summary metadata only).
+
+**What the result contains:**
+- `genes_with_papers` — count of genes that have literature references
+- `total_unique_papers` — total distinct papers across all queried genes
+- `genes[<id>].papers[]` — per-gene paper list, each with:
+  - `pmid`, `title`, `authors[]`, `journal`, `pubdate`, `doi`, `url`
+  - `abstract` (only when `include_abstract=true`)
+  - `unresolved: true` for DOI-only refs that couldn't be resolved to a PMID
+
+**Important notes:**
+- Only genes with `capabilities:pubs` in Solr have literature cross-references.
+  The tool automatically filters for this, so genes without publications simply
+  return `count: 0`.
+- Some references are DOI-only (no PMID). The tool attempts to resolve these
+  via NCBI esearch, but unresolved DOIs are still returned with a `doi.org` URL.
+- For QTL candidate analysis, include rice and Arabidopsis orthologs — these
+  model species have far more literature coverage than most crops.
+
+**Example:**
+```
+# Get papers for a sorghum gene and its rice ortholog
+pubmed_for_genes(
+  gene_ids=["SORBI_3006G095600", "Os04g0447100"],
+  include_abstract=true
+)
+
+# Response:
+# genes_with_papers: 2
+# genes.SORBI_3006G095600.papers[0]:
+#   { pmid: "31597271",
+#     title: "Fertility of Pedicellate Spikelets in Sorghum...",
+#     authors: ["Gladman N", "Jiao Y", "Lee YK", ...],
+#     journal: "Int J Mol Sci", pubdate: "2019 Oct 8",
+#     doi: "10.3390/ijms20194951",
+#     abstract: "As in other cereal crops, the panicles of sorghum..." }
+```
+
+---
+
 ### `enrichment_analysis`
 **Use for:** Gene set enrichment analysis — finding statistically overrepresented
 ontology terms, pathways, or domains in a foreground gene set compared to a
@@ -566,13 +615,24 @@ expression_for_genes(
   → flag genes with significant DE (p < 0.05) under relevant conditions
 ```
 
-**Step 6 — Synthesize ranking:**
+**Step 6 — Literature evidence:**
+```
+# Get papers for QTL genes + their rice/Arabidopsis orthologs
+pubmed_for_genes(
+  gene_ids: <regional genes + orthologs>,
+  include_abstract: true
+)
+  → flag genes with published functional characterization
+```
+
+**Step 7 — Synthesize ranking:**
 Score each gene on:
 - TO/GO annotation relevance to the trait (0–3 pts)
 - Expressed in trait-relevant tissue (0–2 pts)
 - Significantly differentially expressed under trait-relevant condition (0–2 pts)
 - Conserved expression pattern across orthologous species (0–2 pts)
-- Known function in related species from literature (flag)
+- Published functional characterization (0–3 pts: 3 = direct study, 2 = ortholog studied, 1 = mentioned)
+- LOF germplasm available for validation (bonus flag)
 
 ### 7. Cross-species comparison for a gene of interest
 ```
@@ -735,6 +795,38 @@ vep_for_gene(gene_ids=["SORBI_3006G095600", "SORBI_3007G151100", ...])
 # 3. Prioritize genes with EMS homozygous knockouts + high tissue expression
 expression_for_genes(gene_ids=[...], po_terms=[9051])  # 9051=spikelet
 ```
+
+### 10. Literature search for candidate genes
+
+Use `pubmed_for_genes` to find published research on genes and their orthologs.
+Since crop genes often have limited direct publications, always include orthologs
+from model species (rice, Arabidopsis) to leverage their richer literature.
+
+```
+# Step 1 — Get candidate gene + its orthologs
+solr_search(q="id:SORBI_3006G095600",
+            fl="id,name,gene_tree,homology__ortholog_one2one")
+  → extract ortholog IDs from rice (Os...) and Arabidopsis (AT...)
+
+# Step 2 — Fetch papers for gene + orthologs with abstracts
+pubmed_for_genes(
+  gene_ids=["SORBI_3006G095600", "Os04g0447100", "AT1G17420"],
+  include_abstract=true
+)
+  → papers with titles, authors, abstracts
+
+# Step 3 — Interpret abstracts for functional evidence
+# Look for: phenotype descriptions, expression patterns, mutant analyses,
+# protein interactions, pathway placement, stress responses
+```
+
+**Tips for literature analysis:**
+- Genes with `capabilities:pubs` are pre-annotated — check this first
+- Rice (39947) and Arabidopsis (3702) orthologs have far more literature
+- Use `include_abstract=true` to get enough context for functional interpretation
+- DOI-only references (no PMID) are common for some journals; the tool
+  returns a doi.org URL for manual follow-up
+- For a QTL region, batch all candidate genes + orthologs in one call
 
 ---
 
