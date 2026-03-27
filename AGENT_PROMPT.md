@@ -130,9 +130,26 @@ accession).
 
 Request useful fields via `fl`:
 ```
-id, name, biotype, start, end, strand, system_name, taxon_id,
-gene_tree, compara_idx_multi, TO__ancestors, GO__ancestors
+id, name, description, biotype, start, end, strand, system_name, taxon_id,
+gene_tree, compara_idx_multi, TO__ancestors, GO__ancestors,
+closest_rep_id, closest_rep_name, closest_rep_description, closest_rep_taxon_id, closest_rep_identity,
+model_rep_id, model_rep_name, model_rep_description, model_rep_taxon_id, model_rep_identity
 ```
+
+**Representative homolog fields** — precomputed for every gene, essential for naming
+genes that lack their own human-readable name:
+- `closest_rep_*` — closest homolog in the nearest phylogenetic species in the gene
+  tree (e.g., for sorghum genes this is usually an *Oryza sativa* gene). Fields:
+  `closest_rep_id`, `closest_rep_name`, `closest_rep_description`,
+  `closest_rep_taxon_id`, `closest_rep_identity` (fraction, 0–1).
+- `model_rep_*` — homolog in a model organism (typically *Arabidopsis thaliana*,
+  taxon_id 3702001). Fields: `model_rep_id`, `model_rep_name`,
+  `model_rep_description`, `model_rep_taxon_id`, `model_rep_identity`.
+
+**Display name rule:** In every table, chart, and card in a report, show a gene as:
+`GENE_ID / CLOSEST_NAME (description)` — e.g., `SORBI_3006G147000 / RPL14B (60S ribosomal protein L14-2)`. If `name` equals the stable ID (i.e., no human-readable name is
+assigned), fall back first to `closest_rep_name`, then `model_rep_name`, then `description`,
+then the stable ID alone. Never show a bare gene ID without at least one of these.
 
 **Note:** Chromosome names must match the stored `region` field. For sorghum
 use `"1"`–`"10"`. Check a known gene first if unsure of the naming convention.

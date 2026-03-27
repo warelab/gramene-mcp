@@ -1,0 +1,50 @@
+{
+  "skill_name": "qtl-candidate-analysis",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "I have a grain yield QTL in sorghum on chromosome 6 between 50 and 58 Mb. Can you identify the best candidate genes in this interval and tell me which ones have functional evidence from orthologs in rice or maize? I'd like to see expression data and whether any knockout lines are available.",
+      "expected_output": "An HTML report with ranked candidate genes in the sorghum chr6:50000000-58000000 interval. Should include expression profiles, VEP LOF allele data, ortholog annotations from rice and maize, enrichment analysis, and a scored ranking table.",
+      "files": [],
+      "assertions": [
+        {"description": "Report HTML file exists and is >20KB", "type": "file_check"},
+        {"description": "Report contains a ranked candidate table with score columns", "type": "content_check"},
+        {"description": "Report includes VEP/LOF data — mentions EMS or loss-of-function accessions", "type": "content_check"},
+        {"description": "Report identifies orthologs from rice (Os) or maize (Zm)", "type": "content_check"},
+        {"description": "Report includes enrichment analysis results (GO or pathway terms with p-values)", "type": "content_check"},
+        {"description": "Report has an executive summary section with top candidates", "type": "content_check"},
+        {"description": "Report uses Chart.js or contains embedded data visualizations", "type": "content_check"},
+        {"description": "Report includes gene position data (chr6, coordinates in the 50-58Mb range)", "type": "content_check"}
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "I'm looking at a plant height QTL in rice on chromosome 1 from 32 to 38 Mb. What genes are there and which ones are most likely to control height? Show me the functional annotations and any literature.",
+      "expected_output": "An HTML report analyzing rice chr1:32000000-38000000 for plant height candidates. Should resolve rice taxon_id, scan genes, check TO annotations for height-related terms, fetch expression and literature, and produce a ranked list.",
+      "files": [],
+      "assertions": [
+        {"description": "Report HTML file exists and is >20KB", "type": "file_check"},
+        {"description": "Report mentions rice or Oryza sativa as the target species", "type": "content_check"},
+        {"description": "Report contains genes with Os-prefixed IDs (rice gene identifiers)", "type": "content_check"},
+        {"description": "Report discusses height-related annotations or candidate justification", "type": "content_check"},
+        {"description": "Report includes enrichment analysis (GO terms with fold enrichment or p-values)", "type": "content_check"},
+        {"description": "Report includes a ranked or scored candidate list", "type": "content_check"},
+        {"description": "Report mentions literature or publications for at least some genes", "type": "content_check"}
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Can you analyze the drought tolerance QTL region in sorghum? I don't have exact coordinates — look it up from the database. I want to know what's enriched in the region functionally and whether there are any genes with published studies.",
+      "expected_output": "Should resolve 'drought tolerance' to a TO term, query the qtls collection for sorghum drought QTLs, then run the full pipeline on the selected interval. Enrichment analysis should be prominent. Literature search should include ortholog papers.",
+      "files": [],
+      "assertions": [
+        {"description": "Report HTML file exists and is >10KB", "type": "file_check"},
+        {"description": "Report states the QTL coordinates that were resolved from the database (not user-provided)", "type": "content_check"},
+        {"description": "Report mentions drought tolerance or a related trait", "type": "content_check"},
+        {"description": "Report includes enrichment analysis with GO terms", "type": "content_check"},
+        {"description": "Report includes gene candidates ranked or prioritized", "type": "content_check"},
+        {"description": "Report mentions sorghum (SORBI gene IDs or Sorghum bicolor)", "type": "content_check"}
+      ]
+    }
+  ]
+}
