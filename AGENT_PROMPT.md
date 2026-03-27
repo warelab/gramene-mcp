@@ -330,21 +330,35 @@ Key parameters:
 including ontology term lookups, QTL records, assay metadata, gene metadata,
 and gene trees.
 
+**IMPORTANT: the filter parameter is named `filter`, not `query`.** Always pass
+`filter: { ... }`. Passing `query: { ... }` is silently ignored and returns
+unfiltered results.
+
 Useful patterns:
 - Find QTLs for a trait: `collection: "qtls", filter: { "terms": "TO:0000396" }`
 - Look up a TO term by name: `collection: "TO", filter: { "name": /drought/i }`
 - Get gene metadata: `collection: "genes", filter: { "_id": "SORBI_3006G095600" }`
-- List assay groups for an experiment: `collection: "assays", filter: { "experiment": "E-MTAB-5956" }`
+- List assay groups for an experiment:
+  `collection: "assays", filter: { "_id": { "$regex": "^E-MTAB-5956" } }`
+
+**Assay metadata for DE experiments:** The assay `_id` is `"{experiment}.{group}"`,
+e.g. `"E-GEOD-128441.g96"`. For a DE comparison like `g96_g92`, fetch both
+individual group IDs (`E-GEOD-128441.g96` and `E-GEOD-128441.g92`) via
+`mongo_lookup_by_ids` or `mongo_find` with `filter: { "_id": { "$in": [...] } }`.
+The numerator group is the first part of the comparison string (g96 in `g96_g92`),
+the denominator is the second (g92). The tissue label comes from the `characteristic`
+array (type = "organism part"), conditions from the `factor` array.
 
 ---
 
 ### `mongo_lookup_by_ids`
 **Use for:** Batch resolving integer ontology IDs (from Solr `GO__ancestors`,
 `TO__ancestors`, `PO__ancestors`, `taxonomy__ancestors` fields) to their names
-and definitions.
+and definitions; also for fetching specific assay, experiment, or gene documents
+by their exact `_id` values.
 
-Pass numeric `ids` and the matching `collection` (`GO`, `TO`, `PO`, `taxonomy`,
-`domains`, `pathways`).
+Pass string or numeric `ids` and the matching `collection` (`GO`, `TO`, `PO`,
+`taxonomy`, `domains`, `pathways`, `assays`, `experiments`, `genes`).
 
 ---
 
