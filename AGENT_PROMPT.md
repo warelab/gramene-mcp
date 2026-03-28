@@ -151,6 +151,10 @@ genes that lack their own human-readable name:
 assigned), fall back first to `closest_rep_name`, then `model_rep_name`, then `description`,
 then the stable ID alone. Never show a bare gene ID without at least one of these.
 
+**IMPORTANT: Never abbreviate gene stable IDs.** Always write the full identifier
+(e.g., `SORBI_3004G295500`, not `G295500` or `295500`). This applies everywhere:
+tables, prose, code, tool calls, and variable names used in analysis.
+
 **Note:** Chromosome names must match the stored `region` field. For sorghum
 use `"1"`–`"10"`. Check a known gene first if unsure of the naming convention.
 
