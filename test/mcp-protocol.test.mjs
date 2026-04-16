@@ -62,6 +62,9 @@ describe("MCP protocol", () => {
     assert.ok(!res.error);
     assert.equal(res.result.protocolVersion, "2025-11-25");
     assert.equal(res.result.serverInfo.name, "gramene-mcp");
+    // Capabilities advertise both tools and prompts.
+    assert.ok(res.result.capabilities?.tools, "Expected tools capability");
+    assert.ok(res.result.capabilities?.prompts, "Expected prompts capability");
   });
 
   it("ping", async () => {
@@ -1206,5 +1209,121 @@ describe("pubmed_for_genes", () => {
     const paper = data.genes["SORBI_3006G095600"].papers[0];
     assert.ok(paper.doi, "Paper should have a DOI");
     assert.ok(paper.url, "Paper should have a URL");
+  });
+});
+
+// ─── Prompts ─────────────────────────────────────────────────────────
+
+describe("prompts/list", () => {
+  it("returns the full set of workflow prompts", async () => {
+    const res = await rpc("prompts/list");
+    assert.ok(!res.error);
+    const names = res.result.prompts.map((p) => p.name).sort();
+    assert.deepEqual(names, [
+      "base",
+      "cross_species_comparison",
+      "enrichment",
+      "gene_family",
+      "gene_lookup",
+      "germplasm_lof",
+      "literature_search",
+      "orthologs_paralogs",
+      "pathway_genes",
+      "pav_cnv",
+      "qtl_candidate_ranking",
+    ]);
+  });
+
+  it("each prompt has name, title, description, and arguments", async () => {
+    const res = await rpc("prompts/list");
+    for (const p of res.result.prompts) {
+      assert.ok(p.name, "prompt.name required");
+      assert.ok(p.title, `prompt.title required (${p.name})`);
+      assert.ok(p.description, `prompt.description required (${p.name})`);
+      assert.ok(Array.isArray(p.arguments), `prompt.arguments must be array (${p.name})`);
+    }
+  });
+});
+
+describe("prompts/get", () => {
+  it("returns the base prompt with a user message", async () => {
+    const res = await rpc("prompts/get", { name: "base" });
+    assert.ok(!res.error);
+    assert.ok(res.result.description, "Expected description");
+    assert.ok(Array.isArray(res.result.messages), "Expected messages array");
+    assert.equal(res.result.messages.length, 1);
+    const msg = res.result.messages[0];
+    assert.equal(msg.role, "user");
+    assert.equal(msg.content.type, "text");
+    assert.ok(msg.content.text.includes("Gramene MCP Agent"), "Expected base prompt header");
+    assert.ok(msg.content.text.includes("Critical Conventions"), "Expected conventions section");
+  });
+
+  it("interpolates required arguments into a workflow prompt", async () => {
+    const res = await rpc("prompts/get", {
+      name: "gene_lookup",
+      arguments: { query: "lipoxygenase", species: "Sorghum bicolor" },
+    });
+    assert.ok(!res.error);
+    const text = res.result.messages[0].content.text;
+    assert.ok(text.includes("lipoxygenase"), "Expected 'query' interpolation");
+    assert.ok(text.includes("Sorghum bicolor"), "Expected 'species' interpolation");
+    // Placeholders should have been substituted — no leftover {{...}} markers.
+    assert.ok(!/\{\{[a-z_]+\}\}/.test(text), "Expected no unresolved placeholders");
+  });
+
+  it("leaves optional arguments empty when not supplied", async () => {
+    const res = await rpc("prompts/get", {
+      name: "gene_lookup",
+      arguments: { query: "drought tolerance" },
+    });
+    assert.ok(!res.error);
+    const text = res.result.messages[0].content.text;
+    assert.ok(text.includes("drought tolerance"));
+    assert.ok(!/\{\{[a-z_]+\}\}/.test(text), "Expected no unresolved placeholders");
+  });
+
+  it("rejects an unknown prompt with -32602", async () => {
+    const res = await rpc("prompts/get", { name: "nonexistent_workflow" });
+    assert.ok(res.error);
+    assert.equal(res.error.code, -32602);
+  });
+
+  it("rejects missing required arguments with -32602", async () => {
+    // gene_lookup requires a 'query' argument.
+    const res = await rpc("prompts/get", { name: "gene_lookup", arguments: {} });
+    assert.ok(res.error);
+    assert.equal(res.error.code, -32602);
+    assert.ok(/query/i.test(res.error.message), "Error message should name the missing arg");
+  });
+
+  it("qtl_candidate_ranking interpolates region + coordinates", async () => {
+    const res = await rpc("prompts/get", {
+      name: "qtl_candidate_ranking",
+      arguments: {
+        region: "6",
+        start: 52000000,
+        end: 58000000,
+        taxon_id: 4558001,
+      },
+    });
+    assert.ok(!res.error);
+    const text = res.result.messages[0].content.text;
+    assert.ok(text.includes('"6"'), "Expected region value");
+    assert.ok(text.includes("52000000"), "Expected start coordinate");
+    assert.ok(text.includes("4558001"), "Expected taxon_id");
+  });
+
+  it("advertises arguments for every workflow that takes them", async () => {
+    const list = await rpc("prompts/list");
+    const withArgs = list.result.prompts.filter((p) => (p.arguments || []).length > 0);
+    assert.ok(withArgs.length >= 8, "Expected most workflows to accept arguments");
+    // Each declared argument must have a name and description.
+    for (const p of withArgs) {
+      for (const a of p.arguments) {
+        assert.ok(a.name, `arg.name required (${p.name})`);
+        assert.ok(a.description, `arg.description required (${p.name}.${a.name})`);
+      }
+    }
   });
 });

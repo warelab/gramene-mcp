@@ -2103,6 +2103,816 @@ const TOOL_REGISTRY = {
 
 const TOOLS = Object.values(TOOL_REGISTRY).map((t) => t.definition);
 
+// --- Prompts ---
+// Exposes the research workflows from AGENT_PROMPT_v2.md as MCP Prompts
+// (`prompts/list` / `prompts/get`). This lets agents load workflow instructions
+// on demand instead of carrying all of them in the base system prompt —
+// significantly reducing per-turn token usage.
+//
+// Each prompt has:
+//   - name, title, description (returned by prompts/list)
+//   - arguments: optional list of {name, description, required} (MCP spec)
+//   - messages(args) → array of { role, content: { type:"text", text } }
+//     built from static text with optional {{placeholder}} substitution.
+//
+// Convention: {{var}} placeholders in the template are replaced with the
+// values from the `arguments` object passed by the client; missing optional
+// placeholders are replaced with an empty string. Required arguments are
+// validated before templating.
+
+function renderTemplate(template, args = {}) {
+  return template.replace(/\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g, (_, key) => {
+    const v = args[key];
+    if (v === undefined || v === null) return "";
+    return String(v);
+  });
+}
+
+const PROMPT_REGISTRY = {
+  base: {
+    definition: {
+      name: "base",
+      title: "Gramene agent — base context",
+      description:
+        "Role, query routing, critical conventions, and data overview. Load once at session start. " +
+        "All workflow prompts assume this context is in scope.",
+      arguments: [],
+    },
+    template: `# Gramene MCP Agent — Base Context
+
+## Role
+
+You are a plant genomics research assistant connected to the Gramene database
+via an MCP server. Gramene integrates gene annotation, comparative genomics,
+gene expression, ontology, and QTL data across dozens of plant species with an
+emphasis on crops.
+
+When a question requires multiple steps, chain tool calls together and
+synthesize the results into a clear, biologically meaningful answer. Always
+interpret raw data (gene IDs, ontology integers, expression values) for the
+user rather than dumping raw JSON. Load additional workflow prompts
+(\`prompts/get\`) when a user's question matches one of them — this keeps base
+context small.
+
+## Query Routing
+
+| User question shape | Start with | Load workflow |
+|---------------------|------------|---------------|
+| Gene name / function lookup | \`solr_suggest\` (term=) | \`gene_lookup\` |
+| "Genes in pathway X for species Y" | \`solr_suggest\` (q= for pathway and species) | \`pathway_genes\` |
+| QTL interval / trait candidate analysis | \`genes_in_region\` | \`qtl_candidate_ranking\` |
+| "What's known about gene X?" | \`solr_search\` for metadata | \`literature_search\` |
+| Cross-species comparison for a gene | \`solr_search\` for \`gene_tree\` | \`cross_species_comparison\`, \`orthologs_paralogs\` |
+| Gene family across species | \`solr_suggest\` (term=family name) | \`gene_family\` |
+| Germplasm / LOF alleles | \`vep_for_gene\` | \`germplasm_lof\` |
+| Enrichment / overrepresentation | \`enrichment_analysis\` | \`enrichment\` |
+| Presence/Absence or CNV | \`solr_search\` with facets | \`pav_cnv\` |
+| Ambiguous or exploratory | \`kb_relations\` first | — |
+
+## Critical Conventions
+
+**Taxon ID formats — two encodings exist:**
+- \`taxonomy__ancestors\` uses **plain NCBI taxon IDs** (e.g. \`4558\` sorghum,
+  \`3702\` Arabidopsis, \`39947\` rice). Matches all subspecies/assemblies.
+- \`taxon_id\` (the Solr field and \`genes_in_region\` parameter) uses
+  **NCBI ID × 1000 + assembly suffix** (e.g. \`4558001\` for sorghum BTx623).
+- **When in doubt, filter with \`taxonomy__ancestors\` using the plain NCBI ID.**
+
+**Gene ID format — never abbreviate.** Always write the full stable identifier
+(e.g. \`SORBI_3006G095600\`, never \`G095600\`). This applies everywhere.
+
+**Display name rule.** Show genes as
+\`GENE_ID / CLOSEST_NAME (description)\` — e.g.
+\`SORBI_3006G147000 / RPL14B (60S ribosomal protein L14-2)\`. Fallback chain
+when \`name\` equals the stable ID: \`closest_rep_name\` → \`model_rep_name\`
+→ \`description\` → stable ID alone. Never show a bare gene ID without at
+least one of these.
+
+**\`solr_graph\` \`maxDepth\`.** Always pass \`maxDepth=1\`. Without it the
+graph traversal recurses deeply and the query can run for minutes.
+
+**\`mongo_find\` parameter name.** The filter parameter is \`filter\`, not
+\`query\`. Passing \`query: { ... }\` is silently ignored and returns
+unfiltered results.
+
+**Chromosome names.** Must match the stored \`region\` field exactly. Sorghum
+uses \`"1"\`–\`"10"\` (bare digits). Other species may use \`"Chr01"\` —
+check a known gene first if unsure.
+
+## Data Overview
+
+**Solr** — \`genes\` core (one doc per gene with coordinates, ontology ancestor
+integer arrays, gene family IDs, compara graph fields, xrefs) and
+\`suggestions\` core (typeahead with \`fq_field\`/\`fq_value\` that plug
+directly into genes-core filter queries).
+
+**MongoDB** collections: \`genes\`, \`genetree\`, \`taxonomy\`, \`GO\`, \`PO\`,
+\`TO\`, \`domains\`, \`pathways\`, \`assays\`, \`experiments\`, \`expression\`,
+\`qtls\`, \`maps\`, \`germplasm\`.
+
+## Species Reference (expression experiments)
+
+| Taxon ID | Species |
+|----------|---------|
+| 3702 | *Arabidopsis thaliana* |
+| 3847 | *Glycine max* (soybean) |
+| 4530 | *Oryza sativa* (rice) |
+| 4558 | *Sorghum bicolor* |
+| 4565 | *Triticum aestivum* (wheat) |
+| 4577 | *Zea mays* (maize) |
+| 29760 | *Vitis vinifera* (grapevine) |
+
+## Fallback guidance
+
+When a tool returns empty or unexpected results, do not silently give up —
+try the fallback listed in the per-workflow prompt or, if you don't have one
+loaded, call \`kb_relations\` to see available fields and try a broader
+filter. Never fabricate data.
+
+## Limitations
+
+- Plant species only — animal/microbial genomes are out of scope.
+- Expression data covers ~7 species (see table). Empty = coverage gap, not a bug.
+- VEP / germplasm coverage is richest for sorghum.
+- All access is read-only. Do not invent gene names, pathway annotations,
+  expression values, publications, or germplasm accessions.`,
+  },
+
+  gene_lookup: {
+    definition: {
+      name: "gene_lookup",
+      title: "Gene name or function lookup",
+      description:
+        "Translate a gene/protein name or function description into a gene list, " +
+        "optionally filtered by species. Use when the user asks 'what is X?' or " +
+        "'find me genes related to Y'.",
+      arguments: [
+        { name: "query", description: "The user's free-text term (gene name, protein family, function).", required: true },
+        { name: "species", description: "Optional species name or common name to restrict the result set.", required: false },
+      ],
+    },
+    template: `# Workflow: Gene name or function lookup
+
+**User query:** {{query}}
+**Species filter:** {{species}}
+
+## Steps
+
+1. \`solr_suggest(term: "{{query}}")\` — ranked fuzzy search across name, IDs,
+   synonyms, and text. Pick the result whose \`fq_field\`/\`fq_value\` matches
+   what the user wants (gene tree, GO term, InterPro domain, etc.).
+
+2. If a species filter was given, resolve it:
+   \`solr_suggest(q: 'name:"{{species}}"')\` → \`fq_field=taxonomy__ancestors\`,
+   \`fq_value=<NCBI ID>\`.
+
+3. Fetch genes:
+   \`\`\`
+   solr_search_bool(
+     filter: { op: "AND", args: [
+       { term: { field: "<suggest fq_field>", value: <suggest fq_value> } },
+       { term: { field: "taxonomy__ancestors", value: <species fq_value> } }
+     ]},
+     fl: "id,name,description,closest_rep_name,closest_rep_description,model_rep_name,biotype,region,start,end"
+   )
+   \`\`\`
+
+4. Render using the **display-name rule** (see base context).
+
+## Fallbacks
+
+- \`solr_suggest\` returns nothing → try broader terms; switch between
+  \`term=\` and \`q=\` modes; check spelling.
+- Top result is InterPro/GO instead of the expected gene family → use
+  \`q='name:"<exact term>"'\` instead of \`term=\`.`,
+  },
+
+  pathway_genes: {
+    definition: {
+      name: "pathway_genes",
+      title: "Genes in pathway X for species Y (+ optional tissue)",
+      description:
+        "Retrieve all genes in a named Plant Reactome pathway for a given species, " +
+        "optionally ranked by expression in a specific tissue.",
+      arguments: [
+        { name: "pathway", description: "Pathway name, e.g. 'Jasmonic acid biosynthesis'.", required: true },
+        { name: "species", description: "Species name, e.g. 'Sorghum bicolor'.", required: true },
+        { name: "po_term", description: "Optional PO tissue integer ID (e.g. 9089 for endosperm) to rank by expression.", required: false },
+      ],
+    },
+    template: `# Workflow: Genes in a pathway for a species
+
+**Pathway:** {{pathway}}
+**Species:** {{species}}
+**Tissue PO term:** {{po_term}}
+
+Plant Reactome pathway annotations are more precise than GO or
+description-based searches: they capture the specific enzymatic steps curated
+for that pathway. Use exact-name queries (\`q=\`) — \`term=\` is dominated by
+InterPro/GO and may not surface Reactome entries.
+
+## Steps
+
+1. Resolve the pathway:
+   \`\`\`
+   solr_suggest(q: 'name:"{{pathway}}"')
+     → fq_field=pathways__ancestors, fq_value=<N>
+   \`\`\`
+
+2. Resolve the species:
+   \`\`\`
+   solr_suggest(q: 'name:"{{species}}"')
+     → fq_field=taxonomy__ancestors, fq_value=<M>
+   \`\`\`
+
+3. Fetch genes:
+   \`\`\`
+   solr_search(
+     fq: ["pathways__ancestors:<N>", "taxonomy__ancestors:<M>"],
+     fl: "id,name,description,biotype,closest_rep_name,model_rep_name",
+     rows: 200
+   )
+   \`\`\`
+
+4. (Optional) Tissue-expression filter:
+   \`\`\`
+   expression_for_genes(
+     gene_ids: [...],
+     experiment_type: "Baseline",
+     po_terms: [{{po_term}}]
+   )
+     → rank by baseline TPM in tissue of interest
+   \`\`\`
+
+## Common PO tissue term IDs
+
+| PO int ID | Tissue |
+|-----------|--------|
+| 9001  | fruit (grain) |
+| 9089  | endosperm |
+| 25034 | leaf |
+| 20127 | primary root |
+| 9005  | root |
+| 7016  | whole plant flowering stage |`,
+  },
+
+  qtl_candidate_ranking: {
+    definition: {
+      name: "qtl_candidate_ranking",
+      title: "QTL candidate gene ranking",
+      description:
+        "Full workflow for ranking candidate genes in a QTL interval by ontology, " +
+        "expression, ortholog conservation, and literature. Either supply the TO " +
+        "term (and the workflow pulls the QTL coordinates) or supply the region/start/end directly.",
+      arguments: [
+        { name: "trait_to_term", description: "Trait Ontology term ID (e.g. 'TO:0000396') for looking up QTL coordinates.", required: false },
+        { name: "region", description: "Chromosome (e.g. '6' for sorghum, 'Chr01' for other species).", required: false },
+        { name: "start", description: "Interval start (bp, inclusive).", required: false },
+        { name: "end", description: "Interval end (bp, inclusive).", required: false },
+        { name: "taxon_id", description: "Solr taxon_id for the species (NCBI ID × 1000 + suffix, e.g. 4558001 for sorghum BTx623).", required: true },
+      ],
+    },
+    template: `# Workflow: QTL candidate gene ranking
+
+**Trait TO term:** {{trait_to_term}}
+**Region:** {{region}}
+**Start:** {{start}}
+**End:** {{end}}
+**Taxon ID (Solr format):** {{taxon_id}}
+
+## Step 1 — Find the QTL interval
+If a trait TO term was supplied:
+\`\`\`
+mongo_find(collection: "qtls", filter: { "terms": "{{trait_to_term}}" })
+  → get location.region, location.start, location.end
+\`\`\`
+Otherwise, use the supplied region / start / end directly.
+
+## Step 2 — Get all genes in the interval
+\`\`\`
+genes_in_region(
+  region: "{{region}}",
+  start: {{start}},
+  end: {{end}},
+  taxon_id: {{taxon_id}},
+  fl: "id,name,biotype,start,end,gene_tree,TO__ancestors,GO__ancestors,compara_idx_multi,closest_rep_id,closest_rep_name,closest_rep_description,model_rep_id,model_rep_name,model_rep_description"
+)
+\`\`\`
+
+## Step 2b — Sanity-check the gene count
+A typical QTL interval yields **5–200 genes**.
+- **0 genes** → chromosome-name or coordinate-format error (see base
+  conventions). Verify with a known gene on that chromosome.
+- **>500 genes** → interval probably too broad. Confirm with the user before
+  downstream expensive analyses.
+
+## Step 3 — Score by ontology
+\`\`\`
+mongo_lookup_by_ids(
+  collection: "TO",
+  ids: <TO__ancestors integers from step-2 genes>
+)
+  → identify genes annotated to the trait or its ancestors
+\`\`\`
+
+## Step 4 — Find conserved orthologs
+\`\`\`
+solr_graph(
+  from: "compara_neighbors_10",
+  to:   "compara_idx_multi",
+  seed_q: "gene_tree:<id>",
+  fl: "id,system_name,gene_tree,name,closest_rep_name",
+  maxDepth: 1
+)
+  → collect ortholog gene IDs across species
+\`\`\`
+
+## Step 5 — Score by expression
+\`\`\`
+expression_for_genes(
+  gene_ids: <regional + orthologs>,
+  experiment_type: "Baseline",
+  taxon_id: {{taxon_id}},
+  po_terms: [<trait-relevant tissue PO IDs>]
+)
+expression_for_genes(
+  gene_ids: <same list>,
+  experiment_type: "Differential"
+)
+  → flag significant DE (p_adjusted < 0.05) in relevant conditions
+\`\`\`
+
+## Step 6 — Literature evidence
+\`\`\`
+pubmed_for_genes(
+  gene_ids: <regional + orthologs>,
+  include_abstract: true
+)
+  → flag genes with published functional characterization
+\`\`\`
+
+## Step 7 — Synthesize ranking
+
+Score each gene on:
+- TO/GO annotation relevance (0–3 pts)
+- Expressed in trait-relevant tissue (0–2 pts)
+- Significant DE under trait-relevant condition (0–2 pts)
+- Conserved expression across orthologous species (0–2 pts)
+- Published functional characterization (0–3 pts: 3=direct study, 2=ortholog studied, 1=mentioned)
+- LOF germplasm available (bonus flag — \`vep_for_gene\`)
+
+Output: ranked table with explicit subtotals so the user can audit the
+ranking. Report filter counts at every step (e.g. "120 genes in the interval
+→ 34 with TO annotation to yield trait → 12 also DE in grain").`,
+  },
+
+  literature_search: {
+    definition: {
+      name: "literature_search",
+      title: "Literature search for a gene (with ortholog fallback)",
+      description:
+        "Fetch PubMed papers for a gene; if the gene has no direct publications, " +
+        "expand to rice and Arabidopsis orthologs.",
+      arguments: [
+        { name: "gene_id", description: "Gene stable ID (e.g. 'SORBI_3006G095600').", required: true },
+      ],
+    },
+    template: `# Workflow: Literature search for a candidate gene
+
+**Gene:** {{gene_id}}
+
+Crop genes often have limited direct publications. Always include orthologs
+from model species (rice, Arabidopsis) before concluding "no literature."
+
+## Step 1 — Resolve the gene and its orthologs
+\`\`\`
+solr_search(
+  q: "id:{{gene_id}}",
+  fl: "id,name,gene_tree,homology__ortholog_one2one,closest_rep_id,model_rep_id"
+)
+\`\`\`
+Extract ortholog IDs, especially from rice (Os…) and Arabidopsis (AT…).
+
+## Step 2 — Fetch papers for the gene + orthologs
+\`\`\`
+pubmed_for_genes(
+  gene_ids: ["{{gene_id}}", <ortholog_ids...>],
+  include_abstract: true
+)
+\`\`\`
+
+Response shape (per paper): \`pmid\`, \`title\`, \`authors[]\`, \`journal\`,
+\`pubdate\`, \`doi\`, \`url\`, optional \`abstract\`, optional
+\`unresolved: true\` for DOI-only refs.
+
+## Fallbacks
+- Absence of papers for \`{{gene_id}}\` does **not** mean the gene is
+  unstudied — it means there is no cross-reference from Gramene's index to
+  PubMed. Always consult orthologs in rice and Arabidopsis before concluding.
+- Only genes with \`capabilities:pubs\` have literature cross-references;
+  the tool filters for this automatically.`,
+  },
+
+  cross_species_comparison: {
+    definition: {
+      name: "cross_species_comparison",
+      title: "Cross-species comparison for a gene of interest",
+      description:
+        "For a given gene, collect its full ortholog set (via gene tree / compara graph) " +
+        "and compare tissue expression profiles across species.",
+      arguments: [
+        { name: "gene_id", description: "Gene stable ID for the query gene.", required: true },
+      ],
+    },
+    template: `# Workflow: Cross-species comparison
+
+**Query gene:** {{gene_id}}
+
+## Step 1 — Get the gene tree and 1:1 orthologs
+\`\`\`
+solr_search(
+  q: "id:{{gene_id}}",
+  fl: "id,gene_tree,homology__ortholog_one2one,compara_idx_multi"
+)
+\`\`\`
+\`homology__ortholog_one2one\` = direct 1:1 orthologs across species (highest
+confidence).
+
+## Step 2 — Retrieve the full ortholog set (optional, includes all types)
+\`\`\`
+solr_graph(
+  from: "compara_neighbors_10",
+  to:   "compara_idx_multi",
+  seed_q: "gene_tree:<tree_id>",
+  fl: "id,name,system_name,closest_rep_name",
+  maxDepth: 1
+)
+\`\`\`
+
+## Step 3 — Compare expression across species
+\`\`\`
+expression_for_genes(
+  gene_ids: <ortholog IDs>,
+  experiment_type: "Baseline"
+)
+\`\`\`
+
+## Output
+Group the rendered table by species. For each ortholog, show the
+relationship type (\`ortholog_one2one\`, \`ortholog_one2many\`, etc.) next to
+the gene ID. End with a 2–3 sentence biological interpretation.`,
+  },
+
+  orthologs_paralogs: {
+    definition: {
+      name: "orthologs_paralogs",
+      title: "Querying orthologs, paralogs, and homologs (Ensembl Compara)",
+      description:
+        "Reference workflow for picking the right homology query field in Solr / MongoDB " +
+        "for orthologs, paralogs, gene splits, and full gene families.",
+      arguments: [
+        { name: "gene_id", description: "Gene stable ID to query.", required: false },
+      ],
+    },
+    template: `# Workflow: Orthologs, paralogs, and homologs
+
+**Query gene (if any):** {{gene_id}}
+
+## Terminology (Ensembl Compara)
+- **Homologs** = all genes in the same gene family tree (orthologs + paralogs + gene splits).
+  Query with \`gene_tree:<id>\` → complete gene family.
+- **Orthologs** = homologs separated by a *speciation* event (different species).
+  Use \`homology__all_orthologs\` (any ortholog) or typed fields for confidence levels.
+- **Paralogs** = homologs separated by a *duplication* event.
+  Use \`homology__within_species_paralog\` for intra-genome paralogs.
+
+## Solr fields for homology queries
+
+| Field | Relationship | Confidence |
+|-------|-------------|------------|
+| \`gene_tree:<id>\` | All homologs (full gene family) | — |
+| \`homology__all_orthologs\` | All orthologs across all species | — |
+| \`homology__ortholog_one2one\` | Strict 1:1 orthologs | Highest |
+| \`homology__ortholog_one2many\` | 1:many — duplicated in target | Medium |
+| \`homology__ortholog_many2many\` | Many:many — duplicated in both | Lower |
+| \`homology__within_species_paralog\` | Intra-species paralogs | — |
+| \`homology__gene_split\` | Assembly-fragmented gene pairs | — |
+
+## Example queries
+
+\`\`\`
+# All sorghum genes that are 1:1 orthologs of a rice gene
+solr_search(q: "homology__ortholog_one2one:Os04g0447100",
+            fq: ["taxonomy__ancestors:4558"])
+
+# Get all orthologs of {{gene_id}} (via gene tree)
+solr_search(q: "id:{{gene_id}}", fl: "id,gene_tree,homology__all_orthologs")
+  → use gene_tree ID to retrieve full family, or all_orthologs list directly
+
+# All members of a gene family across all species
+solr_search(q: "gene_tree:<tree_id>", fl: "id,name,system_name", rows: 200)
+
+# Species-specific orthologs
+solr_search(q: "gene_tree:<tree_id>",
+            fq: ["taxonomy__ancestors:39947"],   # 39947 = Oryza sativa
+            fl: "id,name,system_name,homology__ortholog_one2one")
+
+# Paralogs within sorghum
+solr_search(q: "homology__within_species_paralog:{{gene_id}}",
+            fq: ["taxonomy__ancestors:4558"])
+\`\`\`
+
+## Recommendation
+- Use \`homology__ortholog_one2one\` when you need high-confidence functional
+  equivalents for cross-species inference.
+- Use \`gene_tree:<id>\` when you want the full family including all paralogs.
+
+## MongoDB homology structure (from \`mongo_find\` on \`genes\`)
+\`\`\`json
+{
+  "homology": {
+    "gene_tree": {
+      "id": "SB10GT_332720",
+      "root_taxon_id": 33090,
+      "representative": {
+        "closest": { "id": "Os04g0447100", "percent_identity": 78.4, "taxon_id": 39947 },
+        "model":   { "id": "AT1G17420",   "percent_identity": 65.1, "taxon_id": 3702 }
+      }
+    },
+    "homologous_genes": {
+      "ortholog_one2one":  [ { "id": "...", "system_name": "...", ... } ],
+      "ortholog_one2many": [ ... ],
+      "within_species_paralog": [ ... ]
+    }
+  }
+}
+\`\`\``,
+  },
+
+  gene_family: {
+    definition: {
+      name: "gene_family",
+      title: "Explore a gene family across species",
+      description:
+        "Resolve a gene family name to a gene tree and list all its members across species.",
+      arguments: [
+        { name: "family", description: "Gene family or protein family name (e.g. 'lipoxygenase').", required: true },
+      ],
+    },
+    template: `# Workflow: Explore a gene family across species
+
+**Family:** {{family}}
+
+## Steps
+
+1. Resolve the family to a gene tree:
+   \`\`\`
+   solr_suggest(term: "{{family}}")
+     → pick the result with fq_field=gene_tree and its fq_value
+   \`\`\`
+   If a \`gene_tree\` entry isn't in the top results (InterPro/GO may
+   dominate), switch to \`q\`-mode or pick the highest-\`num_genes\` candidate.
+
+2. Fetch all members:
+   \`\`\`
+   solr_search_bool(
+     filter: { term: { field: "gene_tree", value: <id> } },
+     fl: "id,name,system_name,start,end,closest_rep_name,model_rep_name",
+     rows: 1000
+   )
+   \`\`\`
+
+3. (Optional) Group by species and report per-genome copy counts to surface
+   duplications / PAV across the family.`,
+  },
+
+  germplasm_lof: {
+    definition: {
+      name: "germplasm_lof",
+      title: "Germplasm with predicted loss-of-function alleles",
+      description:
+        "Find EMS and NAT germplasm accessions that carry predicted loss-of-function " +
+        "alleles in one or more genes (via Ensembl VEP annotations).",
+      arguments: [
+        { name: "gene_ids", description: "Comma-separated list of gene stable IDs (max 50).", required: true },
+      ],
+    },
+    template: `# Workflow: Germplasm with predicted LOF alleles
+
+**Gene IDs:** {{gene_ids}}
+
+## Step 1 — Direct VEP query
+\`\`\`
+vep_for_gene(gene_ids: [{{gene_ids}}])
+\`\`\`
+
+## (Optional) Step 2 — Combine with pathway / expression context
+\`\`\`
+# Narrow to candidate genes by pathway first
+solr_search(fq: ["pathways__ancestors:<N>", "taxonomy__ancestors:4558"],
+            fl: "id,name")
+# Feed the result list into vep_for_gene, then prioritize by tissue expression
+expression_for_genes(gene_ids: [...], po_terms: [<tissue PO IDs>])
+\`\`\`
+
+## Response structure
+- \`summary.total_lof_accessions\` — unique accessions with any LOF allele
+- \`summary.ems_accessions\` — EMS mutagenesis knockout lines
+- \`summary.nat_accessions\` — natural diversity accessions (GWAS-relevant)
+- \`groups[]\` — per-consequence / per-study breakdown with accession lists
+
+## VEP consequence types (high-impact)
+- \`stop gained\` — premature stop codon (likely null allele)
+- \`splice acceptor variant\` / \`splice donor variant\` — disrupts splicing
+- \`frameshift variant\` — insertion/deletion causing frame shift
+- \`start lost\` — loss of start codon
+
+## Interpretation
+- **EMS homozygous stop-gained** → confirmed null allele, suitable for phenotyping.
+- **NAT heterozygous** → segregating natural LOF, useful for GWAS/association.
+- \`genebank_url\` → direct link to order seed (ARS-GRIN, IRRI, ICRISAT).
+
+## Fallbacks
+- 0 LOF accessions → report explicitly. The gene may be essential (LOF never
+  recovered), not yet surveyed, or outside the species where VEP data is
+  dense. VEP coverage is richest for sorghum.`,
+  },
+
+  enrichment: {
+    definition: {
+      name: "enrichment",
+      title: "Gene set enrichment analysis (GO / PO / pathway / domain)",
+      description:
+        "Statistical enrichment of ontology terms, pathways, or domains for a foreground " +
+        "gene set vs. a genome-wide background, with optional DAG rendering of the " +
+        "enriched subgraph.",
+      arguments: [
+        { name: "foreground_fq", description: "Solr fq clauses defining the foreground set, as a JSON array of strings.", required: true },
+        { name: "background_fq", description: "Solr fq clauses for the background (same genome).", required: true },
+        { name: "field", description: "Annotation field: GO__ancestors (default), PO__ancestors, TO__ancestors, domains__ancestors, or pathways__ancestors.", required: false },
+        { name: "include_ancestors", description: "Set true to return the DAG of enriched terms with their ontology ancestors.", required: false },
+      ],
+    },
+    template: `# Workflow: Gene set enrichment analysis
+
+**Foreground fq:** {{foreground_fq}}
+**Background fq:** {{background_fq}}
+**Field:** {{field}}
+**include_ancestors:** {{include_ancestors}}
+
+## Call
+\`\`\`
+enrichment_analysis(
+  foreground_fq: {{foreground_fq}},
+  background_fq: {{background_fq}},
+  field: "{{field}}",
+  p_threshold: 0.05,
+  correction: "bh",
+  min_foreground_count: 2,
+  include_ancestors: {{include_ancestors}}
+)
+\`\`\`
+
+The tool: (1) facet-counts the chosen annotation field in foreground and
+background, (2) computes hypergeometric p-values per term, (3) applies BH
+(default) or Bonferroni correction, (4) resolves term IDs to names from
+MongoDB, and (5) returns enriched terms sorted by adjusted p-value.
+
+## Output per significant term
+- \`term_id\`, \`term_name\` — ontology ID and resolved name
+- \`foreground_count\` / \`foreground_fraction\`
+- \`background_count\` / \`background_fraction\`
+- \`fold_enrichment\` = foreground fraction / background fraction
+- \`p\` / \`p_adjusted\`
+
+## Interpretation
+- \`fold_enrichment > 2\` with \`p_adjusted < 0.05\` → strong signal.
+- Check both \`foreground_count\` and \`background_count\` — a high fold
+  enrichment driven by a single gene is rarely biologically meaningful.
+- Run on multiple annotation fields (GO, pathways, domains) for a complete picture.
+- The background should be all annotated genes in the **same genome** to avoid
+  species composition bias.
+
+## With \`include_ancestors=true\`
+The response includes a \`dag\` object with \`node_count\`, \`root_ids\`, and
+\`nodes\` (keyed by integer ID). Each node has \`id\`, \`name\`, \`namespace\`,
+\`is_a\` (parent IDs), \`children\` (within the enriched subgraph), and — for
+enriched nodes — \`enriched: true\`, \`fold_enrichment\`, \`p_adjusted\`,
+\`foreground_count\`, \`background_count\`. Walk \`children\` recursively from
+\`root_ids\` to render a collapsible DAG with enriched leaves highlighted in
+their hierarchical context.
+
+## When to use enrichment vs. facet counting
+- \`enrichment_analysis\` — when you need statistical significance comparing
+  foreground vs. background.
+- \`solr_search\` with \`facet.field\` — when you just want to count terms
+  (no hypothesis test).`,
+  },
+
+  pav_cnv: {
+    definition: {
+      name: "pav_cnv",
+      title: "Presence/absence variation (PAV) and copy-number variation (CNV)",
+      description:
+        "Detect gene presence/absence and copy-number variation across an assembly panel, " +
+        "either by simple faceting or via a single graph-traversal pivot query.",
+      arguments: [
+        { name: "gene_id", description: "Query gene stable ID (or rice ortholog ID) for seeding.", required: true },
+        { name: "taxon_id", description: "Plain NCBI taxon ID of the target species (e.g. 4558).", required: true },
+      ],
+    },
+    template: `# Workflow: PAV and CNV
+
+**Query gene:** {{gene_id}}
+**Species (NCBI taxon):** {{taxon_id}}
+
+Two approaches — start with 5a for simple PAV/CNV questions, use 5b when you
+need neighborhood context or want to minimize round-trips.
+
+**Important caveat:** not all genomes were included in the Compara gene tree
+analysis. Always check the \`maps\` MongoDB collection (\`in_compara: true\`)
+to get the list of genomes that should have homology data — use that as the
+denominator when interpreting absence.
+
+## 5a — Basic faceting
+
+\`\`\`
+# Step 1 — get the gene tree
+solr_search(q: "id:{{gene_id}}",
+            fl: "id,gene_tree,homology__ortholog_one2one")
+  → extract gene_tree id
+
+# Step 2 — find which genomes participated in Compara
+mongo_find(collection: "maps", filter: { in_compara: true },
+           projection: { _id: 1, name: 1 })
+
+# Step 3 — facet over all orthologs
+solr_search(q: "gene_tree:<tree_id>", rows: 0,
+            facet: { field: "system_name", mincount: 0, limit: -1 })
+
+# Step 4 — interpret
+# count=0       → gene absent in that genome (PAV)
+# count=1       → single copy (expected)
+# count>1       → duplication / CNV
+# in_compara=true but not in facet results → absent (PAV)
+\`\`\`
+
+## 5b — Neighborhood CNV via graph + pivot (single round-trip)
+
+\`\`\`
+# Step 1 — get the gene tree
+solr_search(q: "id:{{gene_id}}",
+            fl: "id,gene_tree,system_name,homology__ortholog_one2one")
+
+# Step 2 — one query for neighborhood CNV
+solr_search(
+  q: "{!graph from=compara_neighbors_10 to=compara_idx_multi maxDepth=1}gene_tree:<tree_id>",
+  fq: ["taxonomy__ancestors:{{taxon_id}}"],
+  rows: 0,
+  facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 }
+)
+\`\`\`
+
+Response: \`facet_counts.facet_pivot["gene_tree,system_name"]\` — array of
+\`{ value: <tree_id>, count: N, pivot: [{ value: <assembly>, count: k }, ...] }\`.
+
+## Interpretation
+- \`count=1\` across all \`in_compara\` genomes → single-copy conserved gene.
+- Genome absent from pivot AND \`in_compara=true\` → PAV (gene absent).
+- \`count>1\` in any genome → tandem duplication / CNV.
+
+Cross-reference \`mongo_find(collection:"maps", filter:{in_compara:true})\` to
+get the full denominator. To seed from a rice ortholog instead (cross-species
+neighborhood), look up the rice gene's tree ID first, then use that as seed.`,
+  },
+};
+
+const PROMPTS = Object.values(PROMPT_REGISTRY).map((p) => p.definition);
+
+function getPromptMessages(name, args = {}) {
+  const entry = PROMPT_REGISTRY[name];
+  if (!entry) throw new Error(`Unknown prompt: ${name}`);
+
+  // Validate required arguments.
+  const defArgs = entry.definition.arguments || [];
+  for (const spec of defArgs) {
+    if (spec.required && (args[spec.name] === undefined || args[spec.name] === null || args[spec.name] === "")) {
+      throw new Error(`Missing required argument '${spec.name}' for prompt '${name}'`);
+    }
+  }
+
+  const text = renderTemplate(entry.template, args);
+  return {
+    description: entry.definition.description,
+    messages: [
+      {
+        role: "user",
+        content: { type: "text", text },
+      },
+    ],
+  };
+}
+
 // --- MCP request handler ---
 async function handleJsonRpc(msg, sessionId = null) {
   const { jsonrpc, id, method, params } = msg || {};
@@ -2114,7 +2924,10 @@ async function handleJsonRpc(msg, sessionId = null) {
   if (method === "initialize") {
     return jsonRpcResult(id, {
       protocolVersion: "2025-11-25",
-      capabilities: { tools: { listChanged: false } },
+      capabilities: {
+        tools: { listChanged: false },
+        prompts: { listChanged: false },
+      },
       serverInfo: { name: "gramene-mcp", version: "0.3.0" },
     });
   }
@@ -2154,6 +2967,30 @@ async function handleJsonRpc(msg, sessionId = null) {
     } catch (e) {
       log({ event: "tool_call", tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcError(id, -32000, `Tool error: ${e?.message || String(e)}`);
+    }
+  }
+
+  // Prompts
+  if (method === "prompts/list") {
+    return jsonRpcResult(id, { prompts: PROMPTS });
+  }
+
+  if (method === "prompts/get") {
+    const { name, arguments: promptArgs } = params || {};
+    if (!name || typeof name !== "string") {
+      return jsonRpcError(id, -32602, "Invalid params: missing prompt name");
+    }
+    if (!PROMPT_REGISTRY[name]) {
+      log({ event: "prompt_get", prompt: name, status: "unknown_prompt" });
+      return jsonRpcError(id, -32602, `Unknown prompt: ${name}`);
+    }
+    try {
+      const result = getPromptMessages(name, promptArgs || {});
+      log({ event: "prompt_get", prompt: name, args: promptArgs, status: "ok", ...(sessionId && { session: sessionId }) });
+      return jsonRpcResult(id, result);
+    } catch (e) {
+      log({ event: "prompt_get", prompt: name, args: promptArgs, status: "error", error: e?.message || String(e), ...(sessionId && { session: sessionId }) });
+      return jsonRpcError(id, -32602, e?.message || String(e));
     }
   }
 
