@@ -57,11 +57,13 @@ npm run dev:squam
 
 The server listens for MCP JSON-RPC requests at `POST http://<MCP_HOST>:<MCP_PORT>/mcp`.
 
-## Connecting to Claude
+## Connecting to MCP clients
+
+The server speaks the [MCP 2025-03-26 Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) transport — a single `POST /mcp` endpoint that any compliant client can use.
 
 ### Claude Desktop
 
-Add an entry to your `claude_desktop_config.json`:
+Add an entry to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
@@ -73,13 +75,119 @@ Add an entry to your `claude_desktop_config.json`:
 }
 ```
 
+Restart Claude Desktop after saving.
+
 ### Claude Code / Cowork
 
 ```bash
 claude mcp add gramene --url http://127.0.0.1:8787/mcp
 ```
 
-Once connected, Claude will automatically discover all available tools and workflow prompts.
+### VS Code (GitHub Copilot)
+
+Create or edit `.vscode/mcp.json` in your workspace (or add to user settings under `mcp.servers` for a global entry):
+
+```json
+{
+  "servers": {
+    "gramene": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Open the Chat view, select **Agent** mode, and the gramene tools will appear in the tools picker.
+
+### Cursor
+
+Create or edit `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` in your project root:
+
+```json
+{
+  "mcpServers": {
+    "gramene": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Open **Cursor Settings → MCP** to verify the server is listed and active.
+
+### Zed
+
+Open your Zed `settings.json` (`zed: open settings`) and add a `context_servers` entry:
+
+```json
+{
+  "context_servers": {
+    "gramene": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Zed supports the MCP HTTP transport natively. If your server requires authentication, add a `headers` map:
+
+```json
+{
+  "context_servers": {
+    "gramene": {
+      "url": "http://127.0.0.1:8787/mcp",
+      "headers": {
+        "Authorization": "Bearer <token>"
+      }
+    }
+  }
+}
+```
+
+### OpenAI Codex
+
+Edit `~/.codex/config.toml` (global) or `.codex/config.toml` in a trusted project:
+
+```toml
+[mcp_servers.gramene]
+url = "http://127.0.0.1:8787/mcp"
+```
+
+Or add it from the CLI:
+
+```bash
+codex mcp add gramene --url http://127.0.0.1:8787/mcp
+```
+
+Both the Codex CLI and the Codex IDE extension share this config file, so you only need to set it up once.
+
+### Continue.dev
+
+Add to `.continue/config.yaml` (or the JSON equivalent) in your project or home directory:
+
+```yaml
+mcpServers:
+  - name: gramene
+    transport:
+      type: http
+      url: http://127.0.0.1:8787/mcp
+```
+
+See the [Continue MCP docs](https://docs.continue.dev/customize/model-context-protocol) for authentication options and tool filtering.
+
+### Any MCP-compliant client
+
+The server endpoint is:
+
+```
+POST http://<host>:<port>/mcp
+Content-Type: application/json
+```
+
+It accepts standard MCP JSON-RPC 2.0 messages (`initialize`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`). Sessions are tracked via the `Mcp-Session-Id` header returned on `initialize` — echo it back on subsequent requests if your client supports session continuity.
+
+If the server is on a remote host, make sure `MCP_ALLOWED_ORIGINS` is set to allow your client's origin, or set it to `*` for unrestricted access.
 
 ## Tools
 
