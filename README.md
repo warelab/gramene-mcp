@@ -191,23 +191,29 @@ If the server is on a remote host, make sure `MCP_ALLOWED_ORIGINS` is set to all
 
 ## Tools
 
-The server exposes 13 tools:
+The server exposes 12 tools:
 
 | Tool | Description |
 |---|---|
-| `solr_search` | Full Solr query against the genes core — field lists, filters, facets, sorting, pagination |
-| `solr_suggest` | Translate a natural-language term (gene name, species, pathway, ontology) into a Solr filter query |
+| `solr_search` | Full Solr query against the genes core — field lists, filters, facets, sorting, pagination. Use for single-gene cards (`q="id:…"`) and to produce facet-count arrays consumed by the client-side enrichment skill |
+| `solr_suggest` | Entry point for free-text concepts (gene name, family, pathway, species, ontology, trait) → `fq_field`/`fq_value`. Always start here before `mongo_find` |
 | `solr_search_bool` | Structured AND/OR/NOT boolean queries without raw Solr syntax |
-| `solr_graph` | Traverse gene relationship graphs (e.g. genomic neighbourhoods via `compara_neighbors_10`) |
-| `genes_in_region` | Find all genes overlapping a chromosomal interval |
+| `solr_graph` | Single-hop graph traversal (e.g. genomic neighbourhoods via `compara_neighbors_10`). Multi-hop relationships are expressed by chaining two queries |
+| `genes_in_region` | Find all genes overlapping a chromosomal interval. `taxon_id` is the plain NCBI ID |
 | `expression_for_genes` | Baseline (TPM/FPKM) and differential (log₂FC) expression by tissue and condition |
 | `vep_for_gene` | Germplasm accessions carrying predicted loss-of-function alleles (Ensembl VEP), grouped by consequence, zygosity, and study |
-| `enrichment_analysis` | Hypergeometric overrepresentation test for GO, Plant Ontology, Trait Ontology, domains, or pathways |
-| `pubmed_for_genes` | PubMed papers linked to a set of genes via NCBI E-utilities |
-| `mongo_find` | Raw MongoDB `find()` against any collection |
+| `pubmed_for_genes` | PubMed and DOI cross-references for a set of genes (returns IDs only — pipe to a PubMed-focused MCP for bibliographic detail) |
+| `mongo_find` | MongoDB `find()` for detail lookups by known ID — not for discovery |
 | `mongo_lookup_by_ids` | Batch-resolve numeric ontology term IDs to names |
 | `mongo_list_collections` | List all collections in the configured database |
 | `kb_relations` | Return the Solr ↔ MongoDB field crosswalk (schema documentation) |
+
+**Enrichment / overrepresentation analysis is intentionally not an MCP tool.**
+Build foreground and background facet-count arrays via `solr_search` (with
+`facet.field` on `GO__ancestors`, `PO__ancestors`, `TO__ancestors`,
+`pathways__ancestors`, or `domains__ancestors`) and pass them to a
+client-side enrichment skill that operates on (ontology, foreground array,
+background array).
 
 ## Workflow prompts
 
@@ -216,14 +222,15 @@ The server also exposes workflow prompts that Claude loads on demand to guide mu
 - **base** — Role definition, query routing, species reference table, and critical conventions
 - **gene_lookup** — Search by gene/protein name or molecular function
 - **pathway_genes** — List genes in a Plant Reactome pathway for a given species
+- **qtl_discovery** — Resolve a free-text trait to a TO term and list matching QTLs
 - **qtl_candidate_ranking** — Full pipeline for ranking candidate genes within a QTL interval
 - **cross_species_comparison** — Compare a gene across orthologs in multiple species
-- **orthologs_paralogs** — Discover paralogs within a species
+- **orthologs_paralogs** — Field reference for ortholog / paralog / homolog queries
 - **gene_family** — Explore a gene family across species
+- **gene_family_expansion** — Per-clade copy counts via `gene_tree` × `taxonomy__ancestors` faceting
 - **germplasm_lof** — Find EMS and natural-diversity knockout lines for target genes
-- **enrichment** — Run ontology enrichment on a gene set
-- **pav_cnv** — Analyse presence/absence and copy-number variation via facets
-- **literature_search** — Discover papers linked to a gene set
+- **pav_cnv** — Analyse presence/absence and copy-number variation via facets or chained graph traversal
+- **literature_search** — Collect PubMed/DOI cross-references for a gene (and its orthologs) to hand off to a PubMed-focused MCP
 
 ## Data model
 
@@ -232,8 +239,10 @@ Gramene-MCP combines two backends:
 **Solr** (`genes` core) — one document per gene, across 30+ plant species. Key field groups:
 
 - Gene identity: `id`, `name`, `description`, `biotype`, `taxon_id`, `region`, `start`, `end`, `strand`
+- Species filtering: `taxonomy__ancestors` (plain NCBI taxon IDs at every rank — preferred)
 - Ontology ancestors: `GO__ancestors`, `PO__ancestors`, `TO__ancestors`, `pathways__ancestors`, `domains__ancestors`
-- Comparative genomics: `gene_tree`, `compara_neighbors_N`, `compara_idx_multi` (PAV/CNV)
+- Comparative genomics: `gene_tree`, `homology__all_orthologs`, `homology__ortholog_one2one`/`one2many`/`many2many`, `homology__within_species_paralog`, `compara_neighbors_N`, `compara_idx_multi` (PAV/CNV)
+- Expression linkage: `expressed_in_gxa_attr_ss` (joins to MongoDB `experiments` and `assays`)
 - Loss-of-function: `VEP__{consequence}__{zygosity}__{species}__{study}__attr_ss`, `VEP__merged__EMS/NAT__attr_ss`
 - Literature: `PUBMED__xrefs`
 
@@ -280,7 +289,9 @@ Standalone scripts for batch data access are in the [`scripts/`](scripts/) direc
 A few quirks to be aware of when using the tools directly:
 
 - **Gene IDs** must be full stable IDs (e.g. `SORBI_3006G095600`), never abbreviated.
-- **Taxon IDs** come in two flavours: `taxonomy__ancestors` uses plain NCBI IDs (e.g. `4558` for sorghum); the `taxon_id` field uses `NCBI_ID × 1000 + suffix` (e.g. `4558001`).
-- **`solr_graph`** must always be called with `maxDepth: 1` to avoid unbounded traversal.
-- **Species suggestions** work best with an exact-name query (`q: 'name:"Sorghum bicolor"'`) rather than a fuzzy `term:` lookup.
+- **Taxon IDs** — filter with `taxonomy__ancestors:<plain NCBI id>` (e.g. `4558` for sorghum). The `taxon_id` *field* on individual gene documents uses `NCBI×1000+suffix` (e.g. `4558001`); avoid filtering on it directly. The `genes_in_region` `taxon_id` parameter takes the plain NCBI ID and applies it as `taxonomy__ancestors`.
+- **`solr_graph`** is single-hop by design; depth is hard-coded server-side. Multi-hop relationships are expressed by chaining two graph queries (e.g. orthologs → neighbors).
+- **Discovery vs detail.** Always start free-text discovery with `solr_suggest`. Reserve `mongo_find` for fetching detail records once you have a specific ID.
+- **Homology field choice.** Default to `homology__all_orthologs`. Use `homology__ortholog_one2one` only for tight pairs (e.g. sorghum ↔ rice); maize is a paleopolyploid, and monocot ↔ Arabidopsis is too distant for stable 1:1 mappings.
+- **Species suggestions** work best with an exact-name query (`q: 'name:"Sorghum bicolor"'`) rather than a fuzzy `term:` lookup. The same applies to pathway and Trait Ontology lookups (`fq: ['category:Trait Ontology']`).
 - **Expression data** is richest for sorghum; VEP loss-of-function data covers sorghum, maize, and several rice genomes.

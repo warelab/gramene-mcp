@@ -76,7 +76,6 @@ describe("MCP protocol", () => {
     const res = await rpc("tools/list");
     const names = res.result.tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
-      "enrichment_analysis",
       "expression_for_genes",
       "genes_in_region",
       "kb_relations",
@@ -108,19 +107,32 @@ describe("MCP protocol", () => {
 // ─── HTTP edge cases ─────────────────────────────────────────────────
 
 describe("HTTP edge cases", () => {
-  it("GET /mcp → 405", async () => {
+  it("GET /mcp → discovery document", async () => {
     const res = await fetch(BASE, { method: "GET" });
-    assert.equal(res.status, 405);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type") || "", /application\/json/);
+    const doc = await res.json();
+    assert.equal(doc.status, "ok");
+    assert.equal(doc.server?.name, "gramene-mcp");
+    assert.ok(doc.server?.version, "Expected server.version");
+    assert.equal(doc.server?.transport, "http");
+    assert.ok(Array.isArray(doc.protocolVersions) && doc.protocolVersions.length > 0,
+      "Expected at least one supported protocolVersion");
+    assert.equal(typeof doc.capabilities?.tools, "boolean");
+    assert.equal(typeof doc.capabilities?.prompts, "boolean");
+    assert.equal(doc.auth?.mode, "none");
   });
 
-  it("POST /wrong-path → 405", async () => {
+  it("POST /wrong-path → 404", async () => {
+    // 405 ("Method Not Allowed") implies the resource exists but doesn't accept
+    // the method. An unknown path correctly returns 404 ("Not Found").
     const url = BASE.replace("/mcp", "/wrong");
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-    assert.equal(res.status, 405);
+    assert.equal(res.status, 404);
   });
 
   it("empty body → 400", async () => {
@@ -507,15 +519,18 @@ describe("expression_for_genes", () => {
       arguments: { gene_ids: [REAL.geneId] },
     });
     const data = toolResult(res);
-    assert.ok(typeof data.gene_count === "number", "Expected gene_count");
+    assert.equal(data.gene_count, 1, "Expected gene_count to reflect requested gene_ids");
     assert.ok(typeof data.experiment_count === "number", "Expected experiment_count");
-    assert.ok(data.genes?.[REAL.geneId], `Expected entry for ${REAL.geneId}`);
-    const gene = data.genes[REAL.geneId];
-    assert.ok(Array.isArray(gene.baseline),     "Expected baseline array");
-    assert.ok(Array.isArray(gene.differential), "Expected differential array");
+    const gene = data.genes?.[REAL.geneId];
+    assert.ok(gene, `Expected entry for ${REAL.geneId}`);
+    assert.ok(Array.isArray(gene.baseline),               "Expected baseline array");
+    assert.ok(Array.isArray(gene.differential),           "Expected differential array");
+    assert.ok(Array.isArray(gene.experiments_with_data),  "Expected experiments_with_data array");
+    assert.ok(gene.experiments_with_data.length > 0,      "Sorghum gene should have at least one expression experiment");
+    assert.ok(gene.baseline.length + gene.differential.length > 0, "Sorghum gene should have expression rows");
   });
 
-  it("Baseline filter returns only baseline entries", async () => {
+  it("baseline rows expose value, tissue, and factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
       arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline" },
@@ -523,11 +538,17 @@ describe("expression_for_genes", () => {
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
     assert.ok(gene, "Expected gene data");
-    // With Baseline filter, differential should be empty
     assert.equal(gene.differential.length, 0, "Expected no differential entries under Baseline filter");
+    assert.ok(gene.baseline.length > 0, "Expected at least one baseline row");
+    const row = gene.baseline[0];
+    assert.equal(typeof row.value, "number", "baseline value should be numeric");
+    assert.ok(typeof row.experiment === "string" && row.experiment.startsWith("E-"), "experiment id should be reconstructed with dashes");
+    assert.ok(/^g\d+$/.test(row.group), "group should be 'gN'");
+    assert.ok("tissue" in row,  "row should expose tissue");
+    assert.ok(Array.isArray(row.factors), "row should expose factors[]");
   });
 
-  it("Differential filter returns only differential entries", async () => {
+  it("differential rows expose contrast structure with control + treatment factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
       arguments: { gene_ids: [REAL.geneId], experiment_type: "Differential" },
@@ -535,11 +556,18 @@ describe("expression_for_genes", () => {
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
     assert.ok(gene, "Expected gene data");
-    // With Differential filter, baseline should be empty
     assert.equal(gene.baseline.length, 0, "Expected no baseline entries under Differential filter");
-    // Differential entries have l2fc
-    if (gene.differential.length > 0) {
-      assert.ok(typeof gene.differential[0].l2fc === "number", "Expected l2fc on differential entry");
+    if (gene.differential.length === 0) return; // nothing to assert if no DE rows
+    const row = gene.differential[0];
+    assert.ok(typeof row.l2fc === "number", "l2fc should be numeric");
+    assert.ok(/^g\d+$/.test(row.control_group),   "control_group should be 'gN'");
+    assert.ok(/^g\d+$/.test(row.treatment_group), "treatment_group should be 'gN'");
+    assert.ok(Array.isArray(row.control_factors),   "control_factors should be an array");
+    assert.ok(Array.isArray(row.treatment_factors), "treatment_factors should be an array");
+    assert.ok(Array.isArray(row.contrast),          "contrast should be an array");
+    assert.ok(Array.isArray(row.shared_factors),    "shared_factors should be an array");
+    for (const c of row.contrast) {
+      assert.ok("type" in c && "control" in c && "treatment" in c, "contrast entry should have type/control/treatment");
     }
   });
 
@@ -551,7 +579,7 @@ describe("expression_for_genes", () => {
     const nAll    = toolResult(all).experiment_count;
     const nSorghum = toolResult(sorghum).experiment_count;
     assert.ok(nAll > 0,          "Expected experiments without filter");
-    assert.ok(nSorghum >= 0,     "Expected non-negative sorghum experiment count");
+    assert.ok(nSorghum > 0,      "Expected sorghum experiments");
     assert.ok(nSorghum <= nAll,  "Taxon filter should not increase experiment count");
   });
 
@@ -564,15 +592,39 @@ describe("expression_for_genes", () => {
     const allBaseline   = toolResult(all).genes?.[REAL.geneId]?.baseline ?? [];
     const grainBaseline = toolResult(grain).genes?.[REAL.geneId]?.baseline ?? [];
     assert.ok(grainBaseline.length <= allBaseline.length, "PO filter should not increase baseline entries");
+    const grainData = toolResult(grain);
+    assert.ok(grainData.po_filter, "PO filter response should include po_filter metadata");
+    assert.deepEqual(grainData.po_filter.requested, [9001]);
   });
 
-  it("non-existent gene returns empty genes map", async () => {
+  it("po ancestor fallback flips po_filter.expanded when only ancestors match", async () => {
+    // PO:0005360 (aleurone layer) — too specific for direct assay annotations,
+    // but its ancestors include endosperm (9089) which does match.
+    const res = await rpc("tools/call", {
+      name: "expression_for_genes",
+      arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [5360] },
+    });
+    const data = toolResult(res);
+    assert.ok(data.po_filter, "Expected po_filter metadata");
+    assert.deepEqual(data.po_filter.requested, [5360]);
+    if ((data.genes[REAL.geneId]?.baseline?.length ?? 0) > 0) {
+      assert.equal(data.po_filter.expanded, true, "Expected expanded:true when only ancestors matched");
+      assert.ok(data.po_filter.ancestors_used.length > 0, "Expected ancestors_used to be non-empty");
+    }
+  });
+
+  it("non-existent gene returns an empty entry, not a missing one", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
       arguments: { gene_ids: ["FAKE_GENE_DOES_NOT_EXIST_XYZ"] },
     });
     const data = toolResult(res);
-    assert.equal(data.gene_count, 0, "Expected zero genes for non-existent ID");
+    assert.equal(data.gene_count, 1, "gene_count counts requested ids, not Solr matches");
+    const gene = data.genes["FAKE_GENE_DOES_NOT_EXIST_XYZ"];
+    assert.ok(gene, "Expected an entry even for a non-existent gene");
+    assert.equal(gene.baseline.length, 0);
+    assert.equal(gene.differential.length, 0);
+    assert.deepEqual(gene.experiments_with_data, []);
   });
 
   it("empty gene_ids → tool error", async () => {
@@ -580,7 +632,7 @@ describe("expression_for_genes", () => {
       name: "expression_for_genes",
       arguments: { gene_ids: [] },
     });
-    assert.ok(res.error, "Expected error for empty gene_ids");
+    assert.ok(res.error || res.result?.isError, "Expected error for empty gene_ids");
   });
 });
 
@@ -856,263 +908,6 @@ describe("vep_for_gene — live data (SORBI_3006G095600)", () => {
     }
   });
 });
-
-// ─── enrichment_analysis ──────────────────────────────────────────────
-
-describe("enrichment_analysis — tool registration", () => {
-  it("enrichment_analysis appears in tools/list", async () => {
-    const res = await rpc("tools/list");
-    const tools = res.result?.tools ?? [];
-    const tool = tools.find((t) => t.name === "enrichment_analysis");
-    assert.ok(tool, "Expected enrichment_analysis in tools/list");
-    assert.ok(tool.inputSchema?.properties?.foreground_fq, "Expected foreground_fq in schema");
-    assert.ok(tool.inputSchema?.properties?.background_fq, "Expected background_fq in schema");
-    assert.ok(tool.inputSchema?.properties?.field, "Expected field in schema");
-  });
-
-  it("requires foreground_fq and background_fq params", async () => {
-    const res = await rpc("tools/call", { name: "enrichment_analysis", arguments: {} });
-    const hasError = res.error != null
-      || res.result?.content?.[0]?.text?.includes("requires")
-      || res.result?.isError === true;
-    assert.ok(hasError, "Expected error when fq params missing");
-  });
-});
-
-describe("enrichment_analysis — GO enrichment for jasmonic acid pathway genes", () => {
-  it("returns enriched GO terms for JA pathway genes vs sorghum background", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        p_threshold: 0.05,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data, "Expected a result");
-    assert.ok(data.foreground_count > 0, "Expected foreground genes > 0");
-    assert.ok(data.background_count > 0, "Expected background genes > 0");
-    assert.ok(data.background_count > data.foreground_count,
-      "Background should be larger than foreground");
-    assert.ok(data.terms_tested > 0, "Expected some terms tested");
-    assert.ok(data.significant_terms > 0,
-      "Expected at least one significant GO term for JA pathway genes");
-  });
-
-  it("enriched terms have expected shape and are sorted by p_adjusted", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-      },
-    });
-    const terms = toolResult(res).terms;
-    assert.ok(terms.length > 0, "Expected significant terms");
-    const t = terms[0];
-    assert.ok(typeof t.term_id === "number", "Expected numeric term_id");
-    assert.ok(typeof t.term_name === "string" && t.term_name.length > 0,
-      "Expected resolved term_name");
-    assert.ok(typeof t.foreground_count === "number", "Expected foreground_count");
-    assert.ok(typeof t.background_count === "number", "Expected background_count");
-    assert.ok(typeof t.fold_enrichment === "number", "Expected fold_enrichment");
-    assert.ok(typeof t.p === "number", "Expected p-value");
-    assert.ok(typeof t.p_adjusted === "number", "Expected p_adjusted");
-
-    // Should be sorted by p_adjusted ascending
-    for (let i = 1; i < terms.length; i++) {
-      assert.ok(terms[i].p_adjusted >= terms[i-1].p_adjusted,
-        `Terms should be sorted by p_adjusted: ${terms[i-1].p_adjusted} > ${terms[i].p_adjusted}`);
-    }
-  });
-
-  it("fold_enrichment > 1 for significantly enriched terms", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-      },
-    });
-    const terms = toolResult(res).terms;
-    for (const t of terms) {
-      assert.ok(t.fold_enrichment > 1,
-        `Expected fold_enrichment > 1 for enriched term "${t.term_name}", got ${t.fold_enrichment}`);
-    }
-  });
-
-  it("p_adjusted <= p_threshold for all returned terms", async () => {
-    const threshold = 0.01;
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        p_threshold: threshold,
-      },
-    });
-    const terms = toolResult(res).terms;
-    for (const t of terms) {
-      assert.ok(t.p_adjusted <= threshold,
-        `Expected p_adjusted <= ${threshold}, got ${t.p_adjusted} for "${t.term_name}"`);
-    }
-  });
-});
-
-describe("enrichment_analysis — pathway enrichment for a gene family", () => {
-  it("returns pathway enrichment for a gene tree vs sorghum background", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: [`gene_tree:${REAL.geneTree}`],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "pathways__ancestors",
-        p_threshold: 0.05,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.foreground_count > 0, "Expected foreground genes");
-    assert.ok(data.background_count > data.foreground_count,
-      "Background should be larger");
-    // May or may not have significant terms — just verify structure
-    assert.ok(typeof data.significant_terms === "number",
-      "Expected significant_terms count");
-    assert.ok(Array.isArray(data.terms), "Expected terms array");
-  });
-});
-
-describe("enrichment_analysis — domain enrichment", () => {
-  it("finds enriched InterPro domains for JA pathway genes", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "domains__ancestors",
-        p_threshold: 0.05,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.foreground_count > 0, "Expected foreground genes");
-    // JA biosynthesis genes should have enriched lipoxygenase/AOS domains
-    assert.ok(data.significant_terms > 0,
-      "Expected enriched domains for JA pathway genes");
-  });
-});
-
-// ─── enrichment_analysis — include_ancestors DAG ──────────────────────
-
-describe("enrichment_analysis — include_ancestors DAG", () => {
-  it("include_ancestors=true returns a dag object with nodes and roots", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: true,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.dag, "Expected dag object in response");
-    assert.ok(data.dag.node_count > 0, "Expected node_count > 0");
-    assert.ok(Array.isArray(data.dag.root_ids), "Expected root_ids array");
-    assert.ok(data.dag.root_ids.length > 0, "Expected at least one root");
-    assert.ok(typeof data.dag.nodes === "object", "Expected nodes object");
-  });
-
-  it("DAG nodes have required structure (id, name, is_a, children)", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: true,
-      },
-    });
-    const nodes = toolResult(res).dag.nodes;
-    for (const [id, node] of Object.entries(nodes)) {
-      assert.ok(typeof node.id === "number", `Expected numeric id, got ${typeof node.id}`);
-      assert.ok(typeof node.name === "string", `Expected string name for ${id}`);
-      assert.ok(Array.isArray(node.is_a), `Expected is_a array for ${id}`);
-      assert.ok(Array.isArray(node.children), `Expected children array for ${id}`);
-    }
-  });
-
-  it("DAG includes more nodes than enriched terms (ancestor context)", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: true,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.dag.node_count >= data.significant_terms,
-      "DAG should have at least as many nodes as enriched terms (plus ancestor context)");
-  });
-
-  it("enriched DAG nodes have fold_enrichment and p_adjusted", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: true,
-      },
-    });
-    const nodes = toolResult(res).dag.nodes;
-    const enrichedNodes = Object.values(nodes).filter((n) => n.enriched);
-    assert.ok(enrichedNodes.length > 0, "Expected at least one enriched node");
-    for (const n of enrichedNodes) {
-      assert.ok(typeof n.fold_enrichment === "number", `Expected fold_enrichment on enriched node ${n.id}`);
-      assert.ok(typeof n.p_adjusted === "number", `Expected p_adjusted on enriched node ${n.id}`);
-      assert.ok(typeof n.foreground_count === "number", `Expected foreground_count on enriched node ${n.id}`);
-    }
-  });
-
-  it("root nodes have no parents (is_a is empty)", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: true,
-      },
-    });
-    const { nodes, root_ids } = toolResult(res).dag;
-    for (const rid of root_ids) {
-      assert.ok(nodes[rid], `Root ${rid} should exist in nodes`);
-      assert.deepStrictEqual(nodes[rid].is_a, [],
-        `Root node ${rid} should have empty is_a`);
-    }
-  });
-
-  it("include_ancestors=false does NOT return a dag object", async () => {
-    const res = await rpc("tools/call", {
-      name: "enrichment_analysis",
-      arguments: {
-        foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"],
-        background_fq: ["taxonomy__ancestors:4558"],
-        field: "GO__ancestors",
-        include_ancestors: false,
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(!data.dag, "Expected NO dag when include_ancestors=false");
-  });
-});
-
 // ─── pubmed_for_genes ────────────────────────────────────────────────
 
 describe("pubmed_for_genes", () => {
@@ -1130,7 +925,7 @@ describe("pubmed_for_genes", () => {
     assert.ok(res.error || res.result?.isError, "Should error when gene_ids missing");
   });
 
-  it("returns paper metadata for a gene with known publications", async () => {
+  it("returns PMID xrefs for a gene with known publications", async () => {
     // SORBI_3006G095600 has PUBMED__xrefs: ["31597271"] (Gladman et al. 2019)
     const res = await rpc("tools/call", {
       name: "pubmed_for_genes",
@@ -1138,57 +933,43 @@ describe("pubmed_for_genes", () => {
     });
     const data = toolResult(res);
     assert.ok(data.gene_count >= 1, "Should find the gene");
-    assert.ok(data.genes_with_papers >= 1, "Gene should have papers");
+    assert.ok(data.genes_with_refs >= 1, "Gene should have references");
     const gene = data.genes["SORBI_3006G095600"];
     assert.ok(gene, "Gene entry should exist");
-    assert.ok(gene.count >= 1, "Should have at least 1 paper");
-    const paper = gene.papers[0];
-    assert.ok(paper.pmid, "Paper should have a pmid");
-    assert.ok(paper.title, "Paper should have a title");
-    assert.ok(paper.title.length > 10, "Title should be a real title");
-    assert.ok(paper.authors && paper.authors.length > 0, "Should have authors");
-    assert.ok(paper.journal, "Should have a journal");
-    assert.ok(paper.url.includes("pubmed"), "Should have a PubMed URL");
+    assert.ok(gene.count >= 1, "Should have at least 1 reference");
+    assert.ok(Array.isArray(gene.pmids), "pmids should be an array");
+    assert.ok(Array.isArray(gene.dois), "dois should be an array");
+    assert.ok(gene.pmids.length + gene.dois.length === gene.count, "count should equal pmids + dois");
+    assert.ok(gene.pmids.every((p) => /^\d+$/.test(p)), "pmids should be numeric strings");
+    assert.ok(gene.dois.every((d) => !d.startsWith("DOI:")), "dois should be stripped of the 'DOI:' prefix");
   });
 
-  it("returns empty papers for a gene without publications", async () => {
-    // Use a gene that does NOT have capabilities:pubs
+  it("returns empty references for a gene without publications", async () => {
     const res = await rpc("tools/call", {
       name: "pubmed_for_genes",
       arguments: { gene_ids: ["SORBI_3001G000100"] },
     });
     const data = toolResult(res);
     const gene = data.genes["SORBI_3001G000100"];
-    assert.ok(gene, "Gene entry should exist even without papers");
-    assert.equal(gene.count, 0, "Should have 0 papers");
-  });
-
-  it("include_abstract returns abstract text", async () => {
-    const res = await rpc("tools/call", {
-      name: "pubmed_for_genes",
-      arguments: { gene_ids: ["SORBI_3006G095600"], include_abstract: true },
-    });
-    const data = toolResult(res);
-    const gene = data.genes["SORBI_3006G095600"];
-    assert.ok(gene.count >= 1, "Should have papers");
-    const paper = gene.papers[0];
-    assert.ok(paper.abstract, "Should have an abstract when include_abstract=true");
-    assert.ok(paper.abstract.length > 50, "Abstract should be substantial text");
+    assert.ok(gene, "Gene entry should exist even without references");
+    assert.equal(gene.count, 0, "Should have 0 references");
+    assert.deepEqual(gene.pmids, []);
+    assert.deepEqual(gene.dois, []);
   });
 
   it("handles multiple genes in a single call", async () => {
     const res = await rpc("tools/call", {
       name: "pubmed_for_genes",
       arguments: {
-        gene_ids: ["SORBI_3006G095600", "SORBI_3001G000100", "SORBI_3009G083300"],
+        gene_ids: ["SORBI_3006G095600", "SORBI_3009G083300"],
       },
     });
     const data = toolResult(res);
-    assert.equal(Object.keys(data.genes).length, 3, "Should return entries for all 3 genes");
-    assert.ok(data.total_unique_papers >= 1, "Should have at least 1 paper total");
+    assert.equal(Object.keys(data.genes).length, 2, "Should return entries for both genes");
+    assert.ok(data.total_unique_pmids + data.total_unique_dois >= 1, "Should have at least 1 reference total");
   });
 
-  it("handles rice genes with DOI-only refs", async () => {
+  it("handles rice genes with DOI references", async () => {
     // Os01g0102400 has both PMID and DOI refs
     const res = await rpc("tools/call", {
       name: "pubmed_for_genes",
@@ -1197,18 +978,7 @@ describe("pubmed_for_genes", () => {
     const data = toolResult(res);
     const gene = data.genes["Os01g0102400"];
     assert.ok(gene, "Rice gene entry should exist");
-    assert.ok(gene.count >= 1, "Should have at least 1 paper");
-  });
-
-  it("returns DOI and URL fields for papers", async () => {
-    const res = await rpc("tools/call", {
-      name: "pubmed_for_genes",
-      arguments: { gene_ids: ["SORBI_3006G095600"] },
-    });
-    const data = toolResult(res);
-    const paper = data.genes["SORBI_3006G095600"].papers[0];
-    assert.ok(paper.doi, "Paper should have a DOI");
-    assert.ok(paper.url, "Paper should have a URL");
+    assert.ok(gene.count >= 1, "Should have at least 1 reference");
   });
 });
 
@@ -1222,8 +992,8 @@ describe("prompts/list", () => {
     assert.deepEqual(names, [
       "base",
       "cross_species_comparison",
-      "enrichment",
       "gene_family",
+      "gene_family_expansion",
       "gene_lookup",
       "germplasm_lof",
       "literature_search",
@@ -1231,6 +1001,7 @@ describe("prompts/list", () => {
       "pathway_genes",
       "pav_cnv",
       "qtl_candidate_ranking",
+      "qtl_discovery",
     ]);
   });
 
@@ -1304,14 +1075,14 @@ describe("prompts/get", () => {
         region: "6",
         start: 52000000,
         end: 58000000,
-        taxon_id: 4558001,
+        taxon_id: 4558,
       },
     });
     assert.ok(!res.error);
     const text = res.result.messages[0].content.text;
     assert.ok(text.includes('"6"'), "Expected region value");
     assert.ok(text.includes("52000000"), "Expected start coordinate");
-    assert.ok(text.includes("4558001"), "Expected taxon_id");
+    assert.ok(text.includes("4558"), "Expected taxon_id");
   });
 
   it("advertises arguments for every workflow that takes them", async () => {

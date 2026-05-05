@@ -34,6 +34,54 @@ const SOLR_SUGGESTIONS_CORE = process.env.SOLR_SUGGESTIONS_CORE || "suggestions"
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
 const MONGO_DB = process.env.MONGO_DB || "test";
 
+// Single source of truth for server identity. Used by both the MCP `initialize`
+// reply (over JSON-RPC) and the GET /mcp discovery endpoint (for clients that
+// want to inspect transport, protocol versions, and capabilities without an
+// initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
+const SERVER_NAME = "gramene-mcp";
+const SERVER_VERSION = "0.3.0";
+const SERVER_DESCRIPTION =
+  "MCP server bridging AI agents to the Gramene plant genomics database " +
+  "(Solr search index + MongoDB annotation store). Tools cover gene search, " +
+  "comparative genomics, expression, ontology / QTL annotations, predicted " +
+  "loss-of-function germplasm, and literature cross-references.";
+const SERVER_HOMEPAGE = "https://github.com/warelab/gramene-mcp";
+const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25"];
+const SERVER_CAPABILITIES = {
+  tools:     { listChanged: false },
+  prompts:   { listChanged: false },
+  resources: false,
+  logging:   false,
+};
+
+function getServerDiscoveryDoc() {
+  return {
+    status: "ok",
+    server: {
+      name: SERVER_NAME,
+      version: SERVER_VERSION,
+      description: SERVER_DESCRIPTION,
+      homepage: SERVER_HOMEPAGE,
+      environment: process.env.NODE_ENV || "production",
+      transport: "http",
+      sessionMode: "session",
+    },
+    protocolVersions: SUPPORTED_PROTOCOL_VERSIONS,
+    capabilities: {
+      tools:     SERVER_CAPABILITIES.tools     !== false,
+      prompts:   SERVER_CAPABILITIES.prompts   !== false,
+      resources: SERVER_CAPABILITIES.resources !== false,
+      logging:   SERVER_CAPABILITIES.logging   !== false,
+    },
+    endpoints: {
+      mcp:       "/mcp",
+      dashboard: "/mcp/usage",
+      stats:     "/mcp/usage/data",
+    },
+    auth: { mode: "none" },
+  };
+}
+
 const ALLOWED_ORIGINS = new Set(
   (process.env.MCP_ALLOWED_ORIGINS || "")
     .split(",")
@@ -160,6 +208,66 @@ function db() {
   return mongoClient.db(MONGO_DB);
 }
 
+// --- Metadata cache ---
+//
+// Slow-changing collections are loaded into memory at startup and refreshed
+// once per day. Tools that previously made a per-call mongo round-trip for
+// experiment / assay / ontology lookups should read from this cache instead.
+//
+// Refresh strategy: countDocuments() is cheap; if it differs from the cached
+// count we reload that collection. This catches inserts/deletes but NOT
+// in-place updates that don't change the doc count — acceptable because these
+// collections (ontology terms, experiment metadata) almost never see in-place
+// edits in practice.
+
+const CACHED_COLLECTIONS = [
+  "experiments", "assays", "taxonomy", "qtls",
+  "PO", "TO", "GO", "pathways", "domains",
+];
+
+const cache = Object.fromEntries(
+  CACHED_COLLECTIONS.map((name) => [name, { docs: new Map(), count: 0, loadedAt: null }])
+);
+
+async function loadCachedCollection(name) {
+  const t0 = Date.now();
+  const docs = await db().collection(name).find({}).toArray();
+  cache[name].docs = new Map(docs.map((d) => [d._id, d]));
+  cache[name].count = docs.length;
+  cache[name].loadedAt = Date.now();
+  log({ event: "cache_load", collection: name, count: docs.length, ms: Date.now() - t0 });
+}
+
+async function initMetadataCache() {
+  const t0 = Date.now();
+  await Promise.all(CACHED_COLLECTIONS.map(loadCachedCollection));
+  log({ event: "cache_init_complete", ms: Date.now() - t0 });
+}
+
+const CACHE_REFRESH_MS = 24 * 3600_000;
+function startCacheRefresh() {
+  setInterval(async () => {
+    for (const name of CACHED_COLLECTIONS) {
+      try {
+        const n = await db().collection(name).countDocuments();
+        if (n !== cache[name].count) {
+          log({ event: "cache_count_changed", collection: name, before: cache[name].count, after: n });
+          await loadCachedCollection(name);
+        }
+      } catch (err) {
+        log({ event: "cache_refresh_error", collection: name, error: String(err?.message || err) });
+      }
+    }
+  }, CACHE_REFRESH_MS).unref();
+}
+
+function cacheGet(name, id) {
+  return cache[name]?.docs.get(id);
+}
+function cacheValues(name) {
+  return cache[name]?.docs.values();
+}
+
 // --- Helpers ---
 function send(res, status, bodyObj, headers = {}) {
   const body = bodyObj ? JSON.stringify(bodyObj) : "";
@@ -243,6 +351,11 @@ const KB_RELATIONS = {
         pathways__ancestors: {
           type: "int[]",
           references: { mongo: { collection: "pathways", key: "_id" } }
+        },
+        QTL_TO__ancestors: {
+          type: "string[]",
+          references: { mongo: { collection: "qtls", key: "_id" } },
+          description: "QTL stable IDs whose interval overlaps this gene's locus. Each value joins to the qtls mongo collection (qtls._id), where each QTL document carries its TO terms, location, population, and source publications."
         },
         compara_idx: {
           type: "pint",
@@ -328,12 +441,12 @@ const KB_RELATIONS = {
         },
         capabilities: {
           type: "string[]",
-          description: "Data types available for this gene. Values include: 'expression' (RNA-seq data in the expression collection), 'pathways' (Plant Reactome annotation), 'homology' (Compara gene trees), 'pubs' (literature), 'regulation' (regulatory features), 'variation' (genetic variants). Use as a filter to restrict to genes with specific data: fq=['capabilities:expression']."
+          description: "Multi-valued tag listing what data is available on the gene. Use as a fast pre-filter before expensive ancestor or facet queries. Vocabulary observed in production: 'location', 'pubs' (literature xrefs), 'taxonomy', 'xrefs', 'expression' (has *__expr / l2fc / pval Solr fields), 'familyRoot', 'homology' (Compara gene tree), 'domains' (InterPro), 'GO', 'PO', 'TO', 'pathways' (Plant Reactome), 'Grassius', 'MAKER', 'QTL_TO' (gene falls inside a curated QTL), 'VEP' (predicted loss-of-function germplasm). Examples: fq=['capabilities:expression'] (only genes with RNA-seq data); fq=['capabilities:VEP','taxonomy__ancestors:4558'] (sorghum genes with VEP coverage)."
         },
         // Literature cross-references
         "PUBMED__xrefs": {
           type: "string[]",
-          description: "PubMed cross-references for this gene. Values are PMID strings (e.g. '31597271') or DOI strings prefixed with 'DOI:' (e.g. 'DOI:10.1016/j.cj.2016.06.014'). Only present on genes with capabilities:pubs. Use the pubmed_for_genes tool to resolve these to full paper metadata (title, authors, abstract)."
+          description: "PubMed cross-references for this gene. Values are PMID strings (e.g. '31597271') or DOI strings prefixed with 'DOI:' (e.g. 'DOI:10.1016/j.cj.2016.06.014'). Only present on genes with capabilities:pubs. Use the pubmed_for_genes tool to collect PMID/DOI lists for a set of genes; resolve those IDs to bibliographic detail via a PubMed-focused MCP."
         },
         "GenBank__xrefs": {
           type: "string[]",
@@ -570,18 +683,16 @@ function sanitizeFilter(obj) {
 
 // Compile a Solr {!graph} local-params query string from structured inputs.
 // Produces e.g.: {!graph from=compara_neighbors_10 to=compara_idx_multi maxDepth=1}gene_tree:X
+//
+// maxDepth is hard-coded to 1. Deeper traversals on the genes core are
+// expensive and have proven error-prone in practice. Multi-hop relationships
+// are expressed by chaining two graph queries (e.g. orthologs → neighbors)
+// rather than by raising the depth.
 function compileGraphQuery(from, to, seedQuery, opts = {}) {
   if (!from || !to || !seedQuery) {
     throw new Error("graph query requires 'from', 'to', and 'seed_q'");
   }
-  // Local param values must not contain whitespace or unescaped special chars.
-  // Field names are safe; maxDepth is validated to be an integer.
-  const localParams = { from, to };
-  if (opts.maxDepth !== undefined) {
-    const d = Number(opts.maxDepth);
-    if (!Number.isInteger(d) || d < -1) throw new Error("maxDepth must be an integer >= -1");
-    localParams.maxDepth = d;
-  }
+  const localParams = { from, to, maxDepth: 1 };
   if (opts.traversalFilter) {
     // Wrap in quotes if it contains spaces
     const tf = String(opts.traversalFilter);
@@ -610,17 +721,101 @@ async function tool_genes_in_region(args) {
     `start:[* TO ${Number(end)}]`,
     `end:[${Number(start)} TO *]`,
   ];
-  if (taxon_id !== undefined) fq.push(`taxon_id:${Number(taxon_id)}`);
+  // Apply species filter via taxonomy__ancestors (plain NCBI taxon ID).
+  // This matches all subspecies/assemblies under that taxon and avoids the
+  // NCBI×1000+suffix encoding required by the Solr `taxon_id` field.
+  if (taxon_id !== undefined) fq.push(`taxonomy__ancestors:${Number(taxon_id)}`);
   if (mapFilter) fq.push(`map:${solrEscapeValue(mapFilter)}`);
   return solrFetch(SOLR_GENES_CORE, "select", { q, fq, fl, rows, sort });
+}
+
+// Solr field names encode experiment IDs by replacing each '-' with '_':
+//   E_GEOD_98817_g4__expr             → experiment "E-GEOD-98817", group "g4"
+//   E_GEOD_54705_g5_g7_l2fc_attr_f    → experiment "E-GEOD-54705", contrast g5→g7
+// Recover the original experiment ID by re-joining the leading underscore-
+// separated tokens with dashes, stopping at the first group token "gN".
+function parseBaselineField(field) {
+  // strip "__expr" suffix → "<E_…>_g<N>"
+  if (!field.endsWith("__expr")) return null;
+  const stem = field.slice(0, -"__expr".length);
+  const parts = stem.split("_");
+  // group token is the trailing "gN"
+  const groupIdx = parts.length - 1;
+  if (!/^g\d+$/.test(parts[groupIdx])) return null;
+  return {
+    experiment: parts.slice(0, groupIdx).join("-"),
+    group: parts[groupIdx],
+  };
+}
+
+function parseDifferentialField(field) {
+  // strip "_l2fc_attr_f" or "_pval_attr_f" suffix → "<E_…>_gC_gT"
+  let metric;
+  let stem;
+  if (field.endsWith("_l2fc_attr_f")) { metric = "l2fc"; stem = field.slice(0, -"_l2fc_attr_f".length); }
+  else if (field.endsWith("_pval_attr_f")) { metric = "p_value"; stem = field.slice(0, -"_pval_attr_f".length); }
+  else return null;
+
+  const parts = stem.split("_");
+  if (parts.length < 3) return null;
+  const treatmentIdx = parts.length - 1;
+  const controlIdx   = parts.length - 2;
+  if (!/^g\d+$/.test(parts[controlIdx]) || !/^g\d+$/.test(parts[treatmentIdx])) return null;
+  return {
+    experiment: parts.slice(0, controlIdx).join("-"),
+    control_group:   parts[controlIdx],
+    treatment_group: parts[treatmentIdx],
+    metric,
+  };
+}
+
+// Tissue extraction for an assay document (factor preferred over characteristic).
+function assayTissue(assay) {
+  if (!assay) return null;
+  return (
+    assay.factor?.find((f) => f.type === "organism part")?.label ??
+    assay.characteristic?.find((c) => c.type === "organism part")?.label ??
+    null
+  );
+}
+
+// All PO int_ids attached to an assay (factor and characteristic).
+function assayPoIds(assay) {
+  const ids = new Set();
+  for (const list of [assay?.factor, assay?.characteristic]) {
+    if (!Array.isArray(list)) continue;
+    for (const f of list) if (typeof f?.int_id === "number") ids.add(f.int_id);
+  }
+  return ids;
+}
+
+// Compute the contrast: factors whose values differ between control and
+// treatment assays. Each entry is { type, control, treatment }. Factor types
+// shared across both with identical values are reported as `shared_factors`.
+function diffAssayFactors(controlAssay, treatmentAssay) {
+  const cFactors = controlAssay?.factor   || [];
+  const tFactors = treatmentAssay?.factor || [];
+  const types = new Set([
+    ...cFactors.map((f) => f.type),
+    ...tFactors.map((f) => f.type),
+  ]);
+  const contrast = [];
+  const shared = [];
+  for (const type of types) {
+    const c = cFactors.find((f) => f.type === type)?.label ?? null;
+    const t = tFactors.find((f) => f.type === type)?.label ?? null;
+    if (c === t) shared.push({ type, label: c });
+    else contrast.push({ type, control: c, treatment: t });
+  }
+  return { contrast, shared };
 }
 
 async function tool_expression_for_genes(args) {
   const {
     gene_ids,
-    experiment_type,  // "Baseline" | "Differential" | null (both)
-    taxon_id,         // integer — filter experiments by species
-    po_terms,         // int[] — PO term int_ids to filter assay tissues/conditions
+    experiment_type,  // "Baseline" | "Differential" | undefined (both)
+    taxon_id,         // integer — filter experiments by species (the species the experiment was done in)
+    po_terms,         // int[] — PO term int_ids; either control or treatment assay must match
   } = args || {};
 
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
@@ -630,110 +825,184 @@ async function tool_expression_for_genes(args) {
     throw new Error("expression_for_genes: max 500 gene_ids per call");
   }
 
-  const d = db();
+  const wantBaseline     = !experiment_type || experiment_type === "Baseline";
+  const wantDifferential = !experiment_type || experiment_type === "Differential";
 
-  // 1. Get relevant experiments (filtered by type and/or taxon)
-  const expFilter = {};
-  if (experiment_type) expFilter.type = experiment_type;
-  if (taxon_id !== undefined) expFilter.taxon_id = Number(taxon_id);
-  const experiments = await d.collection("experiments").find(expFilter).toArray();
-  const relevantExpIds = new Set(experiments.map((e) => e._id));
-  const expMap = Object.fromEntries(experiments.map((e) => [e._id, e]));
-
-  // 2. Get expression docs for the requested gene IDs
-  const expDocs = await d.collection("expression")
-    .find({ _id: { $in: gene_ids } })
-    .toArray();
-
-  // 3. Collect assay IDs needed (only for relevant experiments, non-empty groups)
-  const neededAssayIds = new Set();
-  for (const doc of expDocs) {
-    for (const [expId, groups] of Object.entries(doc)) {
-      if (expId === "_id" || !relevantExpIds.has(expId)) continue;
-      if (!Array.isArray(groups) || groups.length === 0) continue;
-      for (const g of groups) {
-        if (g.group) neededAssayIds.add(`${expId}.${g.group}`);
-      }
-    }
+  // 1. Determine the experiments allowed by the type/taxon filters from cache.
+  const allowedExperiments = new Set();
+  for (const exp of cacheValues("experiments")) {
+    if (experiment_type && exp.type !== experiment_type) continue;
+    if (taxon_id !== undefined && Number(exp.taxon_id) !== Number(taxon_id)) continue;
+    allowedExperiments.add(exp._id);
   }
 
-  // 4. Fetch assay metadata, optionally filtered by PO terms
-  const assayFilter = { _id: { $in: [...neededAssayIds] } };
+  // 2. PO term expansion against the cached PO ontology. If callers passed PO
+  //    ints, expand to ancestors so the row-level filter below treats both the
+  //    requested terms and their ancestors as "matching tissues".
+  const poInfo = { requested: null, expanded: false, ancestors_used: [] };
+  let allowedPoIds = null;            // null = no PO filter
+  let strictPoIds  = null;            // user-requested ints only (without ancestors)
   if (po_terms && po_terms.length > 0) {
-    const poInts = po_terms.map(Number);
-    assayFilter.$or = [
-      { "characteristic.int_id": { $in: poInts } },
-      { "factor.int_id": { $in: poInts } },
-    ];
-  }
-  const assayDocs = await d.collection("assays").find(assayFilter).toArray();
-  const assayMap = Object.fromEntries(assayDocs.map((a) => [a._id, a]));
-  const relevantAssayIds = new Set(assayDocs.map((a) => a._id));
-
-  // Helper: extract a tissue label and extra condition string from an assay
-  function assayLabels(assay) {
-    if (!assay) return { tissue: null, condition: null };
-    const tissue =
-      assay.factor?.find((f) => f.type === "organism part")?.label ??
-      assay.characteristic?.find((c) => c.type === "organism part")?.label ??
-      null;
-    const condParts = (assay.factor ?? [])
-      .filter((f) => f.type !== "organism part")
-      .map((f) => `${f.type}:${f.label}`);
-    return { tissue, condition: condParts.length ? condParts.join(", ") : null };
-  }
-
-  // 5. Build per-gene result
-  const genes = {};
-  for (const doc of expDocs) {
-    const geneId = doc._id;
-    const baseline = [];
-    const differential = [];
-
-    for (const [expId, groups] of Object.entries(doc)) {
-      if (expId === "_id" || !relevantExpIds.has(expId)) continue;
-      if (!Array.isArray(groups) || groups.length === 0) continue;
-
-      const exp = expMap[expId];
-      for (const g of groups) {
-        const assayId = g.group ? `${expId}.${g.group}` : null;
-
-        // When PO filtering is active, skip assay groups that did not match
-        if (po_terms?.length > 0 && assayId && !relevantAssayIds.has(assayId)) continue;
-
-        const { tissue, condition } = assayLabels(assayId ? assayMap[assayId] : null);
-
-        if (g.value !== undefined) {
-          baseline.push({
-            experiment: expId,
-            experiment_name: exp?.name ?? null,
-            group: g.group,
-            value: g.value,
-            tissue,
-            condition,
-          });
-        } else if (g.l2fc !== undefined) {
-          differential.push({
-            experiment: expId,
-            experiment_name: exp?.name ?? null,
-            group: g.group,
-            l2fc: g.l2fc,
-            p_value: g.p_value ?? null,
-            tissue,
-            condition,
-          });
+    strictPoIds  = new Set(po_terms.map(Number));
+    poInfo.requested = [...strictPoIds];
+    allowedPoIds = new Set(strictPoIds);
+    // We always include ancestors up-front so the per-row filter is single-pass;
+    // poInfo.expanded gets flipped below if no row matched the strict set.
+    for (const id of strictPoIds) {
+      const poDoc = cacheGet("PO", id);
+      if (Array.isArray(poDoc?.ancestors)) {
+        for (const a of poDoc.ancestors) if (!strictPoIds.has(a)) {
+          allowedPoIds.add(a);
+          poInfo.ancestors_used.push(a);
         }
       }
     }
-
-    genes[geneId] = { baseline, differential };
   }
 
-  return {
-    gene_count: Object.keys(genes).length,
-    experiment_count: experiments.length,
+  // 3. Build the Solr fl wildcard list according to which experiment types are
+  //    requested, then fetch the gene docs in a single round-trip.
+  const flParts = ["id", "name", "description", "expressed_in_gxa_attr_ss"];
+  if (wantBaseline)     flParts.push("*__expr");
+  if (wantDifferential) flParts.push("*_l2fc_attr_f", "*_pval_attr_f");
+  const idQuery = `id:(${gene_ids.join(" OR ")})`;
+  const solrResp = await solrFetch(SOLR_GENES_CORE, "query", {
+    q: idQuery,
+    fq: ["capabilities:expression"],
+    fl: flParts.join(","),
+    rows: gene_ids.length,
+    defType: "lucene",
+  });
+  const docs = solrResp?.response?.docs || [];
+
+  // 4. Walk each gene doc, parse expression field names, join with cached
+  //    experiment + assay metadata.
+  const genes = {};
+  let strictMatchedAny = false;       // tracks whether any baseline OR differential row passed the strict PO filter
+
+  for (const doc of docs) {
+    const baseline = [];
+    const differential = [];
+
+    // Baseline: one field per (experiment, group)
+    if (wantBaseline) {
+      for (const [field, value] of Object.entries(doc)) {
+        if (!field.endsWith("__expr") || value == null) continue;
+        const parsed = parseBaselineField(field);
+        if (!parsed) continue;
+        if (!allowedExperiments.has(parsed.experiment)) continue;
+        const assay = cacheGet("assays", `${parsed.experiment}.${parsed.group}`);
+        const poIds = assayPoIds(assay);
+        if (allowedPoIds) {
+          let matched = false;
+          for (const id of poIds) if (allowedPoIds.has(id)) { matched = true; break; }
+          if (!matched) continue;
+          if (!strictMatchedAny) {
+            for (const id of poIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
+          }
+        }
+        const exp = cacheGet("experiments", parsed.experiment);
+        baseline.push({
+          experiment:      parsed.experiment,
+          experiment_name: exp?.name ?? null,
+          group:           parsed.group,
+          value,
+          tissue:          assayTissue(assay),
+          factors:         assay?.factor ?? [],
+        });
+      }
+    }
+
+    // Differential: pair _l2fc with the matching _pval by stem identity
+    if (wantDifferential) {
+      const contrasts = new Map();    // key: "<exp>__<cg>__<tg>"
+      for (const [field, value] of Object.entries(doc)) {
+        const parsed = parseDifferentialField(field);
+        if (!parsed || value == null) continue;
+        if (!allowedExperiments.has(parsed.experiment)) continue;
+        const key = `${parsed.experiment}__${parsed.control_group}__${parsed.treatment_group}`;
+        const slot = contrasts.get(key) || {
+          experiment:      parsed.experiment,
+          control_group:   parsed.control_group,
+          treatment_group: parsed.treatment_group,
+        };
+        slot[parsed.metric] = value;
+        contrasts.set(key, slot);
+      }
+      for (const slot of contrasts.values()) {
+        const cAssay = cacheGet("assays", `${slot.experiment}.${slot.control_group}`);
+        const tAssay = cacheGet("assays", `${slot.experiment}.${slot.treatment_group}`);
+        // PO filter: either control or treatment assay must match an allowed PO id
+        if (allowedPoIds) {
+          const cIds = assayPoIds(cAssay);
+          const tIds = assayPoIds(tAssay);
+          let matched = false;
+          for (const id of cIds) if (allowedPoIds.has(id)) { matched = true; break; }
+          if (!matched) for (const id of tIds) if (allowedPoIds.has(id)) { matched = true; break; }
+          if (!matched) continue;
+          if (!strictMatchedAny) {
+            for (const id of cIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
+            if (!strictMatchedAny) for (const id of tIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
+          }
+        }
+        const exp = cacheGet("experiments", slot.experiment);
+        const { contrast, shared } = diffAssayFactors(cAssay, tAssay);
+        differential.push({
+          experiment:      slot.experiment,
+          experiment_name: exp?.name ?? null,
+          control_group:   slot.control_group,
+          treatment_group: slot.treatment_group,
+          control_tissue:    assayTissue(cAssay),
+          treatment_tissue:  assayTissue(tAssay),
+          control_factors:   cAssay?.factor ?? [],
+          treatment_factors: tAssay?.factor ?? [],
+          contrast,
+          shared_factors: shared,
+          l2fc:    slot.l2fc    ?? null,
+          p_value: slot.p_value ?? null,
+        });
+      }
+    }
+
+    genes[doc.id] = {
+      name: doc.name ?? null,
+      description: doc.description ?? null,
+      experiments_with_data: doc.expressed_in_gxa_attr_ss ?? [],
+      baseline,
+      differential,
+    };
+  }
+
+  // Fill in entries for requested gene_ids that returned no Solr doc (no
+  // expression data, or filtered out by capabilities:expression).
+  for (const gid of gene_ids) {
+    if (!genes[gid]) {
+      genes[gid] = {
+        name: null,
+        description: null,
+        experiments_with_data: [],
+        baseline: [],
+        differential: [],
+      };
+    }
+  }
+
+  // If the PO filter is active and produced rows, but only via ancestor
+  // expansion, mark expanded:true. If no row matched even with ancestors, the
+  // result is just empty — which the caller sees from the empty arrays.
+  if (allowedPoIds && !strictMatchedAny) {
+    const anyMatched = Object.values(genes).some(
+      (g) => g.baseline.length || g.differential.length
+    );
+    if (anyMatched) poInfo.expanded = true;
+  }
+
+  const result = {
+    gene_count:       gene_ids.length,
+    experiment_count: allowedExperiments.size,
     genes,
   };
+  if (po_terms && po_terms.length > 0) result.po_filter = poInfo;
+  return result;
 }
 
 // --- VEP (Variant Effect Prediction) tool ---
@@ -923,435 +1192,22 @@ async function tool_vep_for_gene(args) {
   return { gene_count: Object.keys(result).length, genes: result };
 }
 
-// --- Enrichment analysis helpers: hypergeometric test + multiple testing ---
+// Enrichment analysis is intentionally NOT exposed as an MCP tool. It is
+// implemented as a client-side skill that operates on (ontology, foreground
+// term-frequency array, background term-frequency array). The MCP server's
+// job ends with returning facet-count arrays via solr_search.
 
-// Log-gamma via Lanczos approximation (sufficient precision for enrichment p-values)
-function lnGamma(z) {
-  if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - lnGamma(1 - z);
-  z -= 1;
-  const g = 7;
-  const c = [
-    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-    771.32342877765313, -176.61502916214059, 12.507343278686905,
-    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
-  ];
-  let x = c[0];
-  for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
-  const t = z + g + 0.5;
-  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
-}
 
-function lnBinomial(n, k) {
-  if (k < 0 || k > n) return -Infinity;
-  return lnGamma(n + 1) - lnGamma(k + 1) - lnGamma(n - k + 1);
-}
-
-/**
- * Hypergeometric survival function: P(X >= k)
- * N = population size (background), K = successes in population (bg with term),
- * n = draws (foreground size), k = observed successes (fg with term).
- */
-function hypergeomSF(k, N, K, n) {
-  if (k <= 0) return 1;
-  const maxI = Math.min(K, n);
-  if (k > maxI) return 0;
-
-  // Sum P(X = i) for i = k..min(K,n) using log-space for numerical stability
-  const lnDenom = lnBinomial(N, n);
-  let pSum = 0;
-  for (let i = k; i <= maxI; i++) {
-    const lnP = lnBinomial(K, i) + lnBinomial(N - K, n - i) - lnDenom;
-    pSum += Math.exp(lnP);
-    if (pSum > 1) return 1; // numerical ceiling
-  }
-  return Math.min(pSum, 1);
-}
-
-/**
- * Benjamini–Hochberg FDR correction.
- * Takes array of {p, ...rest}, returns same with added `p_adjusted` field.
- */
-function benjaminiHochberg(results) {
-  const m = results.length;
-  if (m === 0) return results;
-  // Sort by raw p ascending
-  const indexed = results.map((r, i) => ({ ...r, _origIdx: i }));
-  indexed.sort((a, b) => a.p - b.p);
-  // Step-up: p_adj[i] = min( p[i] * m / (i+1), p_adj[i+1] )
-  indexed[m - 1].p_adjusted = Math.min(indexed[m - 1].p * m / m, 1);
-  for (let i = m - 2; i >= 0; i--) {
-    indexed[i].p_adjusted = Math.min(indexed[i].p * m / (i + 1), indexed[i + 1].p_adjusted, 1);
-  }
-  // Restore original order
-  const out = new Array(m);
-  for (const r of indexed) {
-    const { _origIdx, ...rest } = r;
-    out[_origIdx] = rest;
-  }
-  return out;
-}
-
-/**
- * Parse Solr flat facet field response: [value, count, value, count, ...]
- * into a Map of value → count.
- */
-function parseFacetField(arr) {
-  const map = new Map();
-  if (!Array.isArray(arr)) return map;
-  for (let i = 0; i < arr.length; i += 2) {
-    const val = arr[i];
-    const cnt = arr[i + 1];
-    if (cnt > 0) map.set(val, cnt);
-  }
-  return map;
-}
-
-async function tool_enrichment_analysis(args) {
-  const {
-    foreground_fq,
-    background_fq,
-    field = "GO__ancestors",
-    p_threshold = 0.05,
-    correction = "bh",
-    min_foreground_count = 2,
-    max_terms = 200,
-    include_ancestors = false,
-  } = args || {};
-
-  if (!Array.isArray(foreground_fq) || foreground_fq.length === 0) {
-    throw new Error("enrichment_analysis requires a non-empty 'foreground_fq' array");
-  }
-  if (!Array.isArray(background_fq) || background_fq.length === 0) {
-    throw new Error("enrichment_analysis requires a non-empty 'background_fq' array");
-  }
-
-  // Allowed ontology/annotation fields for enrichment
-  const ALLOWED_FIELDS = new Set([
-    "GO__ancestors", "PO__ancestors", "TO__ancestors",
-    "domains__ancestors", "pathways__ancestors",
-  ]);
-  if (!ALLOWED_FIELDS.has(field)) {
-    throw new Error(`enrichment_analysis: field must be one of ${[...ALLOWED_FIELDS].join(", ")}`);
-  }
-
-  // The corresponding MongoDB collection for term name lookups
-  const FIELD_TO_COLLECTION = {
-    "GO__ancestors":        "GO",
-    "PO__ancestors":        "PO",
-    "TO__ancestors":        "TO",
-    "domains__ancestors":   "domains",
-    "pathways__ancestors":  "pathways",
-  };
-
-  // 1. Foreground facet: all terms in the foreground set
-  const fgResp = await solrFetch(SOLR_GENES_CORE, "select", {
-    q: "*:*",
-    fq: [...foreground_fq, `${field}:[* TO *]`], // must have at least one term
-    rows: 0,
-    facet: { field, mincount: 1, limit: -1 },
-  });
-  const fgTotal = fgResp?.response?.numFound ?? 0;
-  const fgFacets = parseFacetField(
-    fgResp?.facet_counts?.facet_fields?.[field]
-  );
-
-  if (fgTotal === 0) {
-    return { error: "No foreground genes found matching the filters.", foreground_count: 0 };
-  }
-
-  // 2. Background facet: all terms in the background set
-  const bgResp = await solrFetch(SOLR_GENES_CORE, "select", {
-    q: "*:*",
-    fq: [...background_fq, `${field}:[* TO *]`],
-    rows: 0,
-    facet: { field, mincount: 1, limit: -1 },
-  });
-  const bgTotal = bgResp?.response?.numFound ?? 0;
-  const bgFacets = parseFacetField(
-    bgResp?.facet_counts?.facet_fields?.[field]
-  );
-
-  if (bgTotal === 0) {
-    return { error: "No background genes found matching the filters.", background_count: 0 };
-  }
-
-  // 3. Compute hypergeometric p-value for each foreground term
-  let results = [];
-  for (const [termId, fgCount] of fgFacets.entries()) {
-    if (fgCount < min_foreground_count) continue;
-    const bgCount = bgFacets.get(termId) || 0;
-    if (bgCount === 0) continue; // shouldn't happen but guard
-
-    const p = hypergeomSF(fgCount, bgTotal, bgCount, fgTotal);
-    const foldEnrichment = (fgCount / fgTotal) / (bgCount / bgTotal);
-
-    results.push({
-      term_id: Number(termId),
-      foreground_count: fgCount,
-      foreground_fraction: parseFloat((fgCount / fgTotal).toFixed(4)),
-      background_count: bgCount,
-      background_fraction: parseFloat((bgCount / bgTotal).toFixed(4)),
-      fold_enrichment: parseFloat(foldEnrichment.toFixed(2)),
-      p,
-    });
-  }
-
-  // 4. Multiple testing correction
-  if (correction === "bh" || correction === "benjamini-hochberg") {
-    results = benjaminiHochberg(results);
-  } else {
-    // Bonferroni
-    const m = results.length;
-    for (const r of results) {
-      r.p_adjusted = Math.min(r.p * m, 1);
-    }
-  }
-
-  // 5. Filter by adjusted p-value threshold, sort by p_adjusted
-  results = results
-    .filter((r) => r.p_adjusted <= p_threshold)
-    .sort((a, b) => a.p_adjusted - b.p_adjusted);
-
-  // Cap at max_terms
-  if (results.length > max_terms) results = results.slice(0, max_terms);
-
-  // Round p-values for readable output
-  for (const r of results) {
-    r.p = parseFloat(r.p.toExponential(3));
-    r.p_adjusted = parseFloat(r.p_adjusted.toExponential(3));
-  }
-
-  // 6. Look up term names from MongoDB (and build DAG if requested)
-  const collName = FIELD_TO_COLLECTION[field];
-  const d = db();
-  const enrichedIds = new Set(results.map((r) => r.term_id));
-
-  if (results.length > 0) {
-    if (include_ancestors) {
-      // Collect all ancestor IDs from enriched terms
-      const allAncestorIds = new Set();
-      // First fetch enriched term docs to get their ancestors arrays
-      const enrichedDocs = await d.collection(collName)
-        .find({ _id: { $in: [...enrichedIds] } })
-        .toArray();
-      for (const doc of enrichedDocs) {
-        if (Array.isArray(doc.ancestors)) {
-          doc.ancestors.forEach((a) => allAncestorIds.add(a));
-        }
-        allAncestorIds.add(doc._id);
-      }
-
-      // Fetch all ancestor terms (many may already be in enrichedDocs)
-      const missingIds = [...allAncestorIds].filter((id) => !enrichedIds.has(id));
-      const ancestorDocs = missingIds.length > 0
-        ? await d.collection(collName)
-            .find({ _id: { $in: missingIds } })
-            .toArray()
-        : [];
-
-      const allDocs = [...enrichedDocs, ...ancestorDocs];
-      const docMap = Object.fromEntries(allDocs.map((t) => [t._id, t]));
-
-      // Attach names to enriched results
-      for (const r of results) {
-        r.term_name = docMap[r.term_id]?.name || null;
-      }
-
-      // Build enrichment lookup for quick access
-      const enrichmentMap = Object.fromEntries(results.map((r) => [r.term_id, r]));
-
-      // Build DAG nodes — each node has id, name, namespace, is_a (parents),
-      // children (derived), and enrichment stats if significant
-      const dagNodes = {};
-      const childrenMap = {};  // parent_id → Set of child_ids
-
-      for (const doc of allDocs) {
-        const id = doc._id;
-        const parents = Array.isArray(doc.is_a) ? doc.is_a.filter((p) => allAncestorIds.has(p)) : [];
-        const node = {
-          id,
-          name: doc.name || `${field.replace("__ancestors","")}:${id}`,
-          namespace: doc.namespace || null,
-          is_a: parents,
-          children: [],
-        };
-        if (enrichmentMap[id]) {
-          node.enriched = true;
-          node.fold_enrichment = enrichmentMap[id].fold_enrichment;
-          node.p_adjusted = enrichmentMap[id].p_adjusted;
-          node.foreground_count = enrichmentMap[id].foreground_count;
-          node.background_count = enrichmentMap[id].background_count;
-        }
-        dagNodes[id] = node;
-
-        for (const pid of parents) {
-          if (!childrenMap[pid]) childrenMap[pid] = new Set();
-          childrenMap[pid].add(id);
-        }
-      }
-
-      // Wire up children arrays
-      for (const [pid, kids] of Object.entries(childrenMap)) {
-        if (dagNodes[pid]) dagNodes[pid].children = [...kids].sort((a, b) => a - b);
-      }
-
-      // Identify roots: nodes with no parents within the DAG
-      const roots = Object.values(dagNodes)
-        .filter((n) => n.is_a.length === 0)
-        .map((n) => n.id)
-        .sort((a, b) => a - b);
-
-      // Return with DAG
-      return {
-        foreground_count: fgTotal,
-        background_count: bgTotal,
-        field,
-        correction,
-        p_threshold,
-        terms_tested: fgFacets.size,
-        significant_terms: results.length,
-        terms: results,
-        dag: {
-          node_count: Object.keys(dagNodes).length,
-          root_ids: roots,
-          nodes: dagNodes,
-        },
-      };
-    } else {
-      // No DAG requested — just resolve names
-      const termDocs = await d.collection(collName)
-        .find({ _id: { $in: [...enrichedIds] } }, { projection: { _id: 1, name: 1 } })
-        .toArray();
-      const nameMap = Object.fromEntries(termDocs.map((t) => [t._id, t.name]));
-      for (const r of results) {
-        r.term_name = nameMap[r.term_id] || null;
-      }
-    }
-  }
-
-  return {
-    foreground_count: fgTotal,
-    background_count: bgTotal,
-    field,
-    correction,
-    p_threshold,
-    terms_tested: fgFacets.size,
-    significant_terms: results.length,
-    terms: results,
-  };
-}
-
-// --- PubMed / literature helpers ---
-
-const NCBI_ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi";
-const NCBI_ESEARCH_URL  = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
-const NCBI_EFETCH_URL   = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
-
-/**
- * Fetch paper summaries from NCBI E-utilities for a list of PMIDs.
- * Returns a Map<pmid_string, {pmid, title, authors, journal, pubdate, doi, url}>.
- * Batches up to 200 per request.
- */
-async function fetchPubmedSummaries(pmids) {
-  const results = new Map();
-  if (!pmids.length) return results;
-  const BATCH = 200;
-  for (let i = 0; i < pmids.length; i += BATCH) {
-    const batch = pmids.slice(i, i + BATCH);
-    const url = `${NCBI_ESUMMARY_URL}?db=pubmed&id=${batch.join(",")}&retmode=json`;
-    const res = await fetch(url);
-    if (!res.ok) continue;
-    const data = await res.json();
-    if (!data.result) continue;
-    for (const uid of (data.result.uids || [])) {
-      const rec = data.result[uid];
-      if (!rec || rec.error) continue;
-      let doi = "";
-      if (rec.elocationid) {
-        const m = rec.elocationid.match(/doi:\s*(10\.\S+)/i);
-        if (m) doi = m[1];
-      }
-      if (!doi && rec.articleids) {
-        const d = rec.articleids.find(a => a.idtype === "doi");
-        if (d) doi = d.value;
-      }
-      results.set(String(uid), {
-        pmid: String(uid),
-        title: rec.title || "",
-        authors: (rec.authors || []).map(a => a.name),
-        journal: rec.source || rec.fulljournalname || "",
-        pubdate: rec.pubdate || "",
-        doi,
-        url: `https://pubmed.ncbi.nlm.nih.gov/${uid}/`,
-      });
-    }
-  }
-  return results;
-}
-
-/**
- * Resolve DOIs to PMIDs via NCBI esearch.  Returns Map<doi, pmid_string>.
- */
-async function resolveDoisToPmids(dois) {
-  const result = new Map();
-  if (!dois.length) return result;
-  // esearch one-at-a-time (DOIs can't reliably be batched in a single term query)
-  for (const doi of dois.slice(0, 50)) {  // cap at 50 to stay polite
-    try {
-      const url = `${NCBI_ESEARCH_URL}?db=pubmed&term=${encodeURIComponent(doi)}[doi]&retmode=json`;
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const data = await res.json();
-      const ids = data?.esearchresult?.idlist;
-      if (ids && ids.length === 1) {
-        result.set(doi, ids[0]);
-      }
-    } catch (_) { /* skip failed lookups */ }
-  }
-  return result;
-}
-
-/**
- * Fetch abstracts for a list of PMIDs.  Returns Map<pmid_string, abstract_text>.
- */
-async function fetchPubmedAbstracts(pmids) {
-  const results = new Map();
-  if (!pmids.length) return results;
-  const BATCH = 50;
-  for (let i = 0; i < pmids.length; i += BATCH) {
-    const batch = pmids.slice(i, i + BATCH);
-    try {
-      const url = `${NCBI_EFETCH_URL}?db=pubmed&id=${batch.join(",")}&rettype=xml&retmode=xml`;
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const xml = await res.text();
-      // Simple XML extraction of AbstractText elements per PMID
-      const articleRegex = /<PubmedArticle>[\s\S]*?<\/PubmedArticle>/g;
-      let match;
-      while ((match = articleRegex.exec(xml)) !== null) {
-        const article = match[0];
-        const pmidMatch = article.match(/<PMID[^>]*>(\d+)<\/PMID>/);
-        if (!pmidMatch) continue;
-        const pmid = pmidMatch[1];
-        // Collect all AbstractText segments
-        const absTexts = [];
-        const absRegex = /<AbstractText[^>]*>([\s\S]*?)<\/AbstractText>/g;
-        let absMatch;
-        while ((absMatch = absRegex.exec(article)) !== null) {
-          // Strip inline XML tags (e.g. <i>, <b>, <sup>)
-          absTexts.push(absMatch[1].replace(/<[^>]+>/g, ""));
-        }
-        if (absTexts.length) {
-          results.set(pmid, absTexts.join(" "));
-        }
-      }
-    } catch (_) { /* skip failed batches */ }
-  }
-  return results;
-}
+// --- PubMed cross-reference lookup ---
+//
+// This tool returns the PMID and DOI cross-references stored on each gene
+// document in the Solr genes index. It does NOT call NCBI E-utilities to
+// resolve those IDs into paper metadata (title, authors, journal, abstract).
+// Resolving PubMed IDs into bibliographic records is the job of a separate,
+// PubMed-focused MCP server — feed this tool's output into that one.
 
 async function tool_pubmed_for_genes(args) {
-  const { gene_ids, include_abstract = false } = args || {};
+  const { gene_ids } = args || {};
   if (!gene_ids || !gene_ids.length) {
     throw Object.assign(new Error("gene_ids is required (non-empty array)"), { code: -32602 });
   }
@@ -1359,8 +1215,7 @@ async function tool_pubmed_for_genes(args) {
     throw Object.assign(new Error("gene_ids limited to 500"), { code: -32602 });
   }
 
-  // Step 1: Fetch PUBMED__xrefs from Solr, filtering to genes with capabilities:pubs
-  // Use defType=lucene for reliable OR queries across multiple gene IDs
+  // Fetch PUBMED__xrefs from Solr, restricted to genes flagged with publications.
   const idList = gene_ids.join(" OR ");
   const solrResult = await solrFetch(SOLR_GENES_CORE, "query", {
     q: `id:(${idList})`,
@@ -1371,104 +1226,49 @@ async function tool_pubmed_for_genes(args) {
   });
   const docs = solrResult?.response?.docs || [];
 
-  // Step 2: Collect all PMIDs and DOIs across all genes
+  // Index Solr results so missing genes can be filled with empty entries below.
+  const docMap = Object.fromEntries(docs.map((d) => [d.id, d]));
   const allPmids = new Set();
   const allDois = new Set();
-  const geneRefs = {};  // geneId → { pmids: [], dois: [] }
 
-  for (const doc of docs) {
-    const refs = doc["PUBMED__xrefs"] || [];
+  const genes = {};
+  let genesWithRefs = 0;
+
+  for (const geneId of gene_ids) {
+    const doc = docMap[geneId];
+    if (!doc) {
+      genes[geneId] = { name: null, description: null, pmids: [], dois: [], count: 0 };
+      continue;
+    }
+    const refs = doc.PUBMED__xrefs || [];
     const pmids = [];
     const dois = [];
     for (const ref of refs) {
       if (ref.startsWith("DOI:")) {
-        dois.push(ref.slice(4));
-        allDois.add(ref.slice(4));
+        const doi = ref.slice(4);
+        dois.push(doi);
+        allDois.add(doi);
       } else if (/^\d+$/.test(ref)) {
         pmids.push(ref);
         allPmids.add(ref);
       }
     }
-    geneRefs[doc.id] = { name: doc.name, description: doc.description, pmids, dois };
-  }
-
-  // Step 3: Resolve DOI-only refs to PMIDs
-  const doiToPmid = await resolveDoisToPmids([...allDois].filter(doi => {
-    // only resolve DOIs that don't already have a PMID from the same gene
-    return true;  // resolve all; we'll merge later
-  }));
-  for (const [doi, pmid] of doiToPmid) {
-    allPmids.add(pmid);
-  }
-
-  // Step 4: Fetch paper metadata from NCBI
-  const summaries = await fetchPubmedSummaries([...allPmids]);
-
-  // Step 5: Optionally fetch abstracts
-  let abstracts = new Map();
-  if (include_abstract) {
-    abstracts = await fetchPubmedAbstracts([...allPmids]);
-  }
-
-  // Step 6: Build per-gene results
-  const genes = {};
-  let totalPapers = 0;
-  const allPaperIds = new Set();
-
-  for (const geneId of gene_ids) {
-    const ref = geneRefs[geneId];
-    if (!ref) {
-      genes[geneId] = { name: null, description: null, papers: [], count: 0 };
-      continue;
-    }
-
-    const papers = [];
-    const seenPmids = new Set();
-
-    // Add papers from direct PMIDs
-    for (const pmid of ref.pmids) {
-      if (seenPmids.has(pmid)) continue;
-      seenPmids.add(pmid);
-      const summary = summaries.get(pmid);
-      if (summary) {
-        const paper = { ...summary };
-        if (include_abstract && abstracts.has(pmid)) {
-          paper.abstract = abstracts.get(pmid);
-        }
-        papers.push(paper);
-        allPaperIds.add(pmid);
-      }
-    }
-
-    // Add papers from DOIs (resolved to PMIDs)
-    for (const doi of ref.dois) {
-      const pmid = doiToPmid.get(doi);
-      if (pmid && !seenPmids.has(pmid)) {
-        seenPmids.add(pmid);
-        const summary = summaries.get(pmid);
-        if (summary) {
-          const paper = { ...summary };
-          if (include_abstract && abstracts.has(pmid)) {
-            paper.abstract = abstracts.get(pmid);
-          }
-          papers.push(paper);
-          allPaperIds.add(pmid);
-        }
-      } else if (!pmid) {
-        // DOI couldn't be resolved — include as DOI-only reference
-        papers.push({ doi, url: `https://doi.org/${doi}`, title: null, unresolved: true });
-        allPaperIds.add(`doi:${doi}`);
-      }
-    }
-
-    genes[geneId] = { name: ref.name || null, description: ref.description || null, papers, count: papers.length };
-    totalPapers += papers.length;
+    const count = pmids.length + dois.length;
+    if (count > 0) genesWithRefs++;
+    genes[geneId] = {
+      name: doc.name || null,
+      description: doc.description || null,
+      pmids,
+      dois,
+      count,
+    };
   }
 
   return {
-    gene_count: Object.keys(geneRefs).length,
-    genes_with_papers: Object.values(genes).filter(g => g.count > 0).length,
-    total_unique_papers: allPaperIds.size,
+    gene_count: gene_ids.length,
+    genes_with_refs: genesWithRefs,
+    total_unique_pmids: allPmids.size,
+    total_unique_dois: allDois.size,
     genes,
   };
 }
@@ -1512,7 +1312,6 @@ async function tool_solr_graph(args) {
     from,
     to,
     seed_q,
-    maxDepth = 1,
     traversalFilter,
     returnRoot = true,
     fq,
@@ -1522,7 +1321,7 @@ async function tool_solr_graph(args) {
     sort,
   } = args || {};
 
-  const q = compileGraphQuery(from, to, seed_q, { maxDepth, traversalFilter, returnRoot });
+  const q = compileGraphQuery(from, to, seed_q, { traversalFilter, returnRoot });
   return solrFetch(SOLR_GENES_CORE, "select", { q, fq, fl, rows, start, sort });
 }
 
@@ -1679,6 +1478,28 @@ const TOOL_REGISTRY = {
         `Supports field faceting (flat) and pivot faceting (nested) via the 'facet' parameter.`,
         `Use rows:0 with facets to get counts without fetching documents.`,
         ``,
+        `Common uses:`,
+        `  - Single-gene-by-ID: q="id:<gene_id>" with an explicit fl to build a gene card.`,
+        `  - Faceted gene-family expansion: q="gene_tree:<id>" with facet.field=taxonomy__ancestors`,
+        `    returns hierarchical per-clade counts, surfacing expansion/contraction.`,
+        `  - Frequency arrays for client-side enrichment: facet a foreground fq and a background`,
+        `    fq on the same annotation field (e.g. GO__ancestors), then run the enrichment skill.`,
+        ``,
+        `Useful field reference:`,
+        `  expressed_in_gxa_attr_ss — array of GXA experiment accessions for the gene; joinable`,
+        `    to the MongoDB experiments and assays collections.`,
+        `  PUBMED__xrefs              — PubMed cross-references (use pubmed_for_genes to resolve).`,
+        `  homology__ortholog_one2one / homology__all_orthologs — see orthologs_paralogs prompt.`,
+        `  QTL_TO__ancestors          — QTL _ids (joinable to mongo qtls collection) for which`,
+        `                               this gene falls inside the QTL interval.`,
+        `  capabilities               — multi-valued tag listing what data is available on the`,
+        `                               gene. Use as a fast pre-filter before expensive ancestor`,
+        `                               or facet queries. Vocabulary: location, pubs, taxonomy,`,
+        `                               xrefs, expression, familyRoot, homology, domains, GO,`,
+        `                               PO, TO, pathways, Grassius, MAKER, QTL_TO, VEP. Example:`,
+        `                               fq:["capabilities:VEP","taxonomy__ancestors:4558"] →`,
+        `                               sorghum genes with VEP germplasm coverage.`,
+        ``,
         `Key pattern — neighborhood CNV in a single query:`,
         `  Combine a {!graph} traversal in 'q' with facet.pivot on gene_tree,system_name.`,
         `  This expands to all genes in the ±N flanking region of every ortholog in the`,
@@ -1696,19 +1517,30 @@ const TOOL_REGISTRY = {
     definition: {
       name: "solr_suggest",
       description: [
-        `Search the Solr suggestions core (${SOLR_SUGGESTIONS_CORE}) via /suggest endpoint.`,
-        `Pass 'term' for a simple search — the tool builds the standard Gramene boost query automatically:`,
+        `ALWAYS START HERE for any free-text concept (gene name, family, pathway, species, ontology`,
+        `term, trait). solr_suggest is the entry point for discovery — it translates a name into a`,
+        `concrete fq_field + fq_value that plugs straight into solr_search. Reserve mongo_find for`,
+        `fetching detail records once you already have a specific ID.`,
+        ``,
+        `Searches the suggestions core (${SOLR_SUGGESTIONS_CORE}) via /suggest. Pass 'term' for a`,
+        `fuzzy multi-field search (auto-builds the boosted query):`,
         `  {!boost b=relevance}name:<t>^5 ids:<t>^5 ids:<t>*^3 synonym:<t>^3 synonym:<t>*^2 text:<t>*^1`,
-        `Each result document includes fq_field and fq_value fields that can be used as filter`,
-        `queries against the genes core (e.g. fq_field=taxonomy__ancestors, fq_value=3702).`,
-        `Pass 'q' instead of 'term' to supply a raw Solr query string.`,
+        `Each result carries fq_field, fq_value, and num_genes (the size of the gene set that`,
+        `filter would yield). Pass 'q' instead of 'term' to supply a raw Solr query.`,
+        ``,
+        `Choosing between results:`,
+        `  - Single specific gene → highest-ranked result with fq_field=id.`,
+        `  - "All X-family genes" or other broad set → pick the candidate with the LARGEST num_genes,`,
+        `    not the highest-ranked. InterPro/domain matches (fq_field=domains__ancestors) often`,
+        `    give the cleanest, broadest scope. Example: 'lipoxygenase' → InterPro 'LipOase' with`,
+        `    fq_field=domains__ancestors covers ~1488 genes across 123 genomes.`,
         ``,
         `IMPORTANT — looking up pathways and species:`,
-        `  'term' searches across all categories (InterPro, GO, Taxonomy, Reactome, etc.) and ranks`,
-        `  by relevance. Pathway and species terms often do NOT appear in the top results because`,
-        `  InterPro/GO terms dominate. Use 'q' with an exact name match instead:`,
-        `    Pathway: q='name:"Jasmonic acid biosynthesis"'  → fq_field=pathways__ancestors`,
-        `    Species: q='name:"Sorghum bicolor"'             → fq_field=taxonomy__ancestors`,
+        `  'term' ranks across all categories and is dominated by InterPro/GO. Pathway and species`,
+        `  hits often miss the top. For exact lookups, use 'q' with a field-qualified match:`,
+        `    Pathway:    q='name:"Jasmonic acid biosynthesis"'  → fq_field=pathways__ancestors`,
+        `    Species:    q='name:"Sorghum bicolor"'             → fq_field=taxonomy__ancestors`,
+        `    TO term:    q='name:"plant height"' fq=['category:Trait Ontology']`,
         `  Then use the returned fq_field + fq_value directly as fq filters in solr_search.`,
         ``,
         `Canonical two-step pattern for "genes in pathway X in species Y":`,
@@ -1757,7 +1589,19 @@ const TOOL_REGISTRY = {
   mongo_find: {
     definition: {
       name: "mongo_find",
-      description: "Run a MongoDB find() query on a collection. Supports filter, projection, sort, limit, and skip.",
+      description: [
+        "Fetch detailed records from a MongoDB collection by a known identifier or a small structured filter.",
+        "Use this AFTER you already have a specific ID — typically resolved via solr_suggest first.",
+        "Do NOT use mongo_find to discover IDs from free text; that's solr_suggest's job.",
+        "",
+        "Common patterns:",
+        "  - QTLs for a Trait Ontology term: filter:{ terms: <TO_id> } on 'qtls'",
+        "  - Experiment metadata: filter:{ _id: { $in: [<exp_ids>] } } on 'experiments' or 'assays'",
+        "  - Genome assembly metadata (Compara membership): filter:{ in_compara: true } on 'maps'",
+        "  - Ontology term lookup by ID: prefer mongo_lookup_by_ids over an ad-hoc find().",
+        "",
+        "Filter parameter is `filter` (NOT `query`). Passing `query: {...}` is silently ignored.",
+      ].join("\n"),
       inputSchema: {
         type: "object",
         properties: {
@@ -1806,9 +1650,11 @@ const TOOL_REGISTRY = {
     definition: {
       name: "solr_graph",
       description: [
-        `Traverse a graph of gene relationships in the Solr genes core using the {!graph} query parser.`,
-        `Each document in the index has a node ID field ('to') and an adjacency field ('from') listing`,
-        `the IDs of related documents. The traversal starts from a seed query and follows edges up to maxDepth hops.`,
+        `Traverse a single hop of a gene-relationship graph in the Solr genes core via {!graph}.`,
+        `Each document carries a node-ID field ('to') and an adjacency-list field ('from')`,
+        `pointing to related documents. The traversal starts from a seed query and returns its`,
+        `direct neighbors. Multi-hop relationships are expressed by chaining two graph queries,`,
+        `not by raising the depth.`,
         ``,
         `Common field pairs:`,
         `  Genomic neighborhood (±10 flanking genes):`,
@@ -1816,6 +1662,13 @@ const TOOL_REGISTRY = {
         `    seed_q=gene_tree:<id>  or  seed_q=id:<gene_id>`,
         `  Both fields are pint (integer) — compara_idx_multi holds each gene's compara index,`,
         `  and compara_neighbors_10 holds the compara_idx_multi values of its ±10 flanking genes.`,
+        ``,
+        `Chained-graph pattern for PAV/CNV across a species panel:`,
+        `  1. Seed q: id:<gene_id> traversing homology__all_orthologs → ortholog gene IDs`,
+        `  2. Re-seed with those IDs traversing compara_neighbors_10 → compara_idx_multi,`,
+        `     fq:["taxonomy__ancestors:<plain NCBI id>"], facet on system_name`,
+        `  Per-genome facet counts give copy number; missing genomes (cross-checked against`,
+        `  mongo maps where in_compara=true) are PAV.`,
       ].join("\n"),
       inputSchema: {
         type: "object",
@@ -1831,11 +1684,6 @@ const TOOL_REGISTRY = {
           seed_q: {
             type: "string",
             description: "Seed query identifying the root node(s). E.g. 'gene_tree:EPlGT00140000004862' or 'id:AT1G01010'.",
-          },
-          maxDepth: {
-            type: "integer",
-            minimum: -1,
-            description: "Maximum traversal depth. 1 = direct neighbors only. -1 = unlimited. Default: 1.",
           },
           traversalFilter: {
             type: "string",
@@ -1872,10 +1720,16 @@ const TOOL_REGISTRY = {
         `Returns genes where gene.start ≤ end AND gene.end ≥ start on the given region (chromosome).`,
         `Useful as the first step in QTL candidate gene analysis.`,
         ``,
+        `Species filter: pass the plain NCBI taxon ID via 'taxon_id' — it is applied internally`,
+        `as taxonomy__ancestors:<id>, matching all subspecies and assemblies under that taxon.`,
+        `Do NOT pass the NCBI×1000+suffix encoding (e.g. 4558001); use the plain ID (e.g. 4558).`,
+        ``,
         `Key fields to request via 'fl':`,
-        `  id, name, biotype, start, end, strand, system_name, taxon_id`,
-        `  gene_tree, compara_idx_multi  — for graph traversal to find conserved neighbors`,
-        `  TO__ancestors, GO__ancestors  — for ontology-based scoring`,
+        `  id, name, biotype, start, end, strand, system_name`,
+        `  gene_tree, compara_idx_multi          — for graph traversal to find conserved neighbors`,
+        `  TO__ancestors, GO__ancestors          — for ontology-based scoring`,
+        `  expressed_in_gxa_attr_ss              — joinable to mongo experiments / assays`,
+        `  closest_rep_name, model_rep_name      — display name fallbacks`,
       ].join("\n"),
       inputSchema: {
         type: "object",
@@ -1883,7 +1737,7 @@ const TOOL_REGISTRY = {
           region:   { type: "string",  description: "Chromosome / scaffold name (e.g. '6', 'Chr01')." },
           start:    { type: "integer", description: "Interval start coordinate (bp, inclusive)." },
           end:      { type: "integer", description: "Interval end coordinate (bp, inclusive)." },
-          taxon_id: { type: "integer", description: "Filter by NCBI taxon ID (e.g. 4558 for Sorghum bicolor)." },
+          taxon_id: { type: "integer", description: "Plain NCBI taxon ID (e.g. 4558 for Sorghum bicolor). Applied as taxonomy__ancestors filter; matches all subspecies/assemblies." },
           map:      { type: "string",  description: "Assembly accession to filter by (e.g. 'GCA_000003195.3')." },
           fl:       { type: "string",  description: "Comma-separated Solr field list to return." },
           rows:     { type: "integer", minimum: 0, maximum: 1000, description: "Max genes to return (default 200)." },
@@ -1898,21 +1752,47 @@ const TOOL_REGISTRY = {
     definition: {
       name: "expression_for_genes",
       description: [
-        `Retrieve expression data for a list of gene IDs from the MongoDB expression collection,`,
-        `joined with assay (tissue/condition) and experiment metadata.`,
+        `Retrieve baseline and differential expression for a list of gene IDs in a single`,
+        `Solr round-trip. Reads the encoded expression fields directly from the genes core`,
+        `(*__expr, *_l2fc_attr_f, *_pval_attr_f) and joins with cached experiment + assay`,
+        `metadata; no MongoDB query is needed per call.`,
         ``,
-        `Each gene in the result has:`,
-        `  baseline[]    — {experiment, experiment_name, group, value, tissue, condition}`,
-        `                  value is TPM/FPKM from Baseline experiments`,
-        `  differential[] — {experiment, experiment_name, group, l2fc, p_value, tissue, condition}`,
-        `                   from Differential experiments`,
+        `Per-gene response shape:`,
+        `  experiments_with_data — string[] of GXA experiment accessions covering this gene`,
+        `  baseline[]            — { experiment, experiment_name, group, value, tissue, factors }`,
+        `                          value is TPM/FPKM from Baseline experiments`,
+        `  differential[]        — { experiment, experiment_name,`,
+        `                            control_group, treatment_group,`,
+        `                            control_tissue, treatment_tissue,`,
+        `                            control_factors, treatment_factors,`,
+        `                            contrast, shared_factors,`,
+        `                            l2fc, p_value }`,
+        `                          contrast[]      — factor types whose value differs between`,
+        `                                             control and treatment ({type, control, treatment})`,
+        `                          shared_factors[] — factor types with identical values in both assays`,
         ``,
-        `Use po_terms (integer PO term IDs) to restrict results to specific tissues.`,
+        `Filters:`,
+        `  experiment_type = "Baseline" | "Differential" — narrow the field set returned.`,
+        `  taxon_id (plain NCBI int) — restrict to experiments performed in that species.`,
+        `  po_terms — array of PO int IDs. A baseline row matches when its assay carries any`,
+        `             of the PO ints. A differential row matches when EITHER the control or`,
+        `             treatment assay does.`,
+        ``,
+        `PO ancestor fallback: PO ancestors are unioned into the filter up-front. If no row`,
+        `matched a literally-requested PO id but rows did match an ancestor, the response`,
+        `flags po_filter.expanded=true. Shape:`,
+        `  po_filter: { requested:[...], expanded:bool, ancestors_used:[...] }`,
+        ``,
         `Common PO int IDs: 9001=grain/fruit, 9089=endosperm, 25034=leaf, 20127=stem,`,
         `                   7010=germination stage, 7016=flowering stage.`,
-        `Use experiment_type='Baseline' or 'Differential' to limit scope.`,
-        `Include orthologs (from solr_graph results) in gene_ids to compare expression`,
-        `across species for conserved candidate prioritization.`,
+        ``,
+        `Cross-species comparison: include ortholog gene IDs from any species in gene_ids;`,
+        `they are all returned in the same response, suitable for conserved-candidate`,
+        `prioritization across orthologs.`,
+        ``,
+        `Discovery hint: each gene also returns experiments_with_data (sourced from the Solr`,
+        `field expressed_in_gxa_attr_ss). Useful for "which studies cover this gene at all?"`,
+        `without inspecting every value.`,
       ].join("\n"),
       inputSchema: {
         type: "object",
@@ -1986,112 +1866,29 @@ const TOOL_REGISTRY = {
     handler: tool_vep_for_gene,
   },
 
-  enrichment_analysis: {
-    definition: {
-      name: "enrichment_analysis",
-      description: [
-        `Gene set enrichment analysis using hypergeometric test on ontology/pathway`,
-        `annotation fields.`,
-        ``,
-        `Compares the frequency of annotation terms between a foreground gene set`,
-        `(e.g. genes in a QTL interval, pathway, or user-defined list) and a background`,
-        `set (typically all annotated genes in the same genome). Identifies terms that`,
-        `are statistically overrepresented in the foreground.`,
-        ``,
-        `Both foreground and background are defined by Solr filter queries (fq arrays).`,
-        `The tool automatically:`,
-        `  1. Facet-counts the annotation field in both sets`,
-        `  2. Computes hypergeometric p-values for each term`,
-        `  3. Applies Benjamini–Hochberg FDR correction (or Bonferroni)`,
-        `  4. Looks up term names from MongoDB`,
-        `  5. Returns significant terms sorted by adjusted p-value`,
-        ``,
-        `Supported annotation fields:`,
-        `  - GO__ancestors     — Gene Ontology (biological process, molecular function, cellular component)`,
-        `  - PO__ancestors     — Plant Ontology (anatomy/development)`,
-        `  - TO__ancestors     — Trait Ontology`,
-        `  - domains__ancestors — Protein domains (InterPro)`,
-        `  - pathways__ancestors — Plant Reactome pathways`,
-        ``,
-        `Example — GO enrichment for jasmonic acid pathway genes in sorghum:`,
-        `  foreground_fq: ["pathways__ancestors:1119332", "taxonomy__ancestors:4558"]`,
-        `  background_fq: ["taxonomy__ancestors:4558"]`,
-        `  field: "GO__ancestors"`,
-      ].join("\n"),
-      inputSchema: {
-        type: "object",
-        properties: {
-          foreground_fq: {
-            type: "array",
-            items: { type: "string" },
-            description: "Solr fq clauses defining the foreground gene set. E.g. ['pathways__ancestors:1119332', 'taxonomy__ancestors:4558'].",
-          },
-          background_fq: {
-            type: "array",
-            items: { type: "string" },
-            description: "Solr fq clauses defining the background gene set. Typically just the genome filter, e.g. ['taxonomy__ancestors:4558']. Should be a superset of the foreground.",
-          },
-          field: {
-            type: "string",
-            enum: ["GO__ancestors", "PO__ancestors", "TO__ancestors", "domains__ancestors", "pathways__ancestors"],
-            description: "Annotation field to test for enrichment. Default: GO__ancestors.",
-          },
-          p_threshold: {
-            type: "number",
-            description: "Adjusted p-value threshold. Terms with p_adjusted > this are excluded. Default: 0.05.",
-          },
-          correction: {
-            type: "string",
-            enum: ["bh", "bonferroni"],
-            description: "Multiple testing correction: 'bh' = Benjamini–Hochberg FDR (default, recommended), 'bonferroni' = stricter family-wise error rate.",
-          },
-          min_foreground_count: {
-            type: "integer",
-            description: "Minimum number of foreground genes annotated with a term to include it. Default: 2.",
-          },
-          max_terms: {
-            type: "integer",
-            description: "Maximum enriched terms to return (sorted by p_adjusted). Default: 200.",
-          },
-          include_ancestors: {
-            type: "boolean",
-            description: [
-              "When true, fetches all ancestor terms of the enriched terms from MongoDB",
-              "and returns a 'dag' object containing the ontology subgraph connecting the",
-              "enriched terms to their root(s). Each DAG node has: id, name, namespace,",
-              "is_a (parent IDs), children (child IDs), and enrichment stats if significant.",
-              "Use this to build an interactive ontology browser showing the enriched terms",
-              "in their full hierarchical context. Default: false.",
-            ].join(" "),
-          },
-        },
-        required: ["foreground_fq", "background_fq"],
-      },
-    },
-    handler: tool_enrichment_analysis,
-  },
-
   pubmed_for_genes: {
     definition: {
       name: "pubmed_for_genes",
       description: [
-        "Retrieve published literature (PubMed papers) associated with a list of genes.",
-        "Fetches PUBMED__xrefs from the Solr genes index and resolves them to full paper",
-        "metadata (title, authors, journal, date, DOI) via NCBI E-utilities.",
-        "Optionally includes paper abstracts. Handles both PMID and DOI-only references.",
-        "Use this to find what is known about candidate genes from the literature.",
-      ].join(" "),
+        "Return PubMed and DOI cross-references for a list of genes from the Solr genes index.",
+        "Per gene the response carries `pmids` (numeric PubMed IDs as strings) and `dois`",
+        "(DOI strings, stripped of the 'DOI:' prefix); only genes flagged with",
+        "`capabilities:pubs` carry references.",
+        "",
+        "This tool does NOT fetch paper metadata (title, authors, journal, abstract) — that",
+        "is the job of a separate, PubMed-focused MCP server. Pipe the `pmids`/`dois`",
+        "arrays from this tool into that server when bibliographic detail is needed.",
+        "",
+        "Use to find which candidate genes have literature, and to assemble PMID/DOI lists",
+        "to expand to orthologs in well-studied model species.",
+      ].join("\n"),
       inputSchema: {
         type: "object",
         properties: {
           gene_ids: {
             type: "array",
             items: { type: "string" },
-            description: "Gene stable IDs to look up papers for (max 500). Include orthologs from other species to find literature on well-studied homologs.",
-          },
-          include_abstract: {
-            type: "boolean",
-            description: "When true, fetches paper abstracts from PubMed XML. Slower but provides full context for each paper. Default: false.",
+            description: "Gene stable IDs to look up references for (max 500). Include orthologs from other species to widen literature coverage.",
           },
         },
         required: ["gene_ids"],
@@ -2156,27 +1953,40 @@ context small.
 
 ## Query Routing
 
+Always start with \`solr_suggest\` for any free-text concept (gene name,
+family, pathway, species, ontology term, trait). Reserve \`mongo_find\` for
+fetching detail records once you already have a specific ID.
+
 | User question shape | Start with | Load workflow |
 |---------------------|------------|---------------|
+| Single gene by ID ("tell me about SORBI_…") | \`solr_search\` (q="id:…") | — (build a gene card) |
 | Gene name / function lookup | \`solr_suggest\` (term=) | \`gene_lookup\` |
 | "Genes in pathway X for species Y" | \`solr_suggest\` (q= for pathway and species) | \`pathway_genes\` |
+| Trait → QTL discovery ("QTLs for plant height") | \`solr_suggest\` (q='name:"…"' fq='category:Trait Ontology') | \`qtl_discovery\` |
 | QTL interval / trait candidate analysis | \`genes_in_region\` | \`qtl_candidate_ranking\` |
 | "What's known about gene X?" | \`solr_search\` for metadata | \`literature_search\` |
 | Cross-species comparison for a gene | \`solr_search\` for \`gene_tree\` | \`cross_species_comparison\`, \`orthologs_paralogs\` |
-| Gene family across species | \`solr_suggest\` (term=family name) | \`gene_family\` |
+| Gene family across species | \`solr_suggest\` (pick largest num_genes) | \`gene_family\` |
+| Family expansion / contraction across clades | \`solr_search\` (gene_tree facet on taxonomy__ancestors) | \`gene_family_expansion\` |
 | Germplasm / LOF alleles | \`vep_for_gene\` | \`germplasm_lof\` |
-| Enrichment / overrepresentation | \`enrichment_analysis\` | \`enrichment\` |
-| Presence/Absence or CNV | \`solr_search\` with facets | \`pav_cnv\` |
+| Presence/Absence or CNV | \`solr_search\` with facets / chained \`solr_graph\` | \`pav_cnv\` |
 | Ambiguous or exploratory | \`kb_relations\` first | — |
+
+Enrichment / overrepresentation analysis is **not** an MCP tool. Use
+\`solr_search\` with facet.field on the relevant ontology field for both
+foreground and background, then run the client-side enrichment skill on the
+two frequency arrays.
 
 ## Critical Conventions
 
-**Taxon ID formats — two encodings exist:**
-- \`taxonomy__ancestors\` uses **plain NCBI taxon IDs** (e.g. \`4558\` sorghum,
+**Taxon ID — use the plain NCBI ID.**
+- Filter with \`taxonomy__ancestors:<plain NCBI id>\` (e.g. \`4558\` sorghum,
   \`3702\` Arabidopsis, \`39947\` rice). Matches all subspecies/assemblies.
-- \`taxon_id\` (the Solr field and \`genes_in_region\` parameter) uses
-  **NCBI ID × 1000 + assembly suffix** (e.g. \`4558001\` for sorghum BTx623).
-- **When in doubt, filter with \`taxonomy__ancestors\` using the plain NCBI ID.**
+- The \`genes_in_region\` \`taxon_id\` parameter takes the plain NCBI ID and
+  applies it as \`taxonomy__ancestors\` internally.
+- The Solr \`taxon_id\` *field* on individual gene documents uses
+  NCBI×1000+suffix (e.g. \`4558001\` for sorghum BTx623). Avoid filtering on
+  it directly unless you specifically need a single assembly.
 
 **Gene ID format — never abbreviate.** Always write the full stable identifier
 (e.g. \`SORBI_3006G095600\`, never \`G095600\`). This applies everywhere.
@@ -2188,8 +1998,11 @@ when \`name\` equals the stable ID: \`closest_rep_name\` → \`model_rep_name\`
 → \`description\` → stable ID alone. Never show a bare gene ID without at
 least one of these.
 
-**\`solr_graph\` \`maxDepth\`.** Always pass \`maxDepth=1\`. Without it the
-graph traversal recurses deeply and the query can run for minutes.
+**Homology field choice.** Default to \`homology__all_orthologs\` for
+cross-species inference. Use \`homology__ortholog_one2one\` only for tight
+pairs (e.g. sorghum ↔ rice); maize is a paleopolyploid (1:many is common
+against sorghum/rice/wheat) and monocot ↔ Arabidopsis comparisons are too
+distant for stable 1:1 mappings.
 
 **\`mongo_find\` parameter name.** The filter parameter is \`filter\`, not
 \`query\`. Passing \`query: { ... }\` is silently ignored and returns
@@ -2234,6 +2047,11 @@ filter. Never fabricate data.
 - Plant species only — animal/microbial genomes are out of scope.
 - Expression data covers ~7 species (see table). Empty = coverage gap, not a bug.
 - VEP / germplasm coverage is richest for sorghum.
+- Variant-level queries (sub-genic context, promoter/UTR variants, specific
+  alleles) are not supported by the API yet; \`vep_for_gene\` returns
+  predicted-LOF accession lists only.
+- Enrichment / overrepresentation analysis is delegated to a client-side
+  skill that runs on facet-count arrays from \`solr_search\`.
 - All access is read-only. Do not invent gene names, pathway annotations,
   expression values, publications, or germplasm accessions.`,
   },
@@ -2369,7 +2187,7 @@ InterPro/GO and may not surface Reactome entries.
         { name: "region", description: "Chromosome (e.g. '6' for sorghum, 'Chr01' for other species).", required: false },
         { name: "start", description: "Interval start (bp, inclusive).", required: false },
         { name: "end", description: "Interval end (bp, inclusive).", required: false },
-        { name: "taxon_id", description: "Solr taxon_id for the species (NCBI ID × 1000 + suffix, e.g. 4558001 for sorghum BTx623).", required: true },
+        { name: "taxon_id", description: "Plain NCBI taxon ID for the species (e.g. 4558 for sorghum). Applied as taxonomy__ancestors filter.", required: true },
       ],
     },
     template: `# Workflow: QTL candidate gene ranking
@@ -2378,10 +2196,17 @@ InterPro/GO and may not surface Reactome entries.
 **Region:** {{region}}
 **Start:** {{start}}
 **End:** {{end}}
-**Taxon ID (Solr format):** {{taxon_id}}
+**NCBI taxon ID:** {{taxon_id}}
+
+## Step 0 — Resolve the trait if only a name is known
+If the user gave a trait name rather than a TO ID:
+\`\`\`
+solr_suggest(q: 'name:"<trait>"', fq: ['category:Trait Ontology'])
+  → returns fq_value (TO integer ID) and the canonical TO:NNNNNNN string
+\`\`\`
 
 ## Step 1 — Find the QTL interval
-If a trait TO term was supplied:
+If a trait TO term was supplied (or just resolved):
 \`\`\`
 mongo_find(collection: "qtls", filter: { "terms": "{{trait_to_term}}" })
   → get location.region, location.start, location.end
@@ -2421,8 +2246,7 @@ solr_graph(
   from: "compara_neighbors_10",
   to:   "compara_idx_multi",
   seed_q: "gene_tree:<id>",
-  fl: "id,system_name,gene_tree,name,closest_rep_name",
-  maxDepth: 1
+  fl: "id,system_name,gene_tree,name,closest_rep_name"
 )
   → collect ortholog gene IDs across species
 \`\`\`
@@ -2444,12 +2268,11 @@ expression_for_genes(
 
 ## Step 6 — Literature evidence
 \`\`\`
-pubmed_for_genes(
-  gene_ids: <regional + orthologs>,
-  include_abstract: true
-)
-  → flag genes with published functional characterization
+pubmed_for_genes(gene_ids: <regional + orthologs>)
+  → returns per-gene pmids[] and dois[]; flag genes with non-empty references
 \`\`\`
+For paper titles / authors / abstracts, hand the resulting PMIDs to a
+PubMed-focused MCP server.
 
 ## Step 7 — Synthesize ranking
 
@@ -2469,15 +2292,16 @@ ranking. Report filter counts at every step (e.g. "120 genes in the interval
   literature_search: {
     definition: {
       name: "literature_search",
-      title: "Literature search for a gene (with ortholog fallback)",
+      title: "Literature cross-references for a gene (with ortholog fallback)",
       description:
-        "Fetch PubMed papers for a gene; if the gene has no direct publications, " +
-        "expand to rice and Arabidopsis orthologs.",
+        "Collect PubMed and DOI cross-references for a gene; if the gene has none, expand " +
+        "to rice and Arabidopsis orthologs. Hand the resulting PMID/DOI lists to a " +
+        "PubMed-focused MCP for bibliographic detail.",
       arguments: [
         { name: "gene_id", description: "Gene stable ID (e.g. 'SORBI_3006G095600').", required: true },
       ],
     },
-    template: `# Workflow: Literature search for a candidate gene
+    template: `# Workflow: Literature cross-references for a candidate gene
 
 **Gene:** {{gene_id}}
 
@@ -2488,27 +2312,29 @@ from model species (rice, Arabidopsis) before concluding "no literature."
 \`\`\`
 solr_search(
   q: "id:{{gene_id}}",
-  fl: "id,name,gene_tree,homology__ortholog_one2one,closest_rep_id,model_rep_id"
+  fl: "id,name,gene_tree,homology__all_orthologs,closest_rep_id,model_rep_id"
 )
 \`\`\`
 Extract ortholog IDs, especially from rice (Os…) and Arabidopsis (AT…).
 
-## Step 2 — Fetch papers for the gene + orthologs
+## Step 2 — Fetch references for the gene + orthologs
 \`\`\`
-pubmed_for_genes(
-  gene_ids: ["{{gene_id}}", <ortholog_ids...>],
-  include_abstract: true
-)
+pubmed_for_genes(gene_ids: ["{{gene_id}}", <ortholog_ids...>])
 \`\`\`
 
-Response shape (per paper): \`pmid\`, \`title\`, \`authors[]\`, \`journal\`,
-\`pubdate\`, \`doi\`, \`url\`, optional \`abstract\`, optional
-\`unresolved: true\` for DOI-only refs.
+Response shape (per gene): \`name\`, \`description\`, \`pmids: string[]\`,
+\`dois: string[]\`, \`count\`. Top level also reports
+\`gene_count\`, \`genes_with_refs\`, \`total_unique_pmids\`,
+\`total_unique_dois\`.
+
+## Step 3 — Resolve to bibliographic detail
+This MCP returns IDs only. For titles, authors, journals, and abstracts,
+pass the union of \`pmids\` and \`dois\` into a PubMed-focused MCP server.
 
 ## Fallbacks
-- Absence of papers for \`{{gene_id}}\` does **not** mean the gene is
-  unstudied — it means there is no cross-reference from Gramene's index to
-  PubMed. Always consult orthologs in rice and Arabidopsis before concluding.
+- Absence of references for \`{{gene_id}}\` does **not** mean the gene is
+  unstudied — only that Gramene's index has no PubMed/DOI cross-reference for
+  it. Always consult rice and Arabidopsis orthologs before concluding.
 - Only genes with \`capabilities:pubs\` have literature cross-references;
   the tool filters for this automatically.`,
   },
@@ -2528,24 +2354,44 @@ Response shape (per paper): \`pmid\`, \`title\`, \`authors[]\`, \`journal\`,
 
 **Query gene:** {{gene_id}}
 
-## Step 1 — Get the gene tree and 1:1 orthologs
+## Choosing the homology field
+
+\`homology__ortholog_one2one\` is reliable only between species that lack a
+recent whole-genome duplication relative to each other. Several common cases
+break that assumption:
+
+- **Maize is a paleopolyploid.** Sorghum/rice/wheat ↔ maize comparisons are
+  frequently 1:many, not 1:1.
+- **Monocot ↔ Arabidopsis** is too distant for stable 1:1 mappings.
+
+For comparisons that involve maize, or that span monocots and dicots, prefer
+\`homology__all_orthologs\` (or \`gene_tree:<id>\`) so 1:many and many:many
+orthologs are not silently dropped. Reserve \`homology__ortholog_one2one\` for
+tight pairs (e.g. sorghum ↔ rice).
+
+## Step 1 — Get the gene tree and full ortholog set
 \`\`\`
 solr_search(
   q: "id:{{gene_id}}",
-  fl: "id,gene_tree,homology__ortholog_one2one,compara_idx_multi"
+  fl: "id,gene_tree,homology__all_orthologs,homology__ortholog_one2one,compara_idx_multi"
 )
 \`\`\`
-\`homology__ortholog_one2one\` = direct 1:1 orthologs across species (highest
-confidence).
 
-## Step 2 — Retrieve the full ortholog set (optional, includes all types)
+## Step 2 — Retrieve all family members (recommended for distant comparisons)
+\`\`\`
+solr_search(
+  q: "gene_tree:<tree_id>",
+  fl: "id,name,system_name,taxon_id,closest_rep_name",
+  rows: 500
+)
+\`\`\`
+Or the graph form for ±10-gene context per ortholog:
 \`\`\`
 solr_graph(
   from: "compara_neighbors_10",
   to:   "compara_idx_multi",
   seed_q: "gene_tree:<tree_id>",
-  fl: "id,name,system_name,closest_rep_name",
-  maxDepth: 1
+  fl: "id,name,system_name,closest_rep_name"
 )
 \`\`\`
 
@@ -2623,9 +2469,13 @@ solr_search(q: "homology__within_species_paralog:{{gene_id}}",
 \`\`\`
 
 ## Recommendation
-- Use \`homology__ortholog_one2one\` when you need high-confidence functional
-  equivalents for cross-species inference.
-- Use \`gene_tree:<id>\` when you want the full family including all paralogs.
+- Default to \`homology__all_orthologs\` for cross-species inference. It
+  captures 1:1, 1:many, and many:many in one field — important whenever maize
+  (a paleopolyploid) is involved or whenever the comparison crosses the
+  monocot/dicot boundary, since 1:1 mappings are rare in those cases.
+- Use \`homology__ortholog_one2one\` only for tight pairs (e.g. sorghum ↔
+  rice) where 1:1 is the dominant relationship and you want maximal confidence.
+- Use \`gene_tree:<id>\` when you want the full family including paralogs.
 
 ## MongoDB homology structure (from \`mongo_find\` on \`genes\`)
 \`\`\`json
@@ -2738,84 +2588,14 @@ expression_for_genes(gene_ids: [...], po_terms: [<tissue PO IDs>])
   dense. VEP coverage is richest for sorghum.`,
   },
 
-  enrichment: {
-    definition: {
-      name: "enrichment",
-      title: "Gene set enrichment analysis (GO / PO / pathway / domain)",
-      description:
-        "Statistical enrichment of ontology terms, pathways, or domains for a foreground " +
-        "gene set vs. a genome-wide background, with optional DAG rendering of the " +
-        "enriched subgraph.",
-      arguments: [
-        { name: "foreground_fq", description: "Solr fq clauses defining the foreground set, as a JSON array of strings.", required: true },
-        { name: "background_fq", description: "Solr fq clauses for the background (same genome).", required: true },
-        { name: "field", description: "Annotation field: GO__ancestors (default), PO__ancestors, TO__ancestors, domains__ancestors, or pathways__ancestors.", required: false },
-        { name: "include_ancestors", description: "Set true to return the DAG of enriched terms with their ontology ancestors.", required: false },
-      ],
-    },
-    template: `# Workflow: Gene set enrichment analysis
-
-**Foreground fq:** {{foreground_fq}}
-**Background fq:** {{background_fq}}
-**Field:** {{field}}
-**include_ancestors:** {{include_ancestors}}
-
-## Call
-\`\`\`
-enrichment_analysis(
-  foreground_fq: {{foreground_fq}},
-  background_fq: {{background_fq}},
-  field: "{{field}}",
-  p_threshold: 0.05,
-  correction: "bh",
-  min_foreground_count: 2,
-  include_ancestors: {{include_ancestors}}
-)
-\`\`\`
-
-The tool: (1) facet-counts the chosen annotation field in foreground and
-background, (2) computes hypergeometric p-values per term, (3) applies BH
-(default) or Bonferroni correction, (4) resolves term IDs to names from
-MongoDB, and (5) returns enriched terms sorted by adjusted p-value.
-
-## Output per significant term
-- \`term_id\`, \`term_name\` — ontology ID and resolved name
-- \`foreground_count\` / \`foreground_fraction\`
-- \`background_count\` / \`background_fraction\`
-- \`fold_enrichment\` = foreground fraction / background fraction
-- \`p\` / \`p_adjusted\`
-
-## Interpretation
-- \`fold_enrichment > 2\` with \`p_adjusted < 0.05\` → strong signal.
-- Check both \`foreground_count\` and \`background_count\` — a high fold
-  enrichment driven by a single gene is rarely biologically meaningful.
-- Run on multiple annotation fields (GO, pathways, domains) for a complete picture.
-- The background should be all annotated genes in the **same genome** to avoid
-  species composition bias.
-
-## With \`include_ancestors=true\`
-The response includes a \`dag\` object with \`node_count\`, \`root_ids\`, and
-\`nodes\` (keyed by integer ID). Each node has \`id\`, \`name\`, \`namespace\`,
-\`is_a\` (parent IDs), \`children\` (within the enriched subgraph), and — for
-enriched nodes — \`enriched: true\`, \`fold_enrichment\`, \`p_adjusted\`,
-\`foreground_count\`, \`background_count\`. Walk \`children\` recursively from
-\`root_ids\` to render a collapsible DAG with enriched leaves highlighted in
-their hierarchical context.
-
-## When to use enrichment vs. facet counting
-- \`enrichment_analysis\` — when you need statistical significance comparing
-  foreground vs. background.
-- \`solr_search\` with \`facet.field\` — when you just want to count terms
-  (no hypothesis test).`,
-  },
-
   pav_cnv: {
     definition: {
       name: "pav_cnv",
       title: "Presence/absence variation (PAV) and copy-number variation (CNV)",
       description:
         "Detect gene presence/absence and copy-number variation across an assembly panel, " +
-        "either by simple faceting or via a single graph-traversal pivot query.",
+        "either by faceting on system_name or via a chained graph traversal that includes " +
+        "neighborhood context.",
       arguments: [
         { name: "gene_id", description: "Query gene stable ID (or rice ortholog ID) for seeding.", required: true },
         { name: "taxon_id", description: "Plain NCBI taxon ID of the target species (e.g. 4558).", required: true },
@@ -2826,64 +2606,252 @@ their hierarchical context.
 **Query gene:** {{gene_id}}
 **Species (NCBI taxon):** {{taxon_id}}
 
-Two approaches — start with 5a for simple PAV/CNV questions, use 5b when you
-need neighborhood context or want to minimize round-trips.
+Two approaches — start with the basic faceting variant for direct PAV/CNV
+questions; use the chained-graph variant when you also want ±10-gene
+neighborhood context, or to seed from any homolog rather than the gene tree.
 
-**Important caveat:** not all genomes were included in the Compara gene tree
-analysis. Always check the \`maps\` MongoDB collection (\`in_compara: true\`)
-to get the list of genomes that should have homology data — use that as the
-denominator when interpreting absence.
+**Caveat:** not all genomes participated in the Compara gene tree analysis.
+Always check the \`maps\` MongoDB collection (\`in_compara: true\`) to get
+the genomes that *should* have homology data — that is the denominator when
+interpreting absence.
 
-## 5a — Basic faceting
+**Faceting field:** prefer \`system_name\` (already human-readable).
+Faceting on \`taxon_id\` works but yields NCBI integer IDs that need a second
+lookup against the mongo \`taxonomy\` collection to render species names.
+
+## Variant A — Basic faceting on system_name
 
 \`\`\`
-# Step 1 — get the gene tree
+# 1. Get the gene tree
 solr_search(q: "id:{{gene_id}}",
-            fl: "id,gene_tree,homology__ortholog_one2one")
+            fl: "id,gene_tree,homology__all_orthologs")
   → extract gene_tree id
 
-# Step 2 — find which genomes participated in Compara
+# 2. Genomes that participated in Compara (denominator)
 mongo_find(collection: "maps", filter: { in_compara: true },
-           projection: { _id: 1, name: 1 })
+           projection: { _id: 1, name: 1, system_name: 1 })
 
-# Step 3 — facet over all orthologs
+# 3. Facet members of the family by genome
 solr_search(q: "gene_tree:<tree_id>", rows: 0,
             facet: { field: "system_name", mincount: 0, limit: -1 })
-
-# Step 4 — interpret
-# count=0       → gene absent in that genome (PAV)
-# count=1       → single copy (expected)
-# count>1       → duplication / CNV
-# in_compara=true but not in facet results → absent (PAV)
 \`\`\`
 
-## 5b — Neighborhood CNV via graph + pivot (single round-trip)
+Interpret per genome:
+- count=0 (or absent from facet, with in_compara=true) → PAV (gene absent)
+- count=1 → single copy
+- count>1 → duplication / CNV
+
+## Variant B — Chained graph traversal (neighborhood + CNV)
+
+Two graph queries — the first expands to the family, the second to the
+±10-gene neighborhood of every family member, filtered to one species.
 
 \`\`\`
-# Step 1 — get the gene tree
-solr_search(q: "id:{{gene_id}}",
-            fl: "id,gene_tree,system_name,homology__ortholog_one2one")
+# 1. Family expansion: orthologs of the seed gene
+solr_graph(
+  from: "homology__all_orthologs",
+  to:   "id",
+  seed_q: "id:{{gene_id}}",
+  fl: "id,gene_tree,system_name"
+)
+  → collect all family member ids
 
-# Step 2 — one query for neighborhood CNV
+# 2. Neighborhood traversal in the target species, faceted by system_name
+solr_graph(
+  from:   "compara_neighbors_10",
+  to:     "compara_idx_multi",
+  seed_q: "id:(<family_member_ids joined with OR>)",
+  fq:     ["taxonomy__ancestors:{{taxon_id}}"],
+  fl:     "id,name,system_name,gene_tree"
+)
+  → counts per system_name reveal copy number per genome
+\`\`\`
+
+(Equivalent single-query form is also possible via solr_search with a {!graph}
+prefix and facet.pivot on gene_tree,system_name; see solr_search description.)
+
+## Interpretation
+- count=1 across all in_compara genomes → single-copy conserved gene.
+- Missing from the result AND in_compara=true → PAV (gene absent).
+- count>1 in any genome → tandem duplication / CNV.
+
+To seed from a rice ortholog (cross-species neighborhood), look up the rice
+gene's tree ID first and use it as the seed in step 2.`,
+  },
+
+  gene_family_expansion: {
+    definition: {
+      name: "gene_family_expansion",
+      title: "Gene family expansion / contraction across clades",
+      description:
+        "Compare per-clade copy counts of a gene family (gene tree) using a single faceted " +
+        "Solr query. Useful for spotting lineage-specific expansions (e.g. tandem duplicates " +
+        "in maize) or contractions (single-copy in eudicots, multi-copy in grasses).",
+      arguments: [
+        { name: "family", description: "Gene family or protein family name (e.g. 'lipoxygenase'), OR a gene_tree ID if already known.", required: true },
+      ],
+    },
+    template: `# Workflow: Gene family expansion / contraction
+
+**Family or gene_tree:** {{family}}
+
+## Step 1 — Resolve to a gene tree
+
+If the input is already a gene_tree ID, skip to Step 2. Otherwise:
+
+\`\`\`
+solr_suggest(term: "{{family}}")
+  → among the results pick the candidate with the LARGEST num_genes whose
+    fq_field is gene_tree, domains__ancestors, or pathways__ancestors.
+    InterPro/domain matches often give the cleanest scope.
+\`\`\`
+
+## Step 2 — Per-clade copy counts in a single faceted query
+
+\`\`\`
 solr_search(
-  q: "{!graph from=compara_neighbors_10 to=compara_idx_multi maxDepth=1}gene_tree:<tree_id>",
-  fq: ["taxonomy__ancestors:{{taxon_id}}"],
+  q: "<fq_field>:<fq_value>",         # gene_tree:<id> or domains__ancestors:<id>
   rows: 0,
-  facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 }
+  facet: { field: "taxonomy__ancestors", mincount: 1, limit: -1 }
 )
 \`\`\`
 
-Response: \`facet_counts.facet_pivot["gene_tree,system_name"]\` — array of
-\`{ value: <tree_id>, count: N, pivot: [{ value: <assembly>, count: k }, ...] }\`.
+Faceting on \`taxonomy__ancestors\` returns counts at every level of the
+NCBI taxonomy under the family — species, genus, family, order, clade — in
+the same response. That hierarchical view makes expansion / contraction
+patterns visible without one query per genome.
+
+## Step 3 — Resolve taxon IDs to names
+
+\`\`\`
+mongo_lookup_by_ids(
+  collection: "taxonomy",
+  ids: <facet integer keys>
+)
+  → join names/ranks back onto the counts
+\`\`\`
+
+## Step 4 — (Optional) Per-genome breakdown for a specific clade
+
+\`\`\`
+solr_search(
+  q: "<fq_field>:<fq_value>",
+  fq: ["taxonomy__ancestors:<clade NCBI id>"],
+  rows: 0,
+  facet: { field: "system_name", mincount: 0, limit: -1 }
+)
+\`\`\`
 
 ## Interpretation
-- \`count=1\` across all \`in_compara\` genomes → single-copy conserved gene.
-- Genome absent from pivot AND \`in_compara=true\` → PAV (gene absent).
-- \`count>1\` in any genome → tandem duplication / CNV.
 
-Cross-reference \`mongo_find(collection:"maps", filter:{in_compara:true})\` to
-get the full denominator. To seed from a rice ortholog instead (cross-species
-neighborhood), look up the rice gene's tree ID first, then use that as seed.`,
+- A clade with mean count substantially higher than its sibling clades →
+  lineage-specific expansion (often whole-genome or tandem duplication).
+- A clade with single-copy across all members while siblings are multi-copy
+  → contraction (gene loss after duplication).
+- Highly variable per-genome counts within one clade → PAV / CNV; switch to
+  the \`pav_cnv\` workflow.
+
+## Fallbacks
+
+- 0 hits → name didn't resolve to anything indexed; broaden the suggest term
+  or try \`q='name:"<exact term>"'\`.
+- Counts only at the species level (no intermediate ranks) → the family may
+  be confined to one genus; that's an answer in itself.`,
+  },
+
+  qtl_discovery: {
+    definition: {
+      name: "qtl_discovery",
+      title: "Trait → QTL discovery (find QTLs by trait name)",
+      description:
+        "Resolve a free-text trait to a Trait Ontology term and return matching QTL records " +
+        "(coordinates, populations, references). Use this before qtl_candidate_ranking when " +
+        "you start from a trait name rather than a known interval.",
+      arguments: [
+        { name: "trait", description: "Free-text trait name, e.g. 'plant height' or 'rust resistance'.", required: true },
+        { name: "species", description: "Optional species name to scope the QTL set.", required: false },
+      ],
+    },
+    template: `# Workflow: Trait → QTL discovery
+
+**Trait:** {{trait}}
+**Species filter:** {{species}}
+
+## Step 1 — Resolve the trait to a TO term
+
+\`\`\`
+solr_suggest(
+  q:  'name:"{{trait}}"',
+  fq: ['category:Trait Ontology']
+)
+  → returns one or more matches; each has fq_field=TO__ancestors and
+    fq_value=<TO integer id>. Note also the canonical TO:NNNNNNN string.
+\`\`\`
+
+If the exact name doesn't match, fall back to a fuzzy term lookup:
+\`\`\`
+solr_suggest(term: "{{trait}}", fq: ['category:Trait Ontology'])
+\`\`\`
+
+## Step 2 — List QTLs annotated with that TO term
+
+\`\`\`
+mongo_find(
+  collection: "qtls",
+  filter: { "terms": "TO:NNNNNNN" }
+)
+  → each record has location.region, location.start, location.end,
+    population/cross details, and source publications.
+\`\`\`
+
+To restrict to one species, intersect with the species' assemblies via the
+\`maps\` collection or filter the QTL records themselves if they carry a
+taxon field:
+\`\`\`
+mongo_find(collection: "maps",
+           filter: { "taxon_id": <plain NCBI id> },
+           projection: { _id: 1, name: 1, system_name: 1 })
+\`\`\`
+
+## Step 3 — (Optional) Find genes inside those QTL intervals
+
+The Solr \`QTL_TO__ancestors\` field on each gene holds the QTL stable IDs
+whose interval overlaps that gene. Use it to jump straight from a QTL to its
+candidate genes — no coordinate math required:
+
+\`\`\`
+solr_search(
+  q:  "QTL_TO__ancestors:<qtl_id>",
+  fq: ["taxonomy__ancestors:<plain NCBI id>"],
+  fl: "id,name,description,closest_rep_name,model_rep_name"
+)
+\`\`\`
+
+To pre-filter to QTL-annotated genes for a trait without a specific QTL ID:
+\`\`\`
+solr_search(
+  fq: ["TO__ancestors:<TO int>", "capabilities:QTL_TO",
+       "taxonomy__ancestors:<plain NCBI id>"]
+)
+\`\`\`
+
+## Step 4 — (Optional) Hand off to QTL candidate ranking
+
+For each QTL of interest, load the \`qtl_candidate_ranking\` workflow with
+the resolved \`region\`, \`start\`, \`end\`, and the plain NCBI \`taxon_id\`.
+
+## Output
+
+Render a table with columns: \`Trait | TO term | QTL ID | Region | Span (bp)
+| Population | Reference\`. Group rows by trait if multiple TO matches were
+returned.
+
+## Fallbacks
+
+- No TO match → broaden to a \`term=\` fuzzy lookup, or check synonyms in
+  the TO collection: \`mongo_find(collection:"TO", filter:{"synonyms": …})\`.
+- 0 QTLs for a valid TO term → the trait is annotated but no QTL has been
+  cataloged in Gramene for it. Surface that explicitly.`,
   },
 };
 
@@ -2923,12 +2891,12 @@ async function handleJsonRpc(msg, sessionId = null) {
   // Lifecycle
   if (method === "initialize") {
     return jsonRpcResult(id, {
-      protocolVersion: "2025-11-25",
+      protocolVersion: SUPPORTED_PROTOCOL_VERSIONS[0],
       capabilities: {
-        tools: { listChanged: false },
-        prompts: { listChanged: false },
+        tools: SERVER_CAPABILITIES.tools,
+        prompts: SERVER_CAPABILITIES.prompts,
       },
-      serverInfo: { name: "gramene-mcp", version: "0.3.0" },
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
     });
   }
 
@@ -3164,6 +3132,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname !== "/mcp") return send(res, 404, { error: "Not Found" });
+
+    // GET /mcp — server discovery document. Returns capabilities, supported
+    // protocol versions, transport, and auth mode without requiring an
+    // initialize round-trip. Modeled on https://pubmed.caseyjhand.com/mcp.
+    if (req.method === "GET") {
+      return send(res, 200, getServerDiscoveryDoc(), {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Mcp-Session-Id",
+        "Cache-Control": "no-store",
+      });
+    }
+
     if (req.method !== "POST") return send(res, 405, { error: "Method Not Allowed" });
 
     const msg = await readJson(req);
@@ -3189,6 +3169,18 @@ const server = http.createServer(async (req, res) => {
     return send(res, 400, jsonRpcError(null, -32700, "Parse error", String(e?.message || e)));
   }
 });
+
+// Eagerly load the metadata cache before the server starts accepting
+// connections. This keeps first-call latency predictable and avoids racing
+// tool calls against a half-populated cache.
+try {
+  console.error("Loading metadata cache…");
+  await initMetadataCache();
+  startCacheRefresh();
+} catch (err) {
+  console.error(`Metadata cache load failed: ${err?.message || err}`);
+  process.exit(1);
+}
 
 server.listen(PORT, HOST, () => {
   console.error(`Gramene MCP server listening on http://${HOST}:${PORT}/mcp`);
