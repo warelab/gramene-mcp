@@ -1951,6 +1951,31 @@ user rather than dumping raw JSON. Load additional workflow prompts
 (\`prompts/get\`) when a user's question matches one of them — this keeps base
 context small.
 
+## Run independent calls in parallel
+
+Each tool call costs one model turn. Running independent calls sequentially
+multiplies that latency for no reason. Whenever the next set of calls do not
+depend on each other's outputs, **emit them in a single turn** — most clients
+will dispatch them concurrently.
+
+A call A depends on call B only when B's output supplies an argument A needs.
+If A and B share a starting input, or operate on the same gene list, or query
+different backends entirely, they are independent.
+
+Concrete patterns:
+
+- Resolving multiple unrelated names (e.g. a pathway and a species) → run both
+  \`solr_suggest\` calls in one turn.
+- For a fixed gene list: \`expression_for_genes\`, \`vep_for_gene\`, and
+  \`pubmed_for_genes\` are independent — fire all three together.
+- For a known QTL interval: \`genes_in_region\` and any background-genome facet
+  query for the same species can run in parallel.
+- Workflow prompts mark concurrent steps with **[parallel with Step N]** —
+  treat those step groups as one batch.
+
+Sequential is only correct when one call literally needs another's result
+(e.g. \`solr_suggest\` → use returned \`fq_value\` in \`solr_search\`).
+
 ## Query Routing
 
 Always start with \`solr_suggest\` for any free-text concept (gene name,
@@ -2198,6 +2223,11 @@ InterPro/GO and may not surface Reactome entries.
 **End:** {{end}}
 **NCBI taxon ID:** {{taxon_id}}
 
+> **Concurrency note.** Steps marked **[parallel with Step N]** have no data
+> dependency on each other and SHOULD be emitted as multiple tool calls in a
+> single turn so the client dispatches them concurrently. Each model turn is
+> the dominant cost — collapsing turns is the biggest speedup available.
+
 ## Step 0 — Resolve the trait if only a name is known
 If the user gave a trait name rather than a TO ID:
 \`\`\`
@@ -2231,7 +2261,13 @@ A typical QTL interval yields **5–200 genes**.
 - **>500 genes** → interval probably too broad. Confirm with the user before
   downstream expensive analyses.
 
-## Step 3 — Score by ontology
+---
+
+The next four steps (3, 4, 5, 6) all consume the gene list from Step 2 but
+do NOT depend on each other's outputs. Emit them as one batch of concurrent
+tool calls in a single turn.
+
+## Step 3 — Score by ontology  [parallel with Steps 4, 5, 6]
 \`\`\`
 mongo_lookup_by_ids(
   collection: "TO",
@@ -2240,7 +2276,7 @@ mongo_lookup_by_ids(
   → identify genes annotated to the trait or its ancestors
 \`\`\`
 
-## Step 4 — Find conserved orthologs
+## Step 4 — Find conserved orthologs  [parallel with Steps 3, 5, 6]
 \`\`\`
 solr_graph(
   from: "compara_neighbors_10",
@@ -2250,29 +2286,45 @@ solr_graph(
 )
   → collect ortholog gene IDs across species
 \`\`\`
+(Ortholog IDs from Step 4 widen the gene list used by Steps 5 and 6 on a
+*subsequent* turn — but the initial regional-gene call to those tools can run
+in this batch.)
 
-## Step 5 — Score by expression
+## Step 5 — Score by expression  [parallel with Steps 3, 4, 6]
+Both calls below operate on the same gene list and are independent — emit
+them in the same turn:
 \`\`\`
 expression_for_genes(
-  gene_ids: <regional + orthologs>,
+  gene_ids: <regional genes>,
   experiment_type: "Baseline",
   taxon_id: {{taxon_id}},
   po_terms: [<trait-relevant tissue PO IDs>]
 )
 expression_for_genes(
-  gene_ids: <same list>,
+  gene_ids: <regional genes>,
   experiment_type: "Differential"
 )
-  → flag significant DE (p_adjusted < 0.05) in relevant conditions
+  → flag significant DE (p < 0.05) in relevant conditions
+\`\`\`
+After Step 4 returns, optionally re-run with \`gene_ids: <regional + orthologs>\`
+in a follow-up turn to extend the comparison across species.
+
+## Step 6 — Literature evidence  [parallel with Steps 3, 4, 5]
+\`\`\`
+pubmed_for_genes(gene_ids: <regional genes>)
+  → per-gene pmids[] and dois[]; non-empty = literature exists
+\`\`\`
+After Step 4 returns, repeat with the ortholog IDs in a follow-up turn for
+broader coverage. Hand resolved PMIDs to a PubMed-focused MCP for titles
+and abstracts.
+
+## Step 6b — Loss-of-function germplasm bonus  [parallel with Steps 3, 4, 5]
+\`\`\`
+vep_for_gene(gene_ids: <regional genes>)
+  → predicted LOF accessions per gene (sorghum-richest)
 \`\`\`
 
-## Step 6 — Literature evidence
-\`\`\`
-pubmed_for_genes(gene_ids: <regional + orthologs>)
-  → returns per-gene pmids[] and dois[]; flag genes with non-empty references
-\`\`\`
-For paper titles / authors / abstracts, hand the resulting PMIDs to a
-PubMed-focused MCP server.
+---
 
 ## Step 7 — Synthesize ranking
 
@@ -2282,7 +2334,7 @@ Score each gene on:
 - Significant DE under trait-relevant condition (0–2 pts)
 - Conserved expression across orthologous species (0–2 pts)
 - Published functional characterization (0–3 pts: 3=direct study, 2=ortholog studied, 1=mentioned)
-- LOF germplasm available (bonus flag — \`vep_for_gene\`)
+- LOF germplasm available (bonus flag from Step 6b)
 
 Output: ranked table with explicit subtotals so the user can audit the
 ranking. Report filter counts at every step (e.g. "120 genes in the interval
@@ -2354,6 +2406,11 @@ pass the union of \`pmids\` and \`dois\` into a PubMed-focused MCP server.
 
 **Query gene:** {{gene_id}}
 
+> **Concurrency note.** Steps marked **[parallel with Step N]** have no data
+> dependency on each other and SHOULD be emitted as multiple tool calls in a
+> single turn. Each model turn is the dominant cost — collapse them where you
+> can.
+
 ## Choosing the homology field
 
 \`homology__ortholog_one2one\` is reliable only between species that lack a
@@ -2377,7 +2434,12 @@ solr_search(
 )
 \`\`\`
 
-## Step 2 — Retrieve all family members (recommended for distant comparisons)
+---
+
+After Step 1, the gene tree ID is known. Steps 2 and 3 both consume it but
+do not depend on each other — emit them as one batch in a single turn.
+
+## Step 2 — Retrieve all family members  [parallel with Step 3]
 \`\`\`
 solr_search(
   q: "gene_tree:<tree_id>",
@@ -2385,7 +2447,7 @@ solr_search(
   rows: 500
 )
 \`\`\`
-Or the graph form for ±10-gene context per ortholog:
+Or, for ±10-gene neighborhood context per ortholog (single hop):
 \`\`\`
 solr_graph(
   from: "compara_neighbors_10",
@@ -2395,13 +2457,27 @@ solr_graph(
 )
 \`\`\`
 
-## Step 3 — Compare expression across species
+## Step 3 — Per-clade copy counts  [parallel with Step 2]
+\`\`\`
+solr_search(
+  q: "gene_tree:<tree_id>",
+  rows: 0,
+  facet: { field: "taxonomy__ancestors", mincount: 1, limit: -1 }
+)
+  → surfaces lineage-specific expansion / contraction without a separate turn
+\`\`\`
+
+## Step 4 — Compare expression across species
+After Step 2 returns the ortholog IDs:
 \`\`\`
 expression_for_genes(
-  gene_ids: <ortholog IDs>,
+  gene_ids: <ortholog IDs from Step 2>,
   experiment_type: "Baseline"
 )
 \`\`\`
+
+(If you also want literature coverage, run \`pubmed_for_genes\` with the same
+ortholog list in the same turn as Step 4 — they are independent.)
 
 ## Output
 Group the rendered table by species. For each ortholog, show the

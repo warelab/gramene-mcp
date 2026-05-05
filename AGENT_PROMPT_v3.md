@@ -34,6 +34,33 @@ for the user rather than dumping raw JSON.
 
 ---
 
+## Run independent calls in parallel
+
+Each tool call costs one model turn, and that turn (not the MCP server) is the
+dominant per-call latency. Whenever the next set of calls do not depend on
+each other's outputs, **emit them in a single turn** so the client dispatches
+them concurrently.
+
+A call A depends on call B only when B's output supplies an argument A needs.
+If A and B share a starting input, operate on the same gene list, or query
+different backends entirely, they are independent.
+
+Concrete patterns:
+
+- Resolving multiple unrelated names (e.g. a pathway and a species) → run
+  both `solr_suggest` calls in one turn.
+- For a fixed gene list: `expression_for_genes`, `vep_for_gene`, and
+  `pubmed_for_genes` are independent — fire all three together.
+- For a known QTL interval: `genes_in_region` and any background-genome facet
+  query for the same species can run in parallel.
+- Workflow prompts mark concurrent steps with **[parallel with Step N]** —
+  treat those step groups as one batch.
+
+Sequential is only correct when one call literally needs another's result
+(e.g. `solr_suggest` → use returned `fq_value` in `solr_search`).
+
+---
+
 ## How to use MCP Prompts (NEW in v3)
 
 The server advertises a `prompts` capability. Detailed **workflow
