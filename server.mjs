@@ -3139,7 +3139,7 @@ async function load() {
           return '<tr>' +
             '<td class="session" title="' + (s.session||'') + '">' + sid + '</td>' +
             '<td>' + new Date(s.firstSeen).toLocaleString() + '</td>' +
-            '<td>' + new Date(s.lastSeen).toLocaleTimeString() + '</td>' +
+            '<td>' + new Date(s.lastSeen).toLocaleString() + '</td>' +
             '<td>' + s.calls + '</td>' +
             '<td class="' + (s.errors?'error':'ok') + '">' + (s.errors||'0') + '</td>' +
             '<td style="font-size:.78rem;color:#4b5563">' + tools + '</td>' +
@@ -3149,7 +3149,7 @@ async function load() {
 
     document.getElementById('recent').innerHTML = d.recent.map(e => {
       const args = e.args ? JSON.stringify(e.args, null, 0).slice(0, 200) : '';
-      const t = new Date(e.ts).toLocaleTimeString();
+      const t = new Date(e.ts).toLocaleString();
       const sid = e.session ? e.session.slice(0,8) + '…' : '—';
       return '<tr><td>' + t + '</td>' +
         '<td class="session" title="' + (e.session||'') + '">' + sid + '</td>' +
