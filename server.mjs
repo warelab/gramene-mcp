@@ -46,7 +46,8 @@ const SERVER_DESCRIPTION =
   "comparative genomics, expression, ontology / QTL annotations, predicted " +
   "loss-of-function germplasm, and literature cross-references.";
 const SERVER_HOMEPAGE = "https://github.com/warelab/gramene-mcp";
-const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25"];
+const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26"];
+const SESSION_HEADER = "Mcp-Session-Id";
 const SERVER_CAPABILITIES = {
   tools:     { listChanged: false },
   prompts:   { listChanged: false },
@@ -184,7 +185,7 @@ function computeStats(events) {
 
 // --- Session tracking ---
 // Sessions are created on 'initialize' and identified by a UUID returned in the
-// X-MCP-Session response header. Clients echo it back on subsequent requests.
+// Mcp-Session-Id response header. Clients echo it back on subsequent requests.
 // Sessions older than SESSION_TTL_MS are pruned on each new initialize.
 const SESSION_TTL_MS = 24 * 3600_000; // 24 hours
 const activeSessions = new Map(); // id -> { created, lastSeen, calls, errors }
@@ -2966,8 +2967,12 @@ async function handleJsonRpc(msg, sessionId = null) {
 
   // Lifecycle
   if (method === "initialize") {
+    const requested = params?.protocolVersion;
+    const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+      ? requested
+      : SUPPORTED_PROTOCOL_VERSIONS[0];
     return jsonRpcResult(id, {
-      protocolVersion: SUPPORTED_PROTOCOL_VERSIONS[0],
+      protocolVersion: negotiated,
       capabilities: {
         tools: SERVER_CAPABILITIES.tools,
         prompts: SERVER_CAPABILITIES.prompts,
@@ -3145,7 +3150,7 @@ async function load() {
             '<td style="font-size:.78rem;color:#4b5563">' + tools + '</td>' +
             '</tr>';
         }).join('')
-      : '<tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:16px">No session data yet — sessions are tracked via X-MCP-Session header</td></tr>';
+      : '<tr><td colspan="6" style="color:#9ca3af;text-align:center;padding:16px">No session data yet — sessions are tracked via Mcp-Session-Id header</td></tr>';
 
     document.getElementById('recent').innerHTML = d.recent.map(e => {
       const args = e.args ? JSON.stringify(e.args, null, 0).slice(0, 200) : '';
@@ -3225,7 +3230,7 @@ const server = http.createServer(async (req, res) => {
     const msg = await readJson(req);
 
     // Session management: assign on initialize, validate on subsequent calls.
-    let sessionId = req.headers["x-mcp-session"] || null;
+    let sessionId = req.headers["mcp-session-id"] || req.headers["x-mcp-session"] || null;
     if (msg?.method === "initialize") {
       pruneOldSessions();
       sessionId = randomUUID();
@@ -3236,7 +3241,7 @@ const server = http.createServer(async (req, res) => {
       if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();
     }
 
-    const sessionHeaders = sessionId ? { "X-MCP-Session": sessionId } : {};
+    const sessionHeaders = sessionId ? { [SESSION_HEADER]: sessionId } : {};
     const reply = await handleJsonRpc(msg, sessionId);
 
     if (reply === null) return send(res, 202, null, sessionHeaders);   // notification → no body
