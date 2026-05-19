@@ -3421,16 +3421,76 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.error(`Gramene MCP server listening on http://${HOST}:${PORT}/mcp`);
-  console.error(`Backed by Gramene REST API at ${GRAMENE_API_BASE}`);
-});
+// --- Transport selection ---
+// stdio: --stdio CLI flag or MCP_STDIO=1 env var. Reads newline-delimited
+// JSON-RPC from stdin, writes responses to stdout. Used by Claude Desktop
+// and Claude Code to launch the server as a child process.
+const USE_STDIO = process.argv.includes("--stdio") || process.env.MCP_STDIO === "1";
+
+if (USE_STDIO) {
+  runStdio();
+} else {
+  server.listen(PORT, HOST, () => {
+    console.error(`Gramene MCP server listening on http://${HOST}:${PORT}/mcp`);
+    console.error(`Backed by Gramene REST API at ${GRAMENE_API_BASE}`);
+  });
+}
 
 // Graceful shutdown
 function shutdown() {
   console.error("Shutting down…");
-  server.close();
+  if (!USE_STDIO) server.close();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// --- stdio transport ---
+//
+// One JSON-RPC message per line, both directions. Anything written to stdout
+// that isn't a response will corrupt the stream — all logging goes to stderr.
+function runStdio() {
+  console.error(`Gramene MCP server on stdio. Backed by ${GRAMENE_API_BASE}`);
+  process.stdin.setEncoding("utf8");
+
+  // stdio is single-session — synthesise a stable id for log correlation.
+  const sessionId = randomUUID();
+  activeSessions.set(sessionId, {
+    created: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+  });
+
+  let buf = "";
+  process.stdin.on("data", (chunk) => {
+    buf += chunk;
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      handleStdioLine(line, sessionId);
+    }
+  });
+
+  process.stdin.on("end", () => process.exit(0));
+}
+
+async function handleStdioLine(line, sessionId) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch (e) {
+    const err = jsonRpcError(null, -32700, "Parse error", String(e?.message || e));
+    process.stdout.write(JSON.stringify(err) + "\n");
+    return;
+  }
+  try {
+    const reply = await handleJsonRpc(msg, sessionId);
+    if (reply !== null) process.stdout.write(JSON.stringify(reply) + "\n");
+    // null reply = notification; nothing to send.
+    if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();
+  } catch (e) {
+    const err = jsonRpcError(msg?.id ?? null, -32603, "Internal error", String(e?.message || e));
+    process.stdout.write(JSON.stringify(err) + "\n");
+  }
+}

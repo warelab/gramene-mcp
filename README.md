@@ -44,11 +44,31 @@ The server listens for MCP JSON-RPC requests at `POST http://<MCP_HOST>:<MCP_POR
 
 ## Connecting to MCP clients
 
-The server speaks the [MCP 2025-03-26 Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) transport — a single `POST /mcp` endpoint that any compliant client can use.
+The server speaks two transports:
+
+- **stdio** — the client launches `node server.mjs --stdio` as a child process and communicates over stdin/stdout. No port, no CORS, no HTTP server. Easiest for single-user setups on the same machine.
+- **HTTP** — [MCP 2025-03-26 Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http) at `POST /mcp`. Needed when the server runs on a different machine, when multiple clients share one instance, or when the client only supports HTTP.
+
+The same `server.mjs` handles both — pass `--stdio` (or set `MCP_STDIO=1`) to switch into stdio mode.
 
 ### Claude Desktop
 
-Add an entry to `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
+Edit `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+**stdio (recommended for local use):**
+
+```json
+{
+  "mcpServers": {
+    "gramene": {
+      "command": "node",
+      "args": ["/absolute/path/to/gramene-mcp/server.mjs", "--stdio"]
+    }
+  }
+}
+```
+
+**HTTP:**
 
 ```json
 {
@@ -63,6 +83,14 @@ Add an entry to `claude_desktop_config.json` (macOS: `~/Library/Application Supp
 Restart Claude Desktop after saving.
 
 ### Claude Code / Cowork
+
+**stdio:**
+
+```bash
+claude mcp add gramene -- node /absolute/path/to/gramene-mcp/server.mjs --stdio
+```
+
+**HTTP:**
 
 ```bash
 claude mcp add gramene --url http://127.0.0.1:8787/mcp
