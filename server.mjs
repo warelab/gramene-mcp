@@ -315,12 +315,38 @@ const LOCALHOST_PATTERNS = [
   "https://[::1]:",
 ];
 
+// Origins that always pass the Origin check (in addition to localhost and any
+// values configured via MCP_ALLOWED_ORIGINS). These are the well-known origins
+// for hosted MCP clients that connect to public servers.
+const DEFAULT_ALLOWED_ORIGINS = new Set([
+  "https://claude.ai",
+  "https://www.claude.ai",
+  "https://api.anthropic.com",
+]);
+
 function originAllowed(req) {
   const origin = req.headers.origin;
   if (!origin) return true;                      // no Origin header → allow
   if (ALLOW_ALL_ORIGINS) return true;            // MCP_ALLOWED_ORIGINS=* → allow all
-  if (ALLOWED_ORIGINS.size > 0) return ALLOWED_ORIGINS.has(origin);
+  if (DEFAULT_ALLOWED_ORIGINS.has(origin)) return true;
+  if (ALLOWED_ORIGINS.has(origin)) return true;
   return LOCALHOST_PATTERNS.some((p) => origin.startsWith(p));
+}
+
+function corsHeaders(req) {
+  const origin = req.headers.origin;
+  // Echo back the request Origin if allowed; otherwise wildcard is fine for
+  // read-only/no-auth flows but credentialed requests need an explicit echo.
+  const allowOrigin = origin && originAllowed(req) ? origin : "*";
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers":
+      "Content-Type, Authorization, X-Requested-With, Mcp-Session-Id, MCP-Protocol-Version",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id",
+    "Access-Control-Max-Age": "600",
+    Vary: "Origin",
+  };
 }
 
 const KB_RELATIONS = {
@@ -3188,14 +3214,26 @@ setInterval(tick, 1000);
 // --- HTTP server ---
 const server = http.createServer(async (req, res) => {
   try {
-    if (!originAllowed(req)) return send(res, 403, null);
+    const cors = corsHeaders(req);
+
+    // CORS preflight — always answer, regardless of Origin allowlist. The
+    // browser uses the response headers to decide whether to send the real
+    // request; the real request still goes through originAllowed.
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, cors);
+      return res.end();
+    }
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     // Dashboard routes (GET only, no CORS restriction needed — read-only)
     if (url.pathname === "/mcp/usage" && req.method === "GET") {
       const html = dashboardHtml();
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": Buffer.byteLength(html),
+        ...cors,
+      });
       return res.end(html);
     }
 
@@ -3207,25 +3245,29 @@ const server = http.createServer(async (req, res) => {
         "Content-Type": "application/json; charset=utf-8",
         "Content-Length": Buffer.byteLength(body),
         "Cache-Control": "no-store",
-        "Access-Control-Allow-Origin": "*",
+        ...cors,
       });
       return res.end(body);
     }
 
-    if (url.pathname !== "/mcp") return send(res, 404, { error: "Not Found" });
+    if (url.pathname !== "/mcp") return send(res, 404, { error: "Not Found" }, cors);
+
+    // Block state-changing or session-handshake requests from disallowed
+    // origins. The preflight is already answered above; this guards the
+    // actual MCP traffic against DNS-rebinding / cross-origin abuse.
+    if (!originAllowed(req)) return send(res, 403, null, cors);
 
     // GET /mcp — server discovery document. Returns capabilities, supported
     // protocol versions, transport, and auth mode without requiring an
     // initialize round-trip. Modeled on https://pubmed.caseyjhand.com/mcp.
     if (req.method === "GET") {
       return send(res, 200, getServerDiscoveryDoc(), {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Expose-Headers": "Mcp-Session-Id",
+        ...cors,
         "Cache-Control": "no-store",
       });
     }
 
-    if (req.method !== "POST") return send(res, 405, { error: "Method Not Allowed" });
+    if (req.method !== "POST") return send(res, 405, { error: "Method Not Allowed" }, cors);
 
     const msg = await readJson(req);
 
@@ -3241,13 +3283,16 @@ const server = http.createServer(async (req, res) => {
       if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();
     }
 
-    const sessionHeaders = sessionId ? { [SESSION_HEADER]: sessionId } : {};
+    const sessionHeaders = {
+      ...cors,
+      ...(sessionId ? { [SESSION_HEADER]: sessionId } : {}),
+    };
     const reply = await handleJsonRpc(msg, sessionId);
 
     if (reply === null) return send(res, 202, null, sessionHeaders);   // notification → no body
     return send(res, 200, reply, sessionHeaders);
   } catch (e) {
-    return send(res, 400, jsonRpcError(null, -32700, "Parse error", String(e?.message || e)));
+    return send(res, 400, jsonRpcError(null, -32700, "Parse error", String(e?.message || e)), corsHeaders(req));
   }
 });
 
