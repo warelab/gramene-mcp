@@ -3257,10 +3257,20 @@ const server = http.createServer(async (req, res) => {
     // actual MCP traffic against DNS-rebinding / cross-origin abuse.
     if (!originAllowed(req)) return send(res, 403, null, cors);
 
-    // GET /mcp — server discovery document. Returns capabilities, supported
-    // protocol versions, transport, and auth mode without requiring an
-    // initialize round-trip. Modeled on https://pubmed.caseyjhand.com/mcp.
+    // GET /mcp
+    //   - If the client asks for an SSE stream (Accept: text/event-stream),
+    //     the MCP Streamable HTTP spec requires 405 when the server doesn't
+    //     offer one. We don't, so return 405.
+    //   - Otherwise, serve a human-friendly discovery document so that
+    //     browsers / curl visits to the URL return something useful.
     if (req.method === "GET") {
+      const accept = String(req.headers.accept || "");
+      if (accept.includes("text/event-stream")) {
+        return send(res, 405, { error: "Method Not Allowed" }, {
+          ...cors,
+          Allow: "POST, OPTIONS",
+        });
+      }
       return send(res, 200, getServerDiscoveryDoc(), {
         ...cors,
         "Cache-Control": "no-store",
