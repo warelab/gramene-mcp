@@ -1,10 +1,10 @@
 import fs from "node:fs";
 import http from "node:http";
 import { randomUUID } from "node:crypto";
-import { MongoClient } from "mongodb";
 
 /**
- * Gramene MCP Server — bridges Claude to Solr search and MongoDB.
+ * Gramene MCP Server — bridges Claude to the public Gramene REST API
+ * (https://data.gramene.org).
  *
  * Environment variables:
  *   MCP_HOST             Listen address          (default: 127.0.0.1)
@@ -15,24 +15,16 @@ import { MongoClient } from "mongodb";
  *   MCP_LOG_FILE         Path to append JSON log lines (persists across restarts)
  *   MCP_LOG_BUFFER_SIZE  Max tool_call events kept in memory for the dashboard (default: 10000)
  *
- *   SOLR_BASE_URL        Solr base URL           (default: http://localhost:8983/solr)
- *   SOLR_GENES_CORE      Solr genes core name    (default: genes)
- *   SOLR_SUGGESTIONS_CORE  Suggestions core name (default: suggestions)
- *
- *   MONGO_URI            MongoDB connection URI  (default: mongodb://localhost:27017)
- *   MONGO_DB             Database name           (default: test)
+ *   GRAMENE_API_BASE     Gramene REST API base URL
+ *                          (default: https://data.gramene.org/v69)
+ *                        Override to point at a species-focused stack.
  */
 
 const HOST = process.env.MCP_HOST || "127.0.0.1";
 const PORT = Number(process.env.MCP_PORT || "8787");
 const MAX_BODY_BYTES = Number(process.env.MCP_MAX_BODY_BYTES || "1048576");
 
-const SOLR_BASE_URL = process.env.SOLR_BASE_URL || "http://localhost:8983/solr";
-const SOLR_GENES_CORE = process.env.SOLR_GENES_CORE || "genes";
-const SOLR_SUGGESTIONS_CORE = process.env.SOLR_SUGGESTIONS_CORE || "suggestions";
-
-const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
-const MONGO_DB = process.env.MONGO_DB || "test";
+const GRAMENE_API_BASE = (process.env.GRAMENE_API_BASE || "https://data.gramene.org/v69").replace(/\/$/, "");
 
 // Single source of truth for server identity. Used by both the MCP `initialize`
 // reply (over JSON-RPC) and the GET /mcp discovery endpoint (for clients that
@@ -42,7 +34,7 @@ const SERVER_NAME = "gramene-mcp";
 const SERVER_VERSION = "0.3.0";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
-  "(Solr search index + MongoDB annotation store). Tools cover gene search, " +
+  "via the public REST API at data.gramene.org. Tools cover gene search, " +
   "comparative genomics, expression, ontology / QTL annotations, predicted " +
   "loss-of-function germplasm, and literature cross-references.";
 const SERVER_HOMEPAGE = "https://github.com/warelab/gramene-mcp";
@@ -202,71 +194,49 @@ function pruneOldSessions() {
   }
 }
 
-// --- Mongo ---
-// MongoClient v5+ auto-connects on first operation; no manual connect needed.
-const mongoClient = new MongoClient(MONGO_URI);
-function db() {
-  return mongoClient.db(MONGO_DB);
-}
-
-// --- Metadata cache ---
+// --- Per-process memo for reference collections ---
 //
-// Slow-changing collections are loaded into memory at startup and refreshed
-// once per day. Tools that previously made a per-call mongo round-trip for
-// experiment / assay / ontology lookups should read from this cache instead.
-//
-// Refresh strategy: countDocuments() is cheap; if it differs from the cached
-// count we reload that collection. This catches inserts/deletes but NOT
-// in-place updates that don't change the doc count — acceptable because these
-// collections (ontology terms, experiment metadata) almost never see in-place
-// edits in practice.
+// expression_for_genes joins gene expression fields with experiment / assay /
+// PO metadata. To keep this fast without holding an in-memory copy of those
+// collections, we memoize per-id docs the first time they're fetched from the
+// API. Reference data is slow-changing, so a process-lifetime cache is fine —
+// restart the server to refresh.
+const refCache = {
+  experiments: new Map(),
+  assays:      new Map(),
+  PO:          new Map(),
+  germplasm:   new Map(),
+};
 
-const CACHED_COLLECTIONS = [
-  "experiments", "assays", "taxonomy", "qtls",
-  "PO", "TO", "GO", "pathways", "domains",
-];
-
-const cache = Object.fromEntries(
-  CACHED_COLLECTIONS.map((name) => [name, { docs: new Map(), count: 0, loadedAt: null }])
-);
-
-async function loadCachedCollection(name) {
-  const t0 = Date.now();
-  const docs = await db().collection(name).find({}).toArray();
-  cache[name].docs = new Map(docs.map((d) => [d._id, d]));
-  cache[name].count = docs.length;
-  cache[name].loadedAt = Date.now();
-  log({ event: "cache_load", collection: name, count: docs.length, ms: Date.now() - t0 });
-}
-
-async function initMetadataCache() {
-  const t0 = Date.now();
-  await Promise.all(CACHED_COLLECTIONS.map(loadCachedCollection));
-  log({ event: "cache_init_complete", ms: Date.now() - t0 });
-}
-
-const CACHE_REFRESH_MS = 24 * 3600_000;
-function startCacheRefresh() {
-  setInterval(async () => {
-    for (const name of CACHED_COLLECTIONS) {
-      try {
-        const n = await db().collection(name).countDocuments();
-        if (n !== cache[name].count) {
-          log({ event: "cache_count_changed", collection: name, before: cache[name].count, after: n });
-          await loadCachedCollection(name);
-        }
-      } catch (err) {
-        log({ event: "cache_refresh_error", collection: name, error: String(err?.message || err) });
+async function fetchRefDocs(collection, ids) {
+  const cache = refCache[collection];
+  if (!cache) throw new Error(`refCache: unknown collection ${collection}`);
+  const missing = [];
+  for (const id of ids) if (!cache.has(id)) missing.push(id);
+  if (missing.length > 0) {
+    // The API caps results at 'rows' (default 20). Chunk requests to be safe.
+    const CHUNK = 200;
+    for (let i = 0; i < missing.length; i += CHUNK) {
+      const chunk = missing.slice(i, i + CHUNK);
+      // Pass idList as an array so each element is appended as its own
+      // ?idList=… param — the API rejects single bare integer values.
+      const docs = await apiGet(`/${collection}`, {
+        idList: chunk.map(String),
+        rows: chunk.length,
+      });
+      for (const doc of (Array.isArray(docs) ? docs : [])) {
+        cache.set(doc._id, doc);
       }
+      // Negative-cache misses so we don't refetch every call.
+      for (const id of chunk) if (!cache.has(id)) cache.set(id, null);
     }
-  }, CACHE_REFRESH_MS).unref();
-}
-
-function cacheGet(name, id) {
-  return cache[name]?.docs.get(id);
-}
-function cacheValues(name) {
-  return cache[name]?.docs.values();
+  }
+  const out = new Map();
+  for (const id of ids) {
+    const doc = cache.get(id);
+    if (doc) out.set(id, doc);
+  }
+  return out;
 }
 
 // --- Helpers ---
@@ -350,9 +320,9 @@ function corsHeaders(req) {
 }
 
 const KB_RELATIONS = {
-  solr: {
+  search_index: {
     genes: {
-      core: SOLR_GENES_CORE,
+      endpoint: "/search",
       fields: {
         taxonomy__ancestors: {
           type: "int[]",
@@ -498,68 +468,97 @@ const KB_RELATIONS = {
       }
     },
     suggestions: {
-      core: SOLR_SUGGESTIONS_CORE,
-      endpoint: "select",
-      queryPattern: "{!boost b=relevance}name:<t>^5 ids:<t>^5 ids:<t>*^3 synonym:<t>^3 synonym:<t>*^2 text:<t>*^1",
+      endpoint: "/suggest",
+      queryPattern: "Server-side suggester: pass the free-text term as 'q' and the API applies its own field boosts and grouping.",
       fields: {
         name:      { type: "string",  description: "Gene or feature name" },
         ids:       { type: "string",  description: "Gene/feature identifiers" },
         synonym:   { type: "string",  description: "Synonyms and aliases" },
         text:      { type: "string",  description: "Full-text search field" },
-        relevance: { type: "float",   description: "Boost score used by {!boost b=relevance}" },
-        fq_field:  { type: "string",  description: "Solr field name to use as filter in genes core" },
-        fq_value:  { type: "string|int", description: "Value to filter on in genes core" }
+        relevance: { type: "float",   description: "Boost score from the suggester" },
+        fq_field:  { type: "string",  description: "Search-index field name to use as fq in /search" },
+        fq_value:  { type: "string|int", description: "Value to filter on in /search" }
       }
     }
   },
-  mongo: {
-    collections: {
-      taxonomy: { key: "_id", type: "int", labelField: "name",
-        description: "NCBI taxonomy nodes. _id = taxon_id integer." },
-      GO: { key: "_id", type: "int", labelField: "name",
-        description: "Gene Ontology terms. _id = integer part of GO:XXXXXXX. Has 'ancestors' int[] field." },
-      PO: { key: "_id", type: "int", labelField: "name",
-        description: "Plant Ontology terms. _id = integer part of PO:XXXXXXX. Has 'ancestors' int[] field." },
-      TO: { key: "_id", type: "int", labelField: "name",
-        description: "Trait Ontology terms. _id = integer part of TO:XXXXXXX. Has 'ancestors' int[] field. Use to find trait-relevant terms for QTL scoring." },
-      domains: { key: "_id", type: "int", labelField: "name",
-        description: "Protein domain definitions." },
-      pathways: { key: "_id", type: "int", labelField: "name",
-        description: "Pathway definitions." },
-      genes: { key: "_id", type: "string", labelField: "name",
-        description: "Gene metadata. _id = gene stable ID. Has location {region, start, end, strand, map}, xrefs, biotype, taxon_id, system_name, gene_idx. Homology subdocument: homology.gene_tree = {id, representative: {closest: {id, description, percent_identity, taxon_id}, model: {...}}, root_taxon_id}. Homology.homologous_genes mirrors the Solr homology__* fields keyed by relationship type (ortholog_one2one, ortholog_one2many, ortholog_many2many, within_species_paralog, gene_split), each containing an array of {id, system_name, ...} objects." },
-      genetree: { key: "_id", type: "string",
-        description: "Compara gene trees. _id = tree stable ID (e.g. SB10GT_332720). Hierarchical node structure with taxon_id, node_type, children." },
-      qtls: { key: "_id", type: "string",
-        description: "QTL records. _id = QTL identifier. Has location {map, region, start, end}, source, description, and terms[] (TO term IDs like 'TO:0000396'). Use to find QTL intervals for a trait." },
-      experiments: { key: "_id", type: "string",
-        description: "Expression experiment metadata. _id = experiment accession (e.g. E-MTAB-5956). Has type ('Baseline'|'Differential'), taxon_id, name, description, factors[]." },
-      assays: { key: "_id", type: "string",
-        description: "Assay group metadata. _id = '{experiment}.{group}'. Has characteristic[] and factor[] arrays with {type, label, ontology?, id?, int_id?}. The int_id is the integer PO/EFO term ID for filtering by tissue or condition." },
-      expression: { key: "_id", type: "string",
-        description: "Expression values per gene. _id = gene stable ID. Dynamic keys are experiment accessions; values are arrays of {group, value} (Baseline: TPM/FPKM) or {group, l2fc, p_value} (Differential). Use expression_for_genes tool to join with assay/experiment metadata." },
-      maps: { key: "_id", type: "string",
-        description: "Genome assembly metadata. _id = assembly map name (e.g. GCA_000003195.3), matching the 'map' field in the Solr genes core. Key field: in_compara (boolean) — true if this genome was included in the Compara gene tree analysis and therefore has homology/PAV data. Use this to distinguish genomes with homology info from those without before interpreting PAV/CNV facet results." },
-      germplasm: { key: "_id", type: "string",
-        description: "Germplasm accession metadata. _id = germplasm ens_id (e.g. 'SGT_PI514460', 'ARS105') matching values in VEP__* Solr fields. Fields: pub_id (public accession name/ID), stock_center (genebank code: ARS, IRRI, ICRISAT, sorbmutdb, NCBI, etc.), germplasm_dbid (numeric ID for stock center hyperlink), subpop (subpopulation classification), pop_id (study ID matching VEP field name). Used by vep_for_gene to enrich germplasm IDs with links and metadata." },
-    }
+  collections: {
+    // Reachable via mongo_find / mongo_lookup_by_ids (which call the API's
+    // /<collection> endpoints — see the public Gramene REST API for shapes).
+    taxonomy: { key: "_id", type: "int", labelField: "name",
+      description: "NCBI taxonomy nodes. _id = taxon_id integer." },
+    GO: { key: "_id", type: "int", labelField: "name",
+      description: "Gene Ontology terms. _id = integer part of GO:XXXXXXX. Has 'ancestors' int[] field." },
+    PO: { key: "_id", type: "int", labelField: "name",
+      description: "Plant Ontology terms. _id = integer part of PO:XXXXXXX. Has 'ancestors' int[] field." },
+    TO: { key: "_id", type: "int", labelField: "name",
+      description: "Trait Ontology terms. _id = integer part of TO:XXXXXXX. Has 'ancestors' int[] field. Use to find trait-relevant terms for QTL scoring." },
+    domains: { key: "_id", type: "int", labelField: "name",
+      description: "Protein domain definitions." },
+    pathways: { key: "_id", type: "int", labelField: "name",
+      description: "Pathway definitions." },
+    genes: { key: "_id", type: "string", labelField: "name",
+      description: "Gene metadata. _id = gene stable ID. Has location {region, start, end, strand, map}, xrefs, biotype, taxon_id, system_name, gene_idx. Homology subdocument: homology.gene_tree = {id, representative: {closest: {id, description, percent_identity, taxon_id}, model: {...}}, root_taxon_id}. Homology.homologous_genes mirrors the homology__* search-index fields keyed by relationship type (ortholog_one2one, ortholog_one2many, ortholog_many2many, within_species_paralog, gene_split), each containing an array of {id, system_name, ...} objects." },
+    genetrees: { key: "_id", type: "string",
+      description: "Compara gene trees. _id = tree stable ID (e.g. SB10GT_332720). Hierarchical node structure with taxon_id, node_type, children." },
+    qtls: { key: "_id", type: "string",
+      description: "QTL records. _id = QTL identifier. Has location {map, region, start, end}, source, description, and terms[] (TO term IDs like 'TO:0000396'). Use to find QTL intervals for a trait." },
+    experiments: { key: "_id", type: "string",
+      description: "Expression experiment metadata. _id = experiment accession (e.g. E-MTAB-5956). Has type ('Baseline'|'Differential'), taxon_id, name, description, factors[]." },
+    assays: { key: "_id", type: "string",
+      description: "Assay group metadata. _id = '{experiment}.{group}'. Has characteristic[] and factor[] arrays with {type, label, ontology?, id?, int_id?}. The int_id is the integer PO/EFO term ID for filtering by tissue or condition." },
+    expression: { key: "_id", type: "string",
+      description: "Expression values per gene. _id = gene stable ID. Dynamic keys are experiment accessions; values are arrays of {group, value} (Baseline: TPM/FPKM) or {group, l2fc, p_value} (Differential). Use expression_for_genes tool to join with assay/experiment metadata." },
+    maps: { key: "_id", type: "string",
+      description: "Genome assembly metadata. _id = assembly map name (e.g. GCA_000003195.3), matching the 'map' field on gene documents. Key field: in_compara (boolean) — true if this genome was included in the Compara gene tree analysis and therefore has homology/PAV data. Use this to distinguish genomes with homology info from those without before interpreting PAV/CNV facet results." },
+    germplasm: { key: "_id", type: "string",
+      description: "Germplasm accession metadata. _id = germplasm ens_id (e.g. 'SGT_PI514460', 'ARS105') matching values in VEP__* search-index fields. Fields: pub_id (public accession name/ID), stock_center (genebank code: ARS, IRRI, ICRISAT, sorbmutdb, NCBI, etc.), germplasm_dbid (numeric ID for stock center hyperlink), subpop (subpopulation classification), pop_id (study ID matching VEP field name). Used by vep_for_gene to enrich germplasm IDs with links and metadata." },
   }
 };
 
-// --- Solr helpers ---
-function solrUrl(core, endpoint, params) {
-  const base = SOLR_BASE_URL.replace(/\/$/, "");
-  const url = new URL(`${base}/${encodeURIComponent(core)}/${endpoint}`);
-  for (const [k, v] of Object.entries(params)) {
+// The collection names served by the /<collection> endpoints.
+const COLLECTIONS = [
+  "genes", "genetrees", "maps", "domains", "taxonomy",
+  "GO", "PO", "TO", "qtls", "pathways",
+  "expression", "assays", "experiments", "germplasm",
+];
+
+// --- Gramene REST API helpers ---
+function apiUrl(path, params) {
+  const url = new URL(`${GRAMENE_API_BASE}${path}`);
+  for (const [k, v] of Object.entries(params || {})) {
     if (v === undefined || v === null) continue;
-    if (Array.isArray(v)) v.forEach((x) => url.searchParams.append(k, String(x)));
-    else url.searchParams.set(k, String(v));
+    if (k === "idList") {
+      // The API's swagger declares idList as type=array (CSV). When a single
+      // numeric value is passed bare (?idList=3702) the validator coerces it
+      // back to an integer and rejects the request. A trailing comma forces
+      // it to parse as an array.
+      const values = Array.isArray(v) ? v.map(String) : [String(v)];
+      let csv = values.join(",");
+      if (values.length === 1) csv += ",";
+      url.searchParams.set(k, csv);
+    } else if (Array.isArray(v)) {
+      v.forEach((x) => url.searchParams.append(k, String(x)));
+    } else {
+      url.searchParams.set(k, String(v));
+    }
   }
-  url.searchParams.set("wt", "json");
   return url.toString();
 }
 
-async function solrFetch(core, endpoint, args) {
+async function apiGet(path, params) {
+  const url = apiUrl(path, params);
+  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`Gramene API HTTP ${r.status} on ${path}: ${txt || r.statusText}`);
+  }
+  return r.json();
+}
+
+// /search wraps the Solr genes core; it accepts standard Solr query params
+// (q, fq, fl, rows, start, sort, defType, facet.*, stats.*) and returns the
+// raw Solr response.
+async function searchFetch(args) {
   const {
     q,
     fq,
@@ -573,7 +572,7 @@ async function solrFetch(core, endpoint, args) {
   } = args || {};
 
   if (!q || typeof q !== "string") {
-    throw new Error(`Solr ${endpoint} requires a non-empty string 'q'`);
+    throw new Error("search requires a non-empty string 'q'");
   }
 
   // Classic Solr field faceting — expand the 'facet' convenience object into
@@ -626,13 +625,31 @@ async function solrFetch(core, endpoint, args) {
     }
   }
 
-  const url = solrUrl(core, endpoint, { q, fq, fl, rows, start, sort, defType, ...facetParams, ...statsParams });
-  const r = await fetch(url, { headers: { Accept: "application/json" } });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`Solr HTTP ${r.status}: ${txt || r.statusText}`);
+  return apiGet("/search", {
+    q, fq, fl, rows, start, sort, defType, wt: "json",
+    ...facetParams, ...statsParams,
+  });
+}
+
+// /suggest wraps the Solr suggestions core. Only q / fq / rows / start are
+// meaningful — the suggester applies its own field boosts and grouping. The
+// response is a Solr "grouped" envelope (grouped.category.groups[].doclist).
+async function suggestFetch({ q, fq, rows = 10, start = 0 } = {}) {
+  if (!q || typeof q !== "string") {
+    throw new Error("suggest requires a non-empty string 'q'");
   }
-  return r.json();
+  return apiGet("/suggest", { q, fq, rows, start });
+}
+
+// /<collection> endpoints translate query params into a MongoDB find on the
+// named collection. Supported params: q (text), idList, rows, start, fl
+// (returns only listed fields), taxon_id, db_type, subset, plus any other
+// query param becomes a top-level equality filter on the document.
+async function collectionFetch(collection, params) {
+  if (!COLLECTIONS.includes(collection)) {
+    throw new Error(`Unknown collection: ${collection}. Allowed: ${COLLECTIONS.join(", ")}`);
+  }
+  return apiGet(`/${collection}`, params || {});
 }
 
 function solrEscapeValue(v) {
@@ -641,28 +658,6 @@ function solrEscapeValue(v) {
   const s = String(v);
   const escaped = s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return `"${escaped}"`;
-}
-
-function solrEscapeTerm(term) {
-  // Escapes special Solr characters WITHOUT quoting, so the result can be
-  // used in field:value and field:value* (wildcard) query clauses.
-  return String(term).replace(/[+\-&|!(){}[\]^"~*?:\\/]/g, "\\$&");
-}
-
-// Build the standard Gramene suggest boost query for a search term.
-// Matches the live query pattern used at data.sorghumbase.org:
-//   {!boost b=relevance}name:<t>^5 ids:<t>^5 ids:<t>*^3 synonym:<t>^3 synonym:<t>*^2 text:<t>*^1
-function buildSuggestQuery(term) {
-  const t = solrEscapeTerm(term);
-  return (
-    `{!boost b=relevance}` +
-    `name:${t}^5 ` +
-    `ids:${t}^5 ` +
-    `ids:${t}*^3 ` +
-    `synonym:${t}^3 ` +
-    `synonym:${t}*^2 ` +
-    `text:${t}*^1`
-  );
 }
 
 function compileBoolFilter(node) {
@@ -692,20 +687,71 @@ function compileBoolFilter(node) {
   return `(${compiled.join(` ${op} `)})`;
 }
 
-// --- MongoDB safety ---
-const BLOCKED_MONGO_OPS = new Set(["$where", "$accumulator", "$function"]);
+// --- mongo_find filter translation ---
+//
+// The public API's /<collection> endpoints only support id-based lookup
+// (`idList=…`) and top-level field-equality filters (each extra query param
+// becomes an equality predicate; arrays become $in). Anything richer — $gt,
+// $lt, $regex, $where, $and, $or, dotted paths — is not supported.
+//
+// translateFilterToParams() converts a *restricted* MongoDB-style filter into
+// the API's query-param shape, and throws on anything the API can't express.
 
-function sanitizeFilter(obj) {
-  if (obj === null || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(sanitizeFilter);
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (BLOCKED_MONGO_OPS.has(k)) {
-      throw new Error(`Operator '${k}' is not allowed in filters`);
-    }
-    out[k] = sanitizeFilter(v);
+const REJECTED_FILTER_OPS = [
+  "$where", "$accumulator", "$function",
+  "$and", "$or", "$nor", "$not",
+  "$gt", "$gte", "$lt", "$lte", "$ne", "$exists",
+  "$regex", "$text", "$expr", "$type", "$mod", "$all", "$elemMatch", "$size",
+];
+
+function translateFilterToParams(filter) {
+  if (filter === null || filter === undefined) return {};
+  if (typeof filter !== "object" || Array.isArray(filter)) {
+    throw new Error("filter must be a plain object");
   }
-  return out;
+  const params = {};
+  for (const [key, value] of Object.entries(filter)) {
+    if (REJECTED_FILTER_OPS.includes(key)) {
+      throw new Error(`Operator '${key}' is not supported by the Gramene REST API`);
+    }
+    if (key.startsWith("$")) {
+      throw new Error(`Operator '${key}' is not supported by the Gramene REST API`);
+    }
+    if (key.includes(".")) {
+      throw new Error(`Dotted path '${key}' is not supported by the Gramene REST API`);
+    }
+    if (key === "_id") {
+      params.idList = translateIdClause(value);
+      continue;
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      // Only {$in: [...]} is allowed inside a value.
+      const keys = Object.keys(value);
+      if (keys.length === 1 && keys[0] === "$in" && Array.isArray(value.$in)) {
+        params[key] = value.$in.map(String);
+        continue;
+      }
+      for (const k of keys) {
+        if (REJECTED_FILTER_OPS.includes(k) || k.startsWith("$")) {
+          throw new Error(`Operator '${k}' on field '${key}' is not supported by the Gramene REST API`);
+        }
+      }
+      throw new Error(`Nested object filter on '${key}' is not supported by the Gramene REST API`);
+    }
+    params[key] = String(value);
+  }
+  return params;
+}
+
+function translateIdClause(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const keys = Object.keys(value);
+    if (keys.length === 1 && keys[0] === "$in" && Array.isArray(value.$in)) {
+      return value.$in.map(String);
+    }
+    throw new Error("_id supports only direct equality or {$in: [...]}");
+  }
+  return [String(value)];
 }
 
 // Compile a Solr {!graph} local-params query string from structured inputs.
@@ -753,7 +799,7 @@ async function tool_genes_in_region(args) {
   // NCBI×1000+suffix encoding required by the Solr `taxon_id` field.
   if (taxon_id !== undefined) fq.push(`taxonomy__ancestors:${Number(taxon_id)}`);
   if (mapFilter) fq.push(`map:${solrEscapeValue(mapFilter)}`);
-  return solrFetch(SOLR_GENES_CORE, "select", { q, fq, fl, rows, sort });
+  return searchFetch({ q, fq, fl, rows, sort });
 }
 
 // Solr field names encode experiment IDs by replacing each '-' with '_':
@@ -855,97 +901,47 @@ async function tool_expression_for_genes(args) {
   const wantBaseline     = !experiment_type || experiment_type === "Baseline";
   const wantDifferential = !experiment_type || experiment_type === "Differential";
 
-  // 1. Determine the experiments allowed by the type/taxon filters from cache.
-  const allowedExperiments = new Set();
-  for (const exp of cacheValues("experiments")) {
-    if (experiment_type && exp.type !== experiment_type) continue;
-    if (taxon_id !== undefined && Number(exp.taxon_id) !== Number(taxon_id)) continue;
-    allowedExperiments.add(exp._id);
-  }
-
-  // 2. PO term expansion against the cached PO ontology. If callers passed PO
-  //    ints, expand to ancestors so the row-level filter below treats both the
-  //    requested terms and their ancestors as "matching tissues".
-  const poInfo = { requested: null, expanded: false, ancestors_used: [] };
-  let allowedPoIds = null;            // null = no PO filter
-  let strictPoIds  = null;            // user-requested ints only (without ancestors)
-  if (po_terms && po_terms.length > 0) {
-    strictPoIds  = new Set(po_terms.map(Number));
-    poInfo.requested = [...strictPoIds];
-    allowedPoIds = new Set(strictPoIds);
-    // We always include ancestors up-front so the per-row filter is single-pass;
-    // poInfo.expanded gets flipped below if no row matched the strict set.
-    for (const id of strictPoIds) {
-      const poDoc = cacheGet("PO", id);
-      if (Array.isArray(poDoc?.ancestors)) {
-        for (const a of poDoc.ancestors) if (!strictPoIds.has(a)) {
-          allowedPoIds.add(a);
-          poInfo.ancestors_used.push(a);
-        }
-      }
-    }
-  }
-
-  // 3. Build the Solr fl wildcard list according to which experiment types are
-  //    requested, then fetch the gene docs in a single round-trip.
+  // 1. Fetch gene docs from /search with the expression fields included.
   const flParts = ["id", "name", "description", "expressed_in_gxa_attr_ss"];
   if (wantBaseline)     flParts.push("*__expr");
   if (wantDifferential) flParts.push("*_l2fc_attr_f", "*_pval_attr_f");
-  const idQuery = `id:(${gene_ids.join(" OR ")})`;
-  const solrResp = await solrFetch(SOLR_GENES_CORE, "query", {
-    q: idQuery,
-    fq: ["capabilities:expression"],
+  // The public API's default /search parser ignores Lucene operators in q,
+  // so put the multi-id OR clause in fq (which is parsed as raw lucene).
+  const idClause = `id:(${gene_ids.join(" OR ")})`;
+  const solrResp = await searchFetch({
+    q: "*:*",
+    fq: [idClause, "capabilities:expression"],
     fl: flParts.join(","),
     rows: gene_ids.length,
-    defType: "lucene",
   });
   const docs = solrResp?.response?.docs || [];
 
-  // 4. Walk each gene doc, parse expression field names, join with cached
-  //    experiment + assay metadata.
-  const genes = {};
-  let strictMatchedAny = false;       // tracks whether any baseline OR differential row passed the strict PO filter
+  // 2. Collect referenced experiment + assay IDs from the gene docs so we can
+  //    fetch their metadata from /experiments and /assays in batches.
+  const expIds = new Set();
+  const assayIds = new Set();
+  const baselineRefs = []; // [{doc, field, value, experiment, group}]
+  const diffRefsByDoc = new Map(); // doc → Map(key → {experiment, control_group, treatment_group, l2fc?, p_value?})
 
   for (const doc of docs) {
-    const baseline = [];
-    const differential = [];
-
-    // Baseline: one field per (experiment, group)
     if (wantBaseline) {
       for (const [field, value] of Object.entries(doc)) {
         if (!field.endsWith("__expr") || value == null) continue;
         const parsed = parseBaselineField(field);
         if (!parsed) continue;
-        if (!allowedExperiments.has(parsed.experiment)) continue;
-        const assay = cacheGet("assays", `${parsed.experiment}.${parsed.group}`);
-        const poIds = assayPoIds(assay);
-        if (allowedPoIds) {
-          let matched = false;
-          for (const id of poIds) if (allowedPoIds.has(id)) { matched = true; break; }
-          if (!matched) continue;
-          if (!strictMatchedAny) {
-            for (const id of poIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
-          }
-        }
-        const exp = cacheGet("experiments", parsed.experiment);
-        baseline.push({
-          experiment:      parsed.experiment,
-          experiment_name: exp?.name ?? null,
-          group:           parsed.group,
-          value,
-          tissue:          assayTissue(assay),
-          factors:         assay?.factor ?? [],
-        });
+        expIds.add(parsed.experiment);
+        assayIds.add(`${parsed.experiment}.${parsed.group}`);
+        baselineRefs.push({ doc, value, ...parsed });
       }
     }
-
-    // Differential: pair _l2fc with the matching _pval by stem identity
     if (wantDifferential) {
-      const contrasts = new Map();    // key: "<exp>__<cg>__<tg>"
+      const contrasts = new Map();
       for (const [field, value] of Object.entries(doc)) {
         const parsed = parseDifferentialField(field);
         if (!parsed || value == null) continue;
-        if (!allowedExperiments.has(parsed.experiment)) continue;
+        expIds.add(parsed.experiment);
+        assayIds.add(`${parsed.experiment}.${parsed.control_group}`);
+        assayIds.add(`${parsed.experiment}.${parsed.treatment_group}`);
         const key = `${parsed.experiment}__${parsed.control_group}__${parsed.treatment_group}`;
         const slot = contrasts.get(key) || {
           experiment:      parsed.experiment,
@@ -955,10 +951,93 @@ async function tool_expression_for_genes(args) {
         slot[parsed.metric] = value;
         contrasts.set(key, slot);
       }
-      for (const slot of contrasts.values()) {
-        const cAssay = cacheGet("assays", `${slot.experiment}.${slot.control_group}`);
-        const tAssay = cacheGet("assays", `${slot.experiment}.${slot.treatment_group}`);
-        // PO filter: either control or treatment assay must match an allowed PO id
+      if (contrasts.size > 0) diffRefsByDoc.set(doc, contrasts);
+    }
+  }
+
+  // 3. Fetch experiment + assay docs via the API.
+  const experimentDocs = expIds.size > 0
+    ? await fetchRefDocs("experiments", [...expIds])
+    : new Map();
+  const assayDocs = assayIds.size > 0
+    ? await fetchRefDocs("assays", [...assayIds])
+    : new Map();
+
+  // 4. Build the set of experiments allowed by the type / taxon filters.
+  const allowedExperiments = new Set();
+  for (const [id, exp] of experimentDocs) {
+    if (experiment_type && exp.type !== experiment_type) continue;
+    if (taxon_id !== undefined && Number(exp.taxon_id) !== Number(taxon_id)) continue;
+    allowedExperiments.add(id);
+  }
+
+  // 5. PO term expansion. If callers passed PO ints, fetch the corresponding
+  //    PO docs to discover ancestors, then treat the union as "matching".
+  const poInfo = { requested: null, expanded: false, ancestors_used: [] };
+  let allowedPoIds = null;
+  let strictPoIds  = null;
+  if (po_terms && po_terms.length > 0) {
+    strictPoIds  = new Set(po_terms.map(Number));
+    poInfo.requested = [...strictPoIds];
+    allowedPoIds = new Set(strictPoIds);
+    const poDocs = await fetchRefDocs("PO", [...strictPoIds]);
+    for (const id of strictPoIds) {
+      const poDoc = poDocs.get(id);
+      if (Array.isArray(poDoc?.ancestors)) {
+        for (const a of poDoc.ancestors) if (!strictPoIds.has(a)) {
+          allowedPoIds.add(a);
+          poInfo.ancestors_used.push(a);
+        }
+      }
+    }
+  }
+
+  // 6. Walk each gene doc, joining with the prefetched experiment + assay docs.
+  const genes = {};
+  let strictMatchedAny = false;
+
+  // Group baseline refs by doc for per-gene processing.
+  const baselineByDoc = new Map();
+  for (const ref of baselineRefs) {
+    if (!baselineByDoc.has(ref.doc)) baselineByDoc.set(ref.doc, []);
+    baselineByDoc.get(ref.doc).push(ref);
+  }
+
+  for (const doc of docs) {
+    const baseline = [];
+    const differential = [];
+
+    if (wantBaseline) {
+      for (const ref of baselineByDoc.get(doc) || []) {
+        if (!allowedExperiments.has(ref.experiment)) continue;
+        const assay = assayDocs.get(`${ref.experiment}.${ref.group}`);
+        const poIds = assayPoIds(assay);
+        if (allowedPoIds) {
+          let matched = false;
+          for (const id of poIds) if (allowedPoIds.has(id)) { matched = true; break; }
+          if (!matched) continue;
+          if (!strictMatchedAny) {
+            for (const id of poIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
+          }
+        }
+        const exp = experimentDocs.get(ref.experiment);
+        baseline.push({
+          experiment:      ref.experiment,
+          experiment_name: exp?.name ?? null,
+          group:           ref.group,
+          value:           ref.value,
+          tissue:          assayTissue(assay),
+          factors:         assay?.factor ?? [],
+        });
+      }
+    }
+
+    if (wantDifferential) {
+      const contrasts = diffRefsByDoc.get(doc);
+      if (contrasts) for (const slot of contrasts.values()) {
+        if (!allowedExperiments.has(slot.experiment)) continue;
+        const cAssay = assayDocs.get(`${slot.experiment}.${slot.control_group}`);
+        const tAssay = assayDocs.get(`${slot.experiment}.${slot.treatment_group}`);
         if (allowedPoIds) {
           const cIds = assayPoIds(cAssay);
           const tIds = assayPoIds(tAssay);
@@ -971,7 +1050,7 @@ async function tool_expression_for_genes(args) {
             if (!strictMatchedAny) for (const id of tIds) if (strictPoIds.has(id)) { strictMatchedAny = true; break; }
           }
         }
-        const exp = cacheGet("experiments", slot.experiment);
+        const exp = experimentDocs.get(slot.experiment);
         const { contrast, shared } = diffAssayFactors(cAssay, tAssay);
         differential.push({
           experiment:      slot.experiment,
@@ -1113,19 +1192,19 @@ async function tool_vep_for_gene(args) {
     throw new Error("vep_for_gene: max 50 gene_ids per call");
   }
 
-  // 1. Fetch VEP__ dynamic fields from Solr
-  const q = gene_ids.length === 1
-    ? `id:${gene_ids[0]}`
-    : `id:(${gene_ids.join(" OR ")})`;
-  const solrResp = await solrFetch(SOLR_GENES_CORE, "select", {
-    q,
+  // 1. Fetch VEP__ dynamic fields from /search
+  // The API's default q-parser doesn't honor Lucene OR; put the id clause in fq.
+  const idClause = `id:(${gene_ids.join(" OR ")})`;
+  const solrResp = await searchFetch({
+    q: "*:*",
+    fq: [idClause],
     fl: "id,VEP__*",
     rows: gene_ids.length,
   });
 
   const solrDocs = solrResp?.response?.docs ?? [];
 
-  // 2. Collect all germplasm ens_ids across all genes (for MongoDB lookup)
+  // 2. Collect all germplasm ens_ids referenced across genes.
   const allEnsIds = new Set();
   for (const doc of solrDocs) {
     for (const [field, values] of Object.entries(doc)) {
@@ -1135,16 +1214,11 @@ async function tool_vep_for_gene(args) {
     }
   }
 
-  // 3. Look up germplasm metadata from MongoDB (if any IDs found)
-  let germplasmMap = {};  // ens_id → germplasm doc
+  // 3. Look up germplasm metadata via the API.
+  let germplasmMap = {};
   if (allEnsIds.size > 0 && include_germplasm_details) {
-    const d = db();
-    const germDocs = await d.collection("germplasm")
-      .find({ _id: { $in: [...allEnsIds] } })
-      .toArray();
-    for (const g of germDocs) {
-      germplasmMap[g._id] = g;
-    }
+    const germDocs = await fetchRefDocs("germplasm", [...allEnsIds]);
+    for (const [id, g] of germDocs) germplasmMap[id] = g;
   }
 
   // 4. Build structured result per gene
@@ -1242,14 +1316,14 @@ async function tool_pubmed_for_genes(args) {
     throw Object.assign(new Error("gene_ids limited to 500"), { code: -32602 });
   }
 
-  // Fetch PUBMED__xrefs from Solr, restricted to genes flagged with publications.
-  const idList = gene_ids.join(" OR ");
-  const solrResult = await solrFetch(SOLR_GENES_CORE, "query", {
-    q: `id:(${idList})`,
-    fq: ["capabilities:pubs"],
+  // Fetch PUBMED__xrefs from /search, restricted to genes flagged with publications.
+  // The API's default q-parser doesn't honor Lucene OR; put the id clause in fq.
+  const idClause = `id:(${gene_ids.join(" OR ")})`;
+  const solrResult = await searchFetch({
+    q: "*:*",
+    fq: [idClause, "capabilities:pubs"],
     fl: "id,name,description,PUBMED__xrefs",
     rows: gene_ids.length,
-    defType: "lucene",
   });
   const docs = solrResult?.response?.docs || [];
 
@@ -1301,16 +1375,17 @@ async function tool_pubmed_for_genes(args) {
 }
 
 async function tool_solr_search(args) {
-  return solrFetch(SOLR_GENES_CORE, "query", args);
+  return searchFetch(args);
 }
 
 async function tool_solr_suggest(args) {
-  const { term, q, fq, fl, rows = 10, start = 0, sort } = args || {};
-  // 'term' auto-builds the standard Gramene boosted query across name/ids/synonym/text.
-  // 'q' allows a raw Solr query string for advanced use. 'term' takes precedence.
-  const query = term ? buildSuggestQuery(term) : q;
+  const { term, q, fq, rows = 10, start = 0 } = args || {};
+  // The API's /suggest endpoint applies its own field boosts. Pass either
+  // 'term' (free text) or 'q' (a raw query — useful for `name:"…"` lookups).
+  // 'term' takes precedence if both are provided.
+  const query = term || q;
   if (!query) throw new Error("solr_suggest requires 'term' or 'q'");
-  return solrFetch(SOLR_SUGGESTIONS_CORE, "select", { q: query, fq, fl, rows, start, sort });
+  return suggestFetch({ q: query, fq, rows, start });
 }
 
 async function tool_solr_search_bool(args) {
@@ -1329,7 +1404,7 @@ async function tool_solr_search_bool(args) {
   if (filter) fq.push(compileBoolFilter(filter));
   if (Array.isArray(extra_fq)) fq.push(...extra_fq);
 
-  return solrFetch(SOLR_GENES_CORE, "select", {
+  return searchFetch({
     q, fq: fq.length ? fq : undefined, fl, rows, start, sort, defType,
   });
 }
@@ -1349,14 +1424,16 @@ async function tool_solr_graph(args) {
   } = args || {};
 
   const q = compileGraphQuery(from, to, seed_q, { traversalFilter, returnRoot });
-  return solrFetch(SOLR_GENES_CORE, "select", { q, fq, fl, rows, start, sort });
+  return searchFetch({ q, fq, fl, rows, start, sort });
 }
 
-async function tool_mongo_list_collections(args) {
-  const { nameOnly = true } = args || {};
-  const d = db();
-  const items = await d.listCollections({}, { nameOnly: !!nameOnly }).toArray();
-  return { count: items.length, collections: items };
+async function tool_mongo_list_collections() {
+  // The public API exposes a fixed enum of collections — return it as a list
+  // of name-only entries (compatible with the historical mongo shape).
+  return {
+    count: COLLECTIONS.length,
+    collections: COLLECTIONS.map((name) => ({ name })),
+  };
 }
 
 async function tool_mongo_find(args) {
@@ -1364,7 +1441,6 @@ async function tool_mongo_find(args) {
     collection,
     filter = {},
     projection,
-    sort,
     limit = 50,
     skip = 0,
   } = args || {};
@@ -1372,35 +1448,60 @@ async function tool_mongo_find(args) {
   if (!collection || typeof collection !== "string") {
     throw new Error("mongo_find requires string 'collection'");
   }
-  if (typeof filter !== "object" || filter === null) {
+  if (typeof filter !== "object" || filter === null || Array.isArray(filter)) {
     throw new Error("'filter' must be an object");
   }
 
-  const safeFilter = sanitizeFilter(filter);
-  const d = db();
-  let cursor = d.collection(collection).find(
-    safeFilter,
-    projection ? { projection } : undefined
-  );
-  if (sort) cursor = cursor.sort(sort);
-  cursor = cursor.skip(skip).limit(Math.min(Math.max(limit, 0), 1000));
+  // 'sort' was previously accepted; the public API doesn't expose sorting, so
+  // we ignore it silently rather than fail (sort isn't critical for any current
+  // workflow).
+  const params = translateFilterToParams(filter);
+  const fl = projectionToFl(projection);
+  if (fl) params.fl = fl;
+  params.rows = Math.min(Math.max(limit, 0), 1000);
+  if (skip) params.start = skip;
 
-  const docs = await cursor.toArray();
-  return { count: docs.length, docs };
+  const docs = await collectionFetch(collection, params);
+  const arr = Array.isArray(docs) ? docs : [];
+  // Honor projection: { _id: 0 } → strip _id from each doc. The API's `fl`
+  // already excludes _id when an fl list is set; this catches the case where
+  // the caller only specified { _id: 0 } with no positive fields.
+  if (projection && projection._id === 0) {
+    for (const d of arr) delete d._id;
+  }
+  return { count: arr.length, docs: arr };
 }
 
 async function tool_mongo_lookup_by_ids(args) {
   const { collection, ids, projection } = args || {};
   if (!collection) throw new Error("collection required");
   if (!Array.isArray(ids)) throw new Error("ids must be an array");
+  if (ids.length === 0) return { count: 0, docs: [] };
 
-  const numIds = ids.map((x) => Number(x)).filter((n) => Number.isFinite(n));
-  const d = db();
-  const docs = await d.collection(collection)
-    .find({ _id: { $in: numIds } }, projection ? { projection } : undefined)
-    .toArray();
+  const params = {
+    idList: ids.map(String),
+    rows: ids.length,
+  };
+  const fl = projectionToFl(projection);
+  if (fl) params.fl = fl;
 
-  return { count: docs.length, docs };
+  const docs = await collectionFetch(collection, params);
+  const arr = Array.isArray(docs) ? docs : [];
+  if (projection && projection._id === 0) {
+    for (const d of arr) delete d._id;
+  }
+  return { count: arr.length, docs: arr };
+}
+
+// Translate a MongoDB-style projection ({ field: 1, ... }) into the API's
+// `fl` (comma-separated field list). Returns null for an empty / exclusion-only
+// projection so the API can return all fields.
+function projectionToFl(projection) {
+  if (!projection || typeof projection !== "object") return null;
+  const include = Object.entries(projection)
+    .filter(([k, v]) => v === 1 || v === true)
+    .map(([k]) => k);
+  return include.length > 0 ? include.join(",") : null;
 }
 
 // --- Tool registry (definition + handler in one place) ---
@@ -1501,7 +1602,8 @@ const TOOL_REGISTRY = {
     definition: {
       name: "solr_search",
       description: [
-        `Query the Solr genes core (${SOLR_GENES_CORE}) via /query endpoint. Returns matching gene documents.`,
+        `Query the Gramene search index (the public /search endpoint, which wraps the genes Solr core).`,
+        `Returns matching gene documents in standard Solr response shape.`,
         `Supports field faceting (flat) and pivot faceting (nested) via the 'facet' parameter.`,
         `Use rows:0 with facets to get counts without fetching documents.`,
         ``,
@@ -1514,7 +1616,7 @@ const TOOL_REGISTRY = {
         ``,
         `Useful field reference:`,
         `  expressed_in_gxa_attr_ss — array of GXA experiment accessions for the gene; joinable`,
-        `    to the MongoDB experiments and assays collections.`,
+        `    to the /experiments and /assays collection endpoints.`,
         `  PUBMED__xrefs              — PubMed cross-references (use pubmed_for_genes to resolve).`,
         `  homology__ortholog_one2one / homology__all_orthologs — see orthologs_paralogs prompt.`,
         `  QTL_TO__ancestors          — QTL _ids (joinable to mongo qtls collection) for which`,
@@ -1549,11 +1651,13 @@ const TOOL_REGISTRY = {
         `concrete fq_field + fq_value that plugs straight into solr_search. Reserve mongo_find for`,
         `fetching detail records once you already have a specific ID.`,
         ``,
-        `Searches the suggestions core (${SOLR_SUGGESTIONS_CORE}) via /suggest. Pass 'term' for a`,
-        `fuzzy multi-field search (auto-builds the boosted query):`,
-        `  {!boost b=relevance}name:<t>^5 ids:<t>^5 ids:<t>*^3 synonym:<t>^3 synonym:<t>*^2 text:<t>*^1`,
-        `Each result carries fq_field, fq_value, and num_genes (the size of the gene set that`,
-        `filter would yield). Pass 'q' instead of 'term' to supply a raw Solr query.`,
+        `Calls the public /suggest endpoint, which applies its own field boosts (name, ids, synonym,`,
+        `text) and groups matches by category. Pass 'term' for a free-text query, or 'q' for a`,
+        `field-qualified Solr query (e.g. 'name:"Sorghum bicolor"'). 'term' takes precedence.`,
+        ``,
+        `Response shape: Solr "grouped" envelope — data.grouped.category.groups[].doclist.docs[].`,
+        `Each suggestion doc carries fq_field, fq_value, num_genes (the size of the gene set that`,
+        `filter would yield), category, display_name, and a relevance score.`,
         ``,
         `Choosing between results:`,
         `  - Single specific gene → highest-ranked result with fq_field=id.`,
@@ -1578,13 +1682,11 @@ const TOOL_REGISTRY = {
       inputSchema: {
         type: "object",
         properties: {
-          term: { type: "string", description: "Search term — auto-builds the boosted query across name, ids, synonym, text fields." },
-          q:    { type: "string", description: "Raw Solr query string (overridden by 'term' if both are provided)." },
-          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings." },
-          fl:   { type: "string", description: "Comma-separated field list to return." },
+          term: { type: "string", description: "Free-text search term — handed verbatim to the API's boosted suggester." },
+          q:    { type: "string", description: "Field-qualified Solr query (e.g. 'name:\"Sorghum bicolor\"'). Overridden by 'term' if both are provided." },
+          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:Trait Ontology'])." },
           rows: { type: "integer", minimum: 0, maximum: 1000, description: "Max results to return (default 10)." },
           start: { type: "integer", minimum: 0, description: "Offset for pagination." },
-          sort:  { type: "string" },
         },
       },
     },
@@ -1617,25 +1719,38 @@ const TOOL_REGISTRY = {
     definition: {
       name: "mongo_find",
       description: [
-        "Fetch detailed records from a MongoDB collection by a known identifier or a small structured filter.",
-        "Use this AFTER you already have a specific ID — typically resolved via solr_suggest first.",
-        "Do NOT use mongo_find to discover IDs from free text; that's solr_suggest's job.",
+        "Fetch detailed records from a Gramene collection (genes, taxonomy, GO, PO, TO, qtls, maps,",
+        "germplasm, experiments, assays, expression, pathways, domains, genetrees) by ID or by",
+        "simple field-equality filters. Use AFTER you already have a specific ID — typically",
+        "resolved via solr_suggest first. Do NOT use mongo_find for free-text discovery; that's",
+        "solr_suggest's job.",
+        "",
+        "Supported filter shapes (mapped to the public API's /<collection> endpoint):",
+        "  { _id: <id> }                       → idList=<id>",
+        "  { _id: { $in: [a, b, c] } }         → idList=a,b,c",
+        "  { field: <value> }                   → field=<value>     (top-level equality)",
+        "  { field: { $in: [v1, v2] } }         → field=v1&field=v2 ($in over a single field)",
+        "  Combinations: { _id: …, field1: …, field2: { $in: […] } }   → ANDed together",
+        "",
+        "NOT supported (operators that the public REST API does not expose):",
+        "  $gt, $gte, $lt, $lte, $ne, $exists, $regex, $where, $expr, $and, $or, $nor, $not,",
+        "  dotted-path keys, nested filters beyond a single $in.",
+        "For those cases use solr_search (which exposes Solr fq range/regex syntax on the genes",
+        "index) instead.",
         "",
         "Common patterns:",
-        "  - QTLs for a Trait Ontology term: filter:{ terms: <TO_id> } on 'qtls'",
-        "  - Experiment metadata: filter:{ _id: { $in: [<exp_ids>] } } on 'experiments' or 'assays'",
         "  - Genome assembly metadata (Compara membership): filter:{ in_compara: true } on 'maps'",
         "  - Ontology term lookup by ID: prefer mongo_lookup_by_ids over an ad-hoc find().",
+        "  - Experiment metadata: filter:{ _id: { $in: [<exp_ids>] } } on 'experiments' or 'assays'",
         "",
         "Filter parameter is `filter` (NOT `query`). Passing `query: {...}` is silently ignored.",
       ].join("\n"),
       inputSchema: {
         type: "object",
         properties: {
-          collection: { type: "string" },
-          filter: { type: "object", description: "MongoDB query filter (default: {})" },
-          projection: { type: "object", description: "Fields to include/exclude" },
-          sort: { type: "object", description: "Sort specification, e.g. { name: 1 }" },
+          collection: { type: "string", enum: COLLECTIONS },
+          filter: { type: "object", description: "Restricted MongoDB-style filter (see description)" },
+          projection: { type: "object", description: "Inclusion projection ({ field: 1, ... }). Exclusion of fields other than _id is not supported." },
           limit: { type: "integer", minimum: 0, maximum: 1000, description: "Max docs (default 50, max 1000)" },
           skip: { type: "integer", minimum: 0 },
         },
@@ -1647,11 +1762,11 @@ const TOOL_REGISTRY = {
   mongo_list_collections: {
     definition: {
       name: "mongo_list_collections",
-      description: "List all MongoDB collections in the configured database.",
+      description: "List all Gramene collections reachable via the public /<collection> API endpoints.",
       inputSchema: {
         type: "object",
         properties: {
-          nameOnly: { type: "boolean", description: "Return only collection names (default: true)" },
+          nameOnly: { type: "boolean", description: "Kept for compatibility — the API always returns name-only entries." },
         },
       },
     },
@@ -1660,13 +1775,13 @@ const TOOL_REGISTRY = {
   mongo_lookup_by_ids: {
     definition: {
       name: "mongo_lookup_by_ids",
-      description: "Fetch documents by numeric _id from a MongoDB collection. Useful for resolving Solr ancestor IDs to their labels.",
+      description: "Fetch documents by _id from a Gramene collection. Useful for resolving search-index ancestor IDs to their labels.",
       inputSchema: {
         type: "object",
         properties: {
-          collection: { type: "string" },
-          ids: { type: "array", items: { type: "number" }, description: "Array of numeric _id values" },
-          projection: { type: "object" },
+          collection: { type: "string", enum: COLLECTIONS },
+          ids: { type: "array", items: { type: ["number", "string"] }, description: "Array of _id values (numbers for ontology collections, strings for genes/maps/etc.)" },
+          projection: { type: "object", description: "Inclusion projection ({ field: 1, ... })." },
         },
         required: ["collection", "ids"],
       },
@@ -1734,7 +1849,7 @@ const TOOL_REGISTRY = {
   kb_relations: {
     definition: {
       name: "kb_relations",
-      description: "Return Solr↔MongoDB relationship metadata describing how Solr fields map to MongoDB collections (field crosswalks).",
+      description: "Return field-crosswalk metadata describing how search-index fields map to collection endpoints (which fields you can fq-filter on, and which collection holds the joined document).",
       inputSchema: { type: "object", properties: {} },
     },
     handler: () => KB_RELATIONS,
@@ -1779,10 +1894,10 @@ const TOOL_REGISTRY = {
     definition: {
       name: "expression_for_genes",
       description: [
-        `Retrieve baseline and differential expression for a list of gene IDs in a single`,
-        `Solr round-trip. Reads the encoded expression fields directly from the genes core`,
-        `(*__expr, *_l2fc_attr_f, *_pval_attr_f) and joins with cached experiment + assay`,
-        `metadata; no MongoDB query is needed per call.`,
+        `Retrieve baseline and differential expression for a list of gene IDs. Reads the encoded`,
+        `expression fields from the gene documents (*__expr, *_l2fc_attr_f, *_pval_attr_f) via`,
+        `the /search endpoint, then joins with experiment + assay metadata fetched on demand from`,
+        `the /experiments and /assays collection endpoints (memoized per-process).`,
         ``,
         `Per-gene response shape:`,
         `  experiments_with_data — string[] of GXA experiment accessions covering this gene`,
@@ -1856,9 +1971,9 @@ const TOOL_REGISTRY = {
       description: [
         `Retrieve predicted loss-of-function (LOF) germplasm alleles for one or more genes.`,
         ``,
-        `Uses Ensembl VEP (Variant Effect Prediction) annotations indexed in Solr dynamic`,
-        `fields (VEP__*). For each gene, returns germplasm accessions that carry predicted`,
-        `high-impact variants grouped by:`,
+        `Uses Ensembl VEP (Variant Effect Prediction) annotations indexed as dynamic fields`,
+        `(VEP__*) on the gene documents. For each gene, returns germplasm accessions that`,
+        `carry predicted high-impact variants grouped by:`,
         `  - VEP consequence (e.g. 'stop gained', 'splice acceptor variant')`,
         `  - Zygosity (homozygous / heterozygous)`,
         `  - Study/population (e.g. 'Sorghum Genomics Toolbox', 'Boatwright SAP', 'Purdue EMS')`,
@@ -1867,7 +1982,7 @@ const TOOL_REGISTRY = {
         `Also returns the merged EMS and NAT totals from VEP__merged__EMS/NAT__attr_ss.`,
         ``,
         `Germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) is enriched`,
-        `from the MongoDB 'germplasm' collection when available.`,
+        `from the /germplasm collection endpoint when available.`,
         ``,
         `Use cases:`,
         `  - "Which accessions have a predicted stop-gained in SORBI_3006G095600?"`,
@@ -1884,7 +1999,7 @@ const TOOL_REGISTRY = {
           },
           include_germplasm_details: {
             type: "boolean",
-            description: "Whether to enrich accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from MongoDB. Default true. Set false for a count-only summary.",
+            description: "Whether to enrich accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from the /germplasm endpoint. Default true. Set false for a count-only summary.",
           },
         },
         required: ["gene_ids"],
@@ -1897,7 +2012,7 @@ const TOOL_REGISTRY = {
     definition: {
       name: "pubmed_for_genes",
       description: [
-        "Return PubMed and DOI cross-references for a list of genes from the Solr genes index.",
+        "Return PubMed and DOI cross-references for a list of genes from the Gramene search index.",
         "Per gene the response carries `pmids` (numeric PubMed IDs as strings) and `dois`",
         "(DOI strings, stripped of the 'DOI:' prefix); only genes flagged with",
         "`capabilities:pubs` carry references.",
@@ -3306,27 +3421,15 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Eagerly load the metadata cache before the server starts accepting
-// connections. This keeps first-call latency predictable and avoids racing
-// tool calls against a half-populated cache.
-try {
-  console.error("Loading metadata cache…");
-  await initMetadataCache();
-  startCacheRefresh();
-} catch (err) {
-  console.error(`Metadata cache load failed: ${err?.message || err}`);
-  process.exit(1);
-}
-
 server.listen(PORT, HOST, () => {
   console.error(`Gramene MCP server listening on http://${HOST}:${PORT}/mcp`);
+  console.error(`Backed by Gramene REST API at ${GRAMENE_API_BASE}`);
 });
 
 // Graceful shutdown
-async function shutdown() {
+function shutdown() {
   console.error("Shutting down…");
   server.close();
-  await mongoClient.close();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

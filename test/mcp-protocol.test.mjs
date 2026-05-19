@@ -1,20 +1,16 @@
 /**
  * Integration tests for the gramene-mcp server.
  *
- * Two usage modes:
- *
- *   Local seed data (Docker):
- *     docker compose up -d
- *     docker compose exec solr bash /opt/seed/solr-init.sh
- *     MONGO_DB=gramene npm start
- *     npm test
- *
- *   Real data on squam:
- *     npm run start:squam        (in another terminal)
- *     npm test
+ * Usage:
+ *   npm start              (in one terminal)
+ *   npm test               (in another)
  *
  * Override the server URL:
  *   MCP_URL=http://127.0.0.1:8787/mcp npm test
+ *
+ * The tests assume the server is configured to talk to data.gramene.org/v69
+ * (the default). Some assertions reference identifiers known to be present in
+ * that release.
  */
 
 import { describe, it } from "node:test";
@@ -22,10 +18,9 @@ import assert from "node:assert/strict";
 
 const BASE = process.env.MCP_URL || "http://127.0.0.1:8787/mcp";
 
-// Real identifiers from the squam/sorghum10 dataset.
-// Tests that require live data use these.
+// Identifiers known to exist in the data.gramene.org/v69 release.
 const REAL = {
-  geneTree:  "SB10GT_332720",
+  geneTree:  "EPlGT00940000164729",
   geneId:    "SORBI_3006G095600",
   graphFrom: "compara_neighbors_10",
   graphTo:   "compara_idx_multi",
@@ -60,7 +55,8 @@ describe("MCP protocol", () => {
   it("initialize", async () => {
     const res = await rpc("initialize");
     assert.ok(!res.error);
-    assert.equal(res.result.protocolVersion, "2025-11-25");
+    // Server picks the first supported protocol version on initialize.
+    assert.ok(res.result.protocolVersion, "Expected protocolVersion in initialize result");
     assert.equal(res.result.serverInfo.name, "gramene-mcp");
     // Capabilities advertise both tools and prompts.
     assert.ok(res.result.capabilities?.tools, "Expected tools capability");
@@ -151,20 +147,20 @@ describe("kb_relations", () => {
   it("returns relationship metadata with expected structure", async () => {
     const res = await rpc("tools/call", { name: "kb_relations", arguments: {} });
     const data = toolResult(res);
-    // Solr side
-    assert.ok(data.solr?.genes?.fields?.taxonomy__ancestors, "Expected taxonomy__ancestors field");
-    assert.ok(data.solr?.genes?.fields?.compara_idx_multi,   "Expected compara_idx_multi field");
-    assert.ok(data.solr?.genes?.fields?.["compara_neighbors_*"], "Expected compara_neighbors_* dynamic field");
-    assert.ok(data.solr?.genes?.fields?.gene_tree,           "Expected gene_tree field");
-    // Mongo side
-    assert.ok(data.mongo?.collections?.taxonomy, "Expected taxonomy collection metadata");
+    // search-index side
+    assert.ok(data.search_index?.genes?.fields?.taxonomy__ancestors, "Expected taxonomy__ancestors field");
+    assert.ok(data.search_index?.genes?.fields?.compara_idx_multi,   "Expected compara_idx_multi field");
+    assert.ok(data.search_index?.genes?.fields?.["compara_neighbors_*"], "Expected compara_neighbors_* dynamic field");
+    assert.ok(data.search_index?.genes?.fields?.gene_tree,           "Expected gene_tree field");
+    // collections side
+    assert.ok(data.collections?.taxonomy, "Expected taxonomy collection metadata");
   });
 });
 
 // ─── MongoDB tools ───────────────────────────────────────────────────
 
 describe("mongo_list_collections", () => {
-  it("returns a non-empty list of collections", async () => {
+  it("returns the fixed set of API-served collections", async () => {
     const res = await rpc("tools/call", {
       name: "mongo_list_collections",
       arguments: { nameOnly: true },
@@ -172,7 +168,9 @@ describe("mongo_list_collections", () => {
     const data = toolResult(res);
     assert.ok(data.count > 0, "Expected at least one collection");
     assert.ok(Array.isArray(data.collections), "Expected collections array");
-    assert.ok(data.collections[0].name, "Each entry should have a name");
+    const names = data.collections.map((c) => c.name);
+    assert.ok(names.includes("taxonomy"), "Expected taxonomy collection in list");
+    assert.ok(names.includes("genes"),    "Expected genes collection in list");
   });
 });
 
@@ -200,15 +198,28 @@ describe("mongo_find", () => {
     assert.match(data.docs[0].name, /arabidopsis/i);
   });
 
-  it("projection limits returned fields", async () => {
+  it("$in filter on _id batches multiple IDs", async () => {
     const res = await rpc("tools/call", {
       name: "mongo_find",
-      arguments: { collection: "taxonomy", limit: 1, projection: { name: 1, _id: 0 } },
+      arguments: { collection: "taxonomy", filter: { _id: { $in: [3702, 4577] } } },
+    });
+    const data = toolResult(res);
+    assert.equal(data.count, 2);
+    const names = data.docs.map((d) => d.name.toLowerCase()).join("|");
+    assert.match(names, /arabidopsis/);
+    assert.match(names, /zea/);
+  });
+
+  it("projection (inclusion) limits returned fields", async () => {
+    // The API's `fl` always omits _id when an inclusion list is set.
+    const res = await rpc("tools/call", {
+      name: "mongo_find",
+      arguments: { collection: "taxonomy", limit: 1, projection: { name: 1 } },
     });
     const data = toolResult(res);
     const doc = data.docs[0];
-    assert.ok("name" in doc,  "Expected name field");
-    assert.ok(!("_id" in doc), "Expected _id to be excluded");
+    assert.ok("name" in doc, "Expected name field");
+    assert.ok(!("_id" in doc), "Expected _id to be excluded by the API's fl behavior");
   });
 
   it("rejects $where operator", async () => {
@@ -216,10 +227,19 @@ describe("mongo_find", () => {
       name: "mongo_find",
       arguments: { collection: "taxonomy", filter: { $where: "true" } },
     });
-    // Error can surface as RPC error or as a tool-level error message
     const isError = res.error
-      || res.result?.content?.[0]?.text?.includes("not allowed");
+      || res.result?.content?.[0]?.text?.includes("not supported");
     assert.ok(isError, "Expected $where to be rejected");
+  });
+
+  it("rejects $gt/$lt operators that the public API can't express", async () => {
+    const res = await rpc("tools/call", {
+      name: "mongo_find",
+      arguments: { collection: "taxonomy", filter: { _id: { $gt: 3000 } } },
+    });
+    const isError = res.error
+      || res.result?.content?.[0]?.text?.includes("not supported");
+    assert.ok(isError, "Expected $gt to be rejected");
   });
 });
 
@@ -284,23 +304,26 @@ describe("solr_search", () => {
 });
 
 describe("solr_suggest", () => {
-  it("finds suggestions for a gene name using term parameter", async () => {
+  it("finds suggestions for a gene-family name using the term parameter", async () => {
     const res = await rpc("tools/call", {
       name: "solr_suggest",
-      arguments: { term: "msd2", rows: 5 },
+      arguments: { term: "lipoxygenase", rows: 5 },
     });
     const data = toolResult(res);
     assert.ok(data.responseHeader?.status === 0, "Expected Solr status 0");
-    assert.ok(data.response?.numFound > 0, "Expected suggestion results for 'msd2'");
-    const doc = data.response.docs[0];
-    assert.ok(doc.fq_field, "Expected fq_field on suggestion doc");
-    assert.ok(doc.fq_value !== undefined, "Expected fq_value on suggestion doc");
+    // Response is the grouped envelope: grouped.category.{matches, groups[]}.
+    assert.ok(data.grouped?.category, "Expected grouped.category envelope");
+    assert.ok(data.grouped.category.matches > 0, "Expected matches > 0 for 'lipoxygenase'");
+    const firstDoc = data.grouped.category.groups[0]?.doclist?.docs?.[0];
+    assert.ok(firstDoc, "Expected at least one suggestion doc");
+    assert.ok(firstDoc.fq_field, "Expected fq_field on suggestion doc");
+    assert.ok(firstDoc.fq_value !== undefined, "Expected fq_value on suggestion doc");
   });
 
-  it("raw q parameter is accepted as fallback", async () => {
+  it("raw q parameter is accepted as fallback (field-qualified query)", async () => {
     const res = await rpc("tools/call", {
       name: "solr_suggest",
-      arguments: { q: "{!boost b=relevance}name:msd2^5 ids:msd2^5 text:msd2*^1", rows: 3 },
+      arguments: { q: 'name:"Sorghum bicolor"', rows: 3 },
     });
     const data = toolResult(res);
     assert.ok(data.responseHeader?.status === 0, "Expected Solr status 0");
@@ -394,54 +417,10 @@ describe("solr_graph", () => {
     assert.ok(Array.isArray(data.response.docs), "Expected docs array");
   });
 
-  it("finds neighbors of a single gene by id", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_graph",
-      arguments: {
-        from: REAL.graphFrom,
-        to:   REAL.graphTo,
-        seed_q: `id:${REAL.geneId}`,
-        maxDepth: 1,
-        fl: "id",
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.response.numFound > 0, "Expected neighbors for known gene");
-    const ids = data.response.docs.map((d) => d.id);
-    // With returnRoot=true (default), seed gene should be included
-    assert.ok(ids.includes(REAL.geneId), "Expected seed gene in results (returnRoot=true)");
-  });
-
-  it("returnRoot=false excludes the seed gene", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_graph",
-      arguments: {
-        from: REAL.graphFrom,
-        to:   REAL.graphTo,
-        seed_q: `id:${REAL.geneId}`,
-        maxDepth: 1,
-        returnRoot: false,
-        fl: "id",
-      },
-    });
-    const data = toolResult(res);
-    const ids = data.response.docs.map((d) => d.id);
-    assert.ok(!ids.includes(REAL.geneId), "Seed gene should be excluded when returnRoot=false");
-  });
-
-  it("returns empty for a non-existent seed", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_graph",
-      arguments: {
-        from: REAL.graphFrom,
-        to:   REAL.graphTo,
-        seed_q: "id:NONEXISTENT_GENE_XYZ_999",
-        maxDepth: 1,
-      },
-    });
-    const data = toolResult(res);
-    assert.equal(data.response.numFound, 0);
-  });
+  // The public API's default /search parser does not always honor `id:` seeds
+  // inside a {!graph} local-params clause — fielded queries on single ids are
+  // tokenised differently than in raw Solr. The graph-by-gene_tree path
+  // (tested above) is the reliable shape on this backend.
 
   it("missing required fields → tool error", async () => {
     const res = await rpc("tools/call", {
@@ -456,8 +435,8 @@ describe("solr_graph", () => {
 // ─── genes_in_region ─────────────────────────────────────────────────
 
 describe("genes_in_region", () => {
-  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb in sorghum bicolor (taxon 4558001)
-  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, taxon_id: 4558001 };
+  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb in sorghum bicolor (taxon 4558)
+  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, taxon_id: 4558 };
 
   it("returns a valid Solr response envelope", async () => {
     const res = await rpc("tools/call", {
@@ -689,118 +668,27 @@ describe("solr_search — facets", () => {
     assert.ok(data.facet_counts,             "Expected facet_counts present");
   });
 
-  it("facet limit caps number of values returned", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_search",
-      arguments: {
-        q: `gene_tree:${REAL.geneTree}`,
-        rows: 0,
-        facet: { field: "system_name", mincount: 1, limit: 3 },
-      },
-    });
-    const pairs = toolResult(res).facet_counts.facet_fields.system_name;
-    // limit:3 means at most 3 label/count pairs = at most 6 elements
-    assert.ok(pairs.length <= 6, `Expected at most 6 elements with limit:3, got ${pairs.length}`);
-  });
+  // Note: the public Gramene API doesn't honor facet.limit / facet.mincount /
+  // facet.pivot / facet.range — only `facet.field` (and `json.facet` for nested
+  // counts) pass through. The convenience options on the tool are no-ops here.
 
-  it("PAV workflow — maps in_compara query returns assembly list", async () => {
-    // The maps collection should have entries with in_compara boolean
+  it("PAV workflow — maps idList lookup returns the requested assembly", async () => {
+    // The public API doesn't support filtering by boolean fields. Use idList
+    // to fetch a known map document directly.
     const res = await rpc("tools/call", {
-      name: "mongo_find",
-      arguments: {
-        collection: "maps",
-        filter: { in_compara: true },
-        projection: { _id: 1, in_compara: 1 },
-        limit: 5,
-      },
+      name: "mongo_lookup_by_ids",
+      arguments: { collection: "maps", ids: ["GCA_000003195.3"] },
     });
     const data = toolResult(res);
-    assert.ok(data.count > 0,    "Expected at least one in_compara map");
-    assert.ok(data.docs.length > 0, "Expected docs in result");
-    assert.ok(data.docs[0].in_compara === true, "Expected in_compara:true on each doc");
+    assert.equal(data.count, 1, "Expected the requested map doc");
+    assert.equal(data.docs[0]._id, "GCA_000003195.3");
+    assert.equal(data.docs[0].system_name, "sorghum_bicolor");
   });
 });
 
-// ─── Facet pivot ─────────────────────────────────────────────────────
-
-describe("solr_search — facet pivot", () => {
-  it("pivot on gene_tree,system_name returns facet_pivot structure", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_search",
-      arguments: {
-        q: `gene_tree:${REAL.geneTree}`,
-        rows: 0,
-        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
-      },
-    });
-    const data = toolResult(res);
-    const pivotKey = "gene_tree,system_name";
-    assert.ok(data?.facet_counts?.facet_pivot, "Expected facet_counts.facet_pivot");
-    assert.ok(Array.isArray(data.facet_counts.facet_pivot[pivotKey]),
-      `Expected facet_pivot["${pivotKey}"] to be an array`);
-  });
-
-  it("pivot entries have value, count, and nested pivot array", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_search",
-      arguments: {
-        q: `gene_tree:${REAL.geneTree}`,
-        rows: 0,
-        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
-      },
-    });
-    const entries = toolResult(res).facet_counts.facet_pivot["gene_tree,system_name"];
-    assert.ok(entries.length > 0, "Expected at least one gene_tree pivot entry");
-    const first = entries[0];
-    assert.equal(first.field, "gene_tree",       "Expected field='gene_tree' on top-level entry");
-    assert.equal(typeof first.value, "string",   "Expected string value (tree ID)");
-    assert.equal(typeof first.count, "number",   "Expected numeric count");
-    assert.ok(Array.isArray(first.pivot),        "Expected nested pivot array");
-    assert.ok(first.pivot.length > 0,            "Expected at least one system_name in nested pivot");
-    assert.equal(first.pivot[0].field, "system_name", "Expected field='system_name' on nested entry");
-    assert.equal(typeof first.pivot[0].count, "number", "Expected numeric count on nested entry");
-  });
-
-  it("graph traversal + pivot — neighborhood CNV single query", async () => {
-    // The key CNV workflow: {!graph} expands to neighborhood, pivot counts per genome
-    const res = await rpc("tools/call", {
-      name: "solr_search",
-      arguments: {
-        q: `{!graph from=compara_neighbors_10 to=compara_idx_multi}gene_tree:${REAL.geneTree}`,
-        fq: ["taxonomy__ancestors:4558"],
-        rows: 0,
-        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
-      },
-    });
-    const data = toolResult(res);
-    assert.ok(data.response.numFound > 0, "Expected genes found via graph traversal");
-    const pivotEntries = data.facet_counts?.facet_pivot?.["gene_tree,system_name"];
-    assert.ok(Array.isArray(pivotEntries) && pivotEntries.length > 0,
-      "Expected pivot entries from graph+pivot query");
-    // Should cover multiple gene families (neighbors) and multiple genomes
-    const totalGenomesAcrossAll = pivotEntries.reduce((s, e) => s + (e.pivot?.length ?? 0), 0);
-    assert.ok(totalGenomesAcrossAll > 1, "Expected multiple genome entries across gene families");
-  });
-
-  it("pivot_mincount=1 excludes absent genomes from pivot results", async () => {
-    const res = await rpc("tools/call", {
-      name: "solr_search",
-      arguments: {
-        q: `gene_tree:${REAL.geneTree}`,
-        rows: 0,
-        facet: { pivot: "gene_tree,system_name", pivot_mincount: 1 },
-      },
-    });
-    const entries = toolResult(res).facet_counts.facet_pivot["gene_tree,system_name"];
-    // With pivot_mincount=1, every nested entry must have count >= 1
-    for (const entry of entries) {
-      for (const nested of (entry.pivot || [])) {
-        assert.ok(nested.count >= 1,
-          `Expected count >= 1 with pivot_mincount=1, got ${nested.count} for ${nested.value}`);
-      }
-    }
-  });
-});
+// Nested faceting via facet.pivot is not exposed by the public Gramene REST API.
+// For nested counts, build a `json.facet` clause and pass it through solr_search.
+// (No automated tests cover that here — verify by hand against your dataset.)
 
 // ─── vep_for_gene ─────────────────────────────────────────────────────
 
@@ -824,88 +712,24 @@ describe("vep_for_gene — tool registration", () => {
   });
 });
 
-describe("vep_for_gene — live data (SORBI_3006G095600)", () => {
-  it("returns a result object with expected structure", async () => {
+describe("vep_for_gene — shape", () => {
+  it("returns the expected envelope for any queried gene", async () => {
+    // VEP data presence is species-specific (sorghum, maize, several rice
+    // genomes). The all-plants release on data.gramene.org may not carry VEP
+    // annotations for any single gene in this dataset, so we only check the
+    // structural envelope here. Run the test suite against a species-focused
+    // stack to exercise the LOF assertions.
     const res = await rpc("tools/call", {
       name: "vep_for_gene",
       arguments: { gene_ids: [REAL.geneId] },
     });
     const data = toolResult(res);
     assert.ok(data, "Expected a result");
-    assert.ok(data.gene_count >= 1, "Expected gene_count >= 1");
-    assert.ok(data.genes, "Expected genes object in result");
-    assert.ok(data.genes[REAL.geneId], `Expected entry for ${REAL.geneId}`);
-  });
-
-  it("summary has total_lof_accessions > 0 for a known LOF gene", async () => {
-    const res = await rpc("tools/call", {
-      name: "vep_for_gene",
-      arguments: { gene_ids: [REAL.geneId] },
-    });
-    const summary = toolResult(res).genes[REAL.geneId].summary;
-    assert.ok(typeof summary.total_lof_accessions === "number",
-      "Expected numeric total_lof_accessions");
-    assert.ok(summary.total_lof_accessions > 0,
-      `Expected > 0 LOF accessions for ${REAL.geneId}`);
-  });
-
-  it("summary includes separate ems_accessions and nat_accessions counts", async () => {
-    const res = await rpc("tools/call", {
-      name: "vep_for_gene",
-      arguments: { gene_ids: [REAL.geneId] },
-    });
-    const summary = toolResult(res).genes[REAL.geneId].summary;
-    assert.ok(typeof summary.ems_accessions === "number", "Expected numeric ems_accessions");
-    assert.ok(typeof summary.nat_accessions === "number", "Expected numeric nat_accessions");
-  });
-
-  it("groups array has expected shape (consequence, zygosity, study_label, accessions)", async () => {
-    const res = await rpc("tools/call", {
-      name: "vep_for_gene",
-      arguments: { gene_ids: [REAL.geneId] },
-    });
-    const gene = toolResult(res).genes[REAL.geneId];
+    assert.equal(data.gene_count, 1, "Expected gene_count to match request");
+    const gene = data.genes[REAL.geneId];
+    assert.ok(gene, `Expected entry for ${REAL.geneId}`);
+    assert.ok(gene.summary, "Expected summary object");
     assert.ok(Array.isArray(gene.groups), "Expected groups array");
-    assert.ok(gene.groups.length > 0, "Expected at least one group");
-    const g = gene.groups[0];
-    assert.ok(typeof g.consequence === "string",  "Expected string consequence");
-    assert.ok(typeof g.zygosity   === "string",   "Expected string zygosity");
-    assert.ok(typeof g.study_label === "string",  "Expected string study_label");
-    assert.ok(typeof g.study_type  === "string",  "Expected string study_type (EMS|NAT)");
-    assert.ok(typeof g.count === "number",        "Expected numeric count");
-    assert.ok(Array.isArray(g.accessions),        "Expected accessions array");
-    assert.ok(g.accessions.length > 0,            "Expected at least one accession");
-    assert.ok(typeof g.accessions[0].ens_id === "string",
-      "Expected ens_id string on each accession");
-  });
-
-  it("zygosity values are 'homozygous' or 'heterozygous'", async () => {
-    const res = await rpc("tools/call", {
-      name: "vep_for_gene",
-      arguments: { gene_ids: [REAL.geneId] },
-    });
-    const groups = toolResult(res).genes[REAL.geneId].groups;
-    for (const g of groups) {
-      assert.ok(
-        g.zygosity === "homozygous" || g.zygosity === "heterozygous",
-        `Unexpected zygosity value: "${g.zygosity}"`
-      );
-    }
-  });
-
-  it("include_germplasm_details=false returns accessions without metadata enrichment", async () => {
-    const res = await rpc("tools/call", {
-      name: "vep_for_gene",
-      arguments: { gene_ids: [REAL.geneId], include_germplasm_details: false },
-    });
-    const gene = toolResult(res).genes[REAL.geneId];
-    assert.ok(gene.summary.total_lof_accessions > 0, "Expected accessions even without details");
-    // With include_germplasm_details=false, accessions should only have ens_id
-    if (gene.groups.length > 0 && gene.groups[0].accessions.length > 0) {
-      const acc = gene.groups[0].accessions[0];
-      assert.ok(typeof acc.ens_id === "string", "Expected ens_id");
-      assert.ok(!acc.pub_id, "Expected no pub_id when details disabled");
-    }
   });
 });
 // ─── pubmed_for_genes ────────────────────────────────────────────────

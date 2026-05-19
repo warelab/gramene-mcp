@@ -1,14 +1,12 @@
 # gramene-mcp
 
-An [MCP](https://modelcontextprotocol.io/) server that connects Claude and other AI agents to the [Gramene](https://www.gramene.org/) plant genomics database. It exposes a suite of tools covering gene search, comparative genomics, expression, loss-of-function germplasm, ontology enrichment, and literature discovery — all backed by a Solr search index and a MongoDB annotation store.
+An [MCP](https://modelcontextprotocol.io/) server that connects Claude and other AI agents to the [Gramene](https://www.gramene.org/) plant genomics database via its public REST API at [data.gramene.org](https://data.gramene.org). It exposes a suite of tools covering gene search, comparative genomics, expression, loss-of-function germplasm, ontology enrichment, and literature discovery.
 
 ## Requirements
 
 - **Node.js** v18 or later (ES modules + native `fetch`)
-- **Apache Solr** 9 with a `genes` core and a `suggestions` core
-- **MongoDB** 7
 
-For local development both can be started via the included Docker Compose setup (see [Local development](#local-development) below).
+No local infrastructure (Solr, MongoDB, Docker) is needed — every tool call goes to the public Gramene REST API.
 
 ## Installation
 
@@ -20,12 +18,6 @@ npm install
 
 ## Configuration
 
-Copy `.env.example` and edit to match your environment:
-
-```bash
-cp .env.example .env
-```
-
 | Variable | Default | Description |
 |---|---|---|
 | `MCP_HOST` | `127.0.0.1` | Interface to listen on |
@@ -33,26 +25,19 @@ cp .env.example .env
 | `MCP_ALLOWED_ORIGINS` | _(localhost only)_ | Comma-separated CORS origins; set to `*` to allow all |
 | `MCP_LOG` | `true` | Write JSON request logs to stderr |
 | `MCP_LOG_FILE` | _(none)_ | Optional path for a persistent log file |
-| `SOLR_BASE_URL` | `http://localhost:8983/solr` | Solr base URL |
-| `SOLR_GENES_CORE` | `genes` | Name of the genes Solr core |
-| `SOLR_SUGGESTIONS_CORE` | `suggestions` | Name of the suggestions Solr core |
-| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
-| `MONGO_DB` | `test` | MongoDB database name |
-
-The `.env.squam` file in the repo is a ready-made config pointing at the Gramene production instance on `squam`.
+| `GRAMENE_API_BASE` | `https://data.gramene.org/v69` | Gramene REST API base URL. Override to point at a species-focused stack. |
 
 ## Starting the server
 
 ```bash
-# Using your own .env
+# Default — talks to data.gramene.org/v69
 npm start
-
-# Using the squam production instance
-npm run start:squam
 
 # Development mode (auto-reloads on file changes)
 npm run dev
-npm run dev:squam
+
+# Point at a different release or species-focused stack
+GRAMENE_API_BASE=https://data.gramene.org/v70 npm start
 ```
 
 The server listens for MCP JSON-RPC requests at `POST http://<MCP_HOST>:<MCP_PORT>/mcp`.
@@ -191,22 +176,22 @@ If the server is on a remote host, make sure `MCP_ALLOWED_ORIGINS` is set to all
 
 ## Tools
 
-The server exposes 12 tools:
+The server exposes 12 tools. They map onto two API endpoint families: `/search` and `/suggest` (Solr-backed) and `/<collection>` (MongoDB-backed).
 
 | Tool | Description |
 |---|---|
-| `solr_search` | Full Solr query against the genes core — field lists, filters, facets, sorting, pagination. Use for single-gene cards (`q="id:…"`) and to produce facet-count arrays consumed by the client-side enrichment skill |
-| `solr_suggest` | Entry point for free-text concepts (gene name, family, pathway, species, ontology, trait) → `fq_field`/`fq_value`. Always start here before `mongo_find` |
-| `solr_search_bool` | Structured AND/OR/NOT boolean queries without raw Solr syntax |
-| `solr_graph` | Single-hop graph traversal (e.g. genomic neighbourhoods via `compara_neighbors_10`). Multi-hop relationships are expressed by chaining two queries |
+| `solr_search` | Full Solr query against `/search` — field lists, filters, facets, sorting, pagination. Use for single-gene cards (`q="id:…"`) and to produce facet-count arrays consumed by the client-side enrichment skill |
+| `solr_suggest` | Calls `/suggest`. Entry point for free-text concepts (gene name, family, pathway, species, ontology, trait) → `fq_field`/`fq_value`. Always start here before `mongo_find`. Returns the Solr grouped envelope (`grouped.category.groups[].doclist.docs[]`). |
+| `solr_search_bool` | Structured AND/OR/NOT boolean queries compiled into `/search` `fq` clauses |
+| `solr_graph` | Single-hop `{!graph}` traversal via `/search` (e.g. genomic neighbourhoods through `compara_neighbors_10`). Multi-hop relationships are expressed by chaining two queries |
 | `genes_in_region` | Find all genes overlapping a chromosomal interval. `taxon_id` is the plain NCBI ID |
-| `expression_for_genes` | Baseline (TPM/FPKM) and differential (log₂FC) expression by tissue and condition |
-| `vep_for_gene` | Germplasm accessions carrying predicted loss-of-function alleles (Ensembl VEP), grouped by consequence, zygosity, and study |
+| `expression_for_genes` | Baseline (TPM/FPKM) and differential (log₂FC) expression by tissue and condition. Joins gene expression fields with `/experiments` and `/assays`. |
+| `vep_for_gene` | Germplasm accessions carrying predicted loss-of-function alleles (Ensembl VEP), grouped by consequence, zygosity, and study. Joins with `/germplasm`. |
 | `pubmed_for_genes` | PubMed and DOI cross-references for a set of genes (returns IDs only — pipe to a PubMed-focused MCP for bibliographic detail) |
-| `mongo_find` | MongoDB `find()` for detail lookups by known ID — not for discovery |
-| `mongo_lookup_by_ids` | Batch-resolve numeric ontology term IDs to names |
-| `mongo_list_collections` | List all collections in the configured database |
-| `kb_relations` | Return the Solr ↔ MongoDB field crosswalk (schema documentation) |
+| `mongo_find` | Detail lookup by ID against `/<collection>`. Supports `{_id: x}`, `{_id: {$in: […]}}`, and top-level field-equality filters with optional `$in`. Operators like `$gt`/`$lt`/`$regex`/`$where` are NOT supported by the public API — use `solr_search` for those. |
+| `mongo_lookup_by_ids` | Batch-resolve numeric ontology term IDs (or string IDs in other collections) to documents |
+| `mongo_list_collections` | List the fixed set of collections served by the API |
+| `kb_relations` | Return the search-index ↔ collections field crosswalk (schema documentation) |
 
 **Enrichment / overrepresentation analysis is intentionally not an MCP tool.**
 Build foreground and background facet-count arrays via `solr_search` (with
@@ -234,24 +219,24 @@ The server also exposes workflow prompts that Claude loads on demand to guide mu
 
 ## Data model
 
-Gramene-MCP combines two backends:
+The public REST API exposes two endpoint families:
 
-**Solr** (`genes` core) — one document per gene, across 30+ plant species. Key field groups:
+**`/search`** (Solr-backed gene documents) — one document per gene, across 30+ plant species. Key field groups:
 
 - Gene identity: `id`, `name`, `description`, `biotype`, `taxon_id`, `region`, `start`, `end`, `strand`
 - Species filtering: `taxonomy__ancestors` (plain NCBI taxon IDs at every rank — preferred)
 - Ontology ancestors: `GO__ancestors`, `PO__ancestors`, `TO__ancestors`, `pathways__ancestors`, `domains__ancestors`
 - Comparative genomics: `gene_tree`, `homology__all_orthologs`, `homology__ortholog_one2one`/`one2many`/`many2many`, `homology__within_species_paralog`, `compara_neighbors_N`, `compara_idx_multi` (PAV/CNV)
-- Expression linkage: `expressed_in_gxa_attr_ss` (joins to MongoDB `experiments` and `assays`)
+- Expression linkage: `expressed_in_gxa_attr_ss` (joins to the `/experiments` and `/assays` collection endpoints)
 - Loss-of-function: `VEP__{consequence}__{zygosity}__{species}__{study}__attr_ss`, `VEP__merged__EMS/NAT__attr_ss`
 - Literature: `PUBMED__xrefs`
 
-**MongoDB** — annotation collections used for enrichment and metadata lookups:
+**`/<collection>`** (annotation documents) — used for enrichment and metadata lookups:
 
 | Collection | Contents |
 |---|---|
 | `genes` | Gene-level metadata |
-| `genetree` | Gene family / homology trees |
+| `genetrees` | Gene family / homology trees |
 | `taxonomy` | NCBI taxonomy nodes |
 | `GO`, `PO`, `TO` | Ontology term documents |
 | `domains`, `pathways` | InterPro domains and Plant Reactome pathways |
@@ -260,29 +245,19 @@ Gramene-MCP combines two backends:
 | `germplasm` | Accession metadata: `pub_id`, `stock_center`, `subpopulation`, genebank URL |
 | `maps` | Genome assembly metadata (`in_compara` flag) |
 
-## Local development
+The collection endpoints accept `idList`, `q` (text search), and top-level field-equality filters. They do **not** support range, regex, or `$where`-style operators — use `solr_search` for those.
 
-The `seed/` directory contains everything needed to spin up a local Solr + MongoDB stack with sample data:
+## Development
 
 ```bash
-# Start containers, apply schemas, and load sample data
-./seed/setup-test-env.sh
+# Auto-reload on file changes
+npm run dev
 
-# Start the MCP server against the local stack
-MONGO_DB=gramene npm start
-
-# Run integration tests
+# Run the integration test suite (hits data.gramene.org)
 npm test
-
-# Tear down containers
-./seed/setup-test-env.sh --down
 ```
 
-The Docker Compose stack runs `mongo:7` and `solr:9` with health checks, persistent volumes, and automatic schema + seed-data loading.
-
-## Command-line utilities
-
-Standalone scripts for batch data access are in the [`scripts/`](scripts/) directory. See [scripts/README.md](scripts/README.md) for full documentation.
+The default test runner targets a server you start separately on `http://127.0.0.1:8787/mcp`; override with `MCP_URL` if you want to point at a different instance.
 
 ## Conventions
 
