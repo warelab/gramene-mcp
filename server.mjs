@@ -15,16 +15,82 @@ import { randomUUID } from "node:crypto";
  *   MCP_LOG_FILE         Path to append JSON log lines (persists across restarts)
  *   MCP_LOG_BUFFER_SIZE  Max tool_call events kept in memory for the dashboard (default: 10000)
  *
- *   GRAMENE_API_BASE     Gramene REST API base URL
+ *   GRAMENE_SITES        Sites to serve, as comma-separated id=apiBase pairs, e.g.
+ *                          v69=https://data.gramene.org/v69,sorghum_v11=https://data.sorghumbase.org/sorghum_v11
+ *                        or as a JSON array that can also describe each site:
+ *                          [{"id":"v69","apiBase":"https://data.gramene.org/v69","description":"..."}]
+ *                        Each site is served at /mcp/<id>; the first entry also
+ *                        answers the bare /mcp path. Takes precedence over
+ *                        GRAMENE_API_BASE.
+ *   GRAMENE_API_BASE     Single-site shorthand: Gramene REST API base URL
  *                          (default: https://data.gramene.org/v69)
- *                        Override to point at a species-focused stack.
+ *                        The site id is the URL's last path segment (e.g. v69).
  */
 
 const HOST = process.env.MCP_HOST || "127.0.0.1";
 const PORT = Number(process.env.MCP_PORT || "8787");
 const MAX_BODY_BYTES = Number(process.env.MCP_MAX_BODY_BYTES || "1048576");
 
-const GRAMENE_API_BASE = (process.env.GRAMENE_API_BASE || "https://data.gramene.org/v69").replace(/\/$/, "");
+// --- Sites ---
+// A site pairs a URL-safe id with a Gramene REST API base. MCP traffic for a
+// site arrives at /mcp/<id>, and every tool call made there queries that
+// site's API and fills that site's reference-doc cache.
+const RESERVED_SITE_IDS = new Set(["usage"]);
+
+function parseSites() {
+  const spec = (process.env.GRAMENE_SITES || "").trim();
+  let entries;
+  if (/^[[{]/.test(spec)) {
+    entries = JSON.parse(spec);
+  } else if (spec) {
+    entries = spec.split(",").map((s) => s.trim()).filter(Boolean).map((pair) => {
+      const eq = pair.indexOf("=");
+      if (eq <= 0) throw new Error(`GRAMENE_SITES: expected id=url, got "${pair}"`);
+      return { id: pair.slice(0, eq).trim(), apiBase: pair.slice(eq + 1).trim() };
+    });
+  } else {
+    const apiBase = process.env.GRAMENE_API_BASE || "https://data.gramene.org/v69";
+    entries = [{ id: new URL(apiBase).pathname.split("/").filter(Boolean).pop() || "default", apiBase }];
+  }
+  if (!Array.isArray(entries)) throw new Error("GRAMENE_SITES JSON must be an array");
+
+  const sites = new Map();
+  for (const { id, apiBase, description } of entries) {
+    if (typeof id !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(id) || RESERVED_SITE_IDS.has(id)) {
+      throw new Error(`Invalid site id "${id}"`);
+    }
+    if (sites.has(id)) throw new Error(`Duplicate site id "${id}"`);
+    sites.set(id, {
+      id,
+      apiBase: new URL(apiBase).toString().replace(/\/$/, ""),
+      description: description || null,
+      refCache: {
+        experiments: new Map(),
+        assays:      new Map(),
+        PO:          new Map(),
+        germplasm:   new Map(),
+      },
+    });
+  }
+  if (sites.size === 0) throw new Error("GRAMENE_SITES defines no sites");
+  return sites;
+}
+
+const SITES = parseSites();
+const DEFAULT_SITE = SITES.values().next().value;
+
+// Sent as `instructions` in the initialize reply. Every site exposes the same
+// tool names, so this is how a client connected to several sites tells them apart.
+function siteInstructions(site) {
+  return [
+    `This server serves the Gramene site "${site.id}", backed by the REST API at ${site.apiBase}.`,
+    site.description,
+    `All tools and prompts on this server read only this site's data. Other Gramene MCP servers ` +
+      `offer the same tool names for other releases or species collections: use the one whose site ` +
+      `matches the user's question, and say which site results came from when several are connected.`,
+    `To list this site's genome assemblies, call mongo_find with collection "maps".`,
+  ].filter(Boolean).join("\n\n");
+}
 
 // Single source of truth for server identity. Used by both the MCP `initialize`
 // reply (over JSON-RPC) and the GET /mcp discovery endpoint (for clients that
@@ -47,7 +113,7 @@ const SERVER_CAPABILITIES = {
   logging:   false,
 };
 
-function getServerDiscoveryDoc() {
+function getServerDiscoveryDoc(site) {
   return {
     status: "ok",
     server: {
@@ -66,10 +132,14 @@ function getServerDiscoveryDoc() {
       resources: SERVER_CAPABILITIES.resources !== false,
       logging:   SERVER_CAPABILITIES.logging   !== false,
     },
+    site: { id: site.id, apiBase: site.apiBase, description: site.description },
+    sites: [...SITES.values()].map((s) => ({
+      id: s.id, apiBase: s.apiBase, description: s.description, mcp: `/mcp/${s.id}`,
+    })),
     endpoints: {
-      mcp:       "/mcp",
-      dashboard: "/mcp/usage",
-      stats:     "/mcp/usage/data",
+      mcp:       `/mcp/${site.id}`,
+      dashboard: `/mcp/${site.id}/usage`,
+      stats:     `/mcp/${site.id}/usage/data`,
     },
     auth: { mode: "none" },
   };
@@ -179,11 +249,12 @@ function computeStats(events) {
 // Sessions are created on 'initialize' and identified by a UUID returned in the
 // Mcp-Session-Id response header. Clients echo it back on subsequent requests.
 // Sessions older than SESSION_TTL_MS are pruned on each new initialize.
+// A session belongs to the site it was initialized on.
 const SESSION_TTL_MS = 24 * 3600_000; // 24 hours
-const activeSessions = new Map(); // id -> { created, lastSeen, calls, errors }
+const activeSessions = new Map(); // id -> { site, created, lastSeen }
 
-function getOrCreateSession(sessionId) {
-  if (sessionId && activeSessions.has(sessionId)) return sessionId;
+function getOrCreateSession(sessionId, site) {
+  if (sessionId && activeSessions.get(sessionId)?.site === site.id) return sessionId;
   return null;
 }
 
@@ -200,16 +271,10 @@ function pruneOldSessions() {
 // PO metadata. To keep this fast without holding an in-memory copy of those
 // collections, we memoize per-id docs the first time they're fetched from the
 // API. Reference data is slow-changing, so a process-lifetime cache is fine —
-// restart the server to refresh.
-const refCache = {
-  experiments: new Map(),
-  assays:      new Map(),
-  PO:          new Map(),
-  germplasm:   new Map(),
-};
-
-async function fetchRefDocs(collection, ids) {
-  const cache = refCache[collection];
+// restart the server to refresh. Each site keeps its own cache (site.refCache)
+// since ids can resolve to different docs across releases.
+async function fetchRefDocs(site, collection, ids) {
+  const cache = site.refCache[collection];
   if (!cache) throw new Error(`refCache: unknown collection ${collection}`);
   const missing = [];
   for (const id of ids) if (!cache.has(id)) missing.push(id);
@@ -220,7 +285,7 @@ async function fetchRefDocs(collection, ids) {
       const chunk = missing.slice(i, i + CHUNK);
       // Pass idList as an array so each element is appended as its own
       // ?idList=… param — the API rejects single bare integer values.
-      const docs = await apiGet(`/${collection}`, {
+      const docs = await apiGet(site, `/${collection}`, {
         idList: chunk.map(String),
         rows: chunk.length,
       });
@@ -523,8 +588,8 @@ const COLLECTIONS = [
 ];
 
 // --- Gramene REST API helpers ---
-function apiUrl(path, params) {
-  const url = new URL(`${GRAMENE_API_BASE}${path}`);
+function apiUrl(site, path, params) {
+  const url = new URL(`${site.apiBase}${path}`);
   for (const [k, v] of Object.entries(params || {})) {
     if (v === undefined || v === null) continue;
     if (k === "idList") {
@@ -545,8 +610,8 @@ function apiUrl(path, params) {
   return url.toString();
 }
 
-async function apiGet(path, params) {
-  const url = apiUrl(path, params);
+async function apiGet(site, path, params) {
+  const url = apiUrl(site, path, params);
   const r = await fetch(url, { headers: { Accept: "application/json" } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
@@ -558,7 +623,7 @@ async function apiGet(path, params) {
 // /search wraps the Solr genes core; it accepts standard Solr query params
 // (q, fq, fl, rows, start, sort, defType, facet.*, stats.*) and returns the
 // raw Solr response.
-async function searchFetch(args) {
+async function searchFetch(site, args) {
   const {
     q,
     fq,
@@ -625,7 +690,7 @@ async function searchFetch(args) {
     }
   }
 
-  return apiGet("/search", {
+  return apiGet(site, "/search", {
     q, fq, fl, rows, start, sort, defType, wt: "json",
     ...facetParams, ...statsParams,
   });
@@ -634,22 +699,22 @@ async function searchFetch(args) {
 // /suggest wraps the Solr suggestions core. Only q / fq / rows / start are
 // meaningful — the suggester applies its own field boosts and grouping. The
 // response is a Solr "grouped" envelope (grouped.category.groups[].doclist).
-async function suggestFetch({ q, fq, rows = 10, start = 0 } = {}) {
+async function suggestFetch(site, { q, fq, rows = 10, start = 0 } = {}) {
   if (!q || typeof q !== "string") {
     throw new Error("suggest requires a non-empty string 'q'");
   }
-  return apiGet("/suggest", { q, fq, rows, start });
+  return apiGet(site, "/suggest", { q, fq, rows, start });
 }
 
 // /<collection> endpoints translate query params into a MongoDB find on the
 // named collection. Supported params: q (text), idList, rows, start, fl
 // (returns only listed fields), taxon_id, db_type, subset, plus any other
 // query param becomes a top-level equality filter on the document.
-async function collectionFetch(collection, params) {
+async function collectionFetch(site, collection, params) {
   if (!COLLECTIONS.includes(collection)) {
     throw new Error(`Unknown collection: ${collection}. Allowed: ${COLLECTIONS.join(", ")}`);
   }
-  return apiGet(`/${collection}`, params || {});
+  return apiGet(site, `/${collection}`, params || {});
 }
 
 function solrEscapeValue(v) {
@@ -782,7 +847,7 @@ function compileGraphQuery(from, to, seedQuery, opts = {}) {
 
 // --- Tool implementations ---
 
-async function tool_genes_in_region(args) {
+async function tool_genes_in_region(args, site) {
   const { region, start, end, taxon_id, map: mapFilter, fl, rows = 200, sort } = args || {};
   if (!region || start === undefined || end === undefined) {
     throw new Error("genes_in_region requires 'region', 'start', and 'end'");
@@ -799,7 +864,7 @@ async function tool_genes_in_region(args) {
   // NCBI×1000+suffix encoding required by the Solr `taxon_id` field.
   if (taxon_id !== undefined) fq.push(`taxonomy__ancestors:${Number(taxon_id)}`);
   if (mapFilter) fq.push(`map:${solrEscapeValue(mapFilter)}`);
-  return searchFetch({ q, fq, fl, rows, sort });
+  return searchFetch(site, { q, fq, fl, rows, sort });
 }
 
 // Solr field names encode experiment IDs by replacing each '-' with '_':
@@ -883,7 +948,7 @@ function diffAssayFactors(controlAssay, treatmentAssay) {
   return { contrast, shared };
 }
 
-async function tool_expression_for_genes(args) {
+async function tool_expression_for_genes(args, site) {
   const {
     gene_ids,
     experiment_type,  // "Baseline" | "Differential" | undefined (both)
@@ -908,7 +973,7 @@ async function tool_expression_for_genes(args) {
   // The public API's default /search parser ignores Lucene operators in q,
   // so put the multi-id OR clause in fq (which is parsed as raw lucene).
   const idClause = `id:(${gene_ids.join(" OR ")})`;
-  const solrResp = await searchFetch({
+  const solrResp = await searchFetch(site, {
     q: "*:*",
     fq: [idClause, "capabilities:expression"],
     fl: flParts.join(","),
@@ -957,10 +1022,10 @@ async function tool_expression_for_genes(args) {
 
   // 3. Fetch experiment + assay docs via the API.
   const experimentDocs = expIds.size > 0
-    ? await fetchRefDocs("experiments", [...expIds])
+    ? await fetchRefDocs(site, "experiments", [...expIds])
     : new Map();
   const assayDocs = assayIds.size > 0
-    ? await fetchRefDocs("assays", [...assayIds])
+    ? await fetchRefDocs(site, "assays", [...assayIds])
     : new Map();
 
   // 4. Build the set of experiments allowed by the type / taxon filters.
@@ -980,7 +1045,7 @@ async function tool_expression_for_genes(args) {
     strictPoIds  = new Set(po_terms.map(Number));
     poInfo.requested = [...strictPoIds];
     allowedPoIds = new Set(strictPoIds);
-    const poDocs = await fetchRefDocs("PO", [...strictPoIds]);
+    const poDocs = await fetchRefDocs(site, "PO", [...strictPoIds]);
     for (const id of strictPoIds) {
       const poDoc = poDocs.get(id);
       if (Array.isArray(poDoc?.ancestors)) {
@@ -1183,7 +1248,7 @@ function parseVepFieldName(fieldName) {
   return null;
 }
 
-async function tool_vep_for_gene(args) {
+async function tool_vep_for_gene(args, site) {
   const { gene_ids, include_germplasm_details = true } = args || {};
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
     throw new Error("vep_for_gene requires a non-empty 'gene_ids' array");
@@ -1195,7 +1260,7 @@ async function tool_vep_for_gene(args) {
   // 1. Fetch VEP__ dynamic fields from /search
   // The API's default q-parser doesn't honor Lucene OR; put the id clause in fq.
   const idClause = `id:(${gene_ids.join(" OR ")})`;
-  const solrResp = await searchFetch({
+  const solrResp = await searchFetch(site, {
     q: "*:*",
     fq: [idClause],
     fl: "id,VEP__*",
@@ -1217,7 +1282,7 @@ async function tool_vep_for_gene(args) {
   // 3. Look up germplasm metadata via the API.
   let germplasmMap = {};
   if (allEnsIds.size > 0 && include_germplasm_details) {
-    const germDocs = await fetchRefDocs("germplasm", [...allEnsIds]);
+    const germDocs = await fetchRefDocs(site, "germplasm", [...allEnsIds]);
     for (const [id, g] of germDocs) germplasmMap[id] = g;
   }
 
@@ -1307,7 +1372,7 @@ async function tool_vep_for_gene(args) {
 // Resolving PubMed IDs into bibliographic records is the job of a separate,
 // PubMed-focused MCP server — feed this tool's output into that one.
 
-async function tool_pubmed_for_genes(args) {
+async function tool_pubmed_for_genes(args, site) {
   const { gene_ids } = args || {};
   if (!gene_ids || !gene_ids.length) {
     throw Object.assign(new Error("gene_ids is required (non-empty array)"), { code: -32602 });
@@ -1319,7 +1384,7 @@ async function tool_pubmed_for_genes(args) {
   // Fetch PUBMED__xrefs from /search, restricted to genes flagged with publications.
   // The API's default q-parser doesn't honor Lucene OR; put the id clause in fq.
   const idClause = `id:(${gene_ids.join(" OR ")})`;
-  const solrResult = await searchFetch({
+  const solrResult = await searchFetch(site, {
     q: "*:*",
     fq: [idClause, "capabilities:pubs"],
     fl: "id,name,description,PUBMED__xrefs",
@@ -1374,21 +1439,21 @@ async function tool_pubmed_for_genes(args) {
   };
 }
 
-async function tool_solr_search(args) {
-  return searchFetch(args);
+async function tool_solr_search(args, site) {
+  return searchFetch(site, args);
 }
 
-async function tool_solr_suggest(args) {
+async function tool_solr_suggest(args, site) {
   const { term, q, fq, rows = 10, start = 0 } = args || {};
   // The API's /suggest endpoint applies its own field boosts. Pass either
   // 'term' (free text) or 'q' (a raw query — useful for `name:"…"` lookups).
   // 'term' takes precedence if both are provided.
   const query = term || q;
   if (!query) throw new Error("solr_suggest requires 'term' or 'q'");
-  return suggestFetch({ q: query, fq, rows, start });
+  return suggestFetch(site, { q: query, fq, rows, start });
 }
 
-async function tool_solr_search_bool(args) {
+async function tool_solr_search_bool(args, site) {
   const {
     q = "*:*",
     filter,
@@ -1404,12 +1469,12 @@ async function tool_solr_search_bool(args) {
   if (filter) fq.push(compileBoolFilter(filter));
   if (Array.isArray(extra_fq)) fq.push(...extra_fq);
 
-  return searchFetch({
+  return searchFetch(site, {
     q, fq: fq.length ? fq : undefined, fl, rows, start, sort, defType,
   });
 }
 
-async function tool_solr_graph(args) {
+async function tool_solr_graph(args, site) {
   const {
     from,
     to,
@@ -1424,7 +1489,7 @@ async function tool_solr_graph(args) {
   } = args || {};
 
   const q = compileGraphQuery(from, to, seed_q, { traversalFilter, returnRoot });
-  return searchFetch({ q, fq, fl, rows, start, sort });
+  return searchFetch(site, { q, fq, fl, rows, start, sort });
 }
 
 async function tool_mongo_list_collections() {
@@ -1436,7 +1501,7 @@ async function tool_mongo_list_collections() {
   };
 }
 
-async function tool_mongo_find(args) {
+async function tool_mongo_find(args, site) {
   const {
     collection,
     filter = {},
@@ -1461,7 +1526,7 @@ async function tool_mongo_find(args) {
   params.rows = Math.min(Math.max(limit, 0), 1000);
   if (skip) params.start = skip;
 
-  const docs = await collectionFetch(collection, params);
+  const docs = await collectionFetch(site, collection, params);
   const arr = Array.isArray(docs) ? docs : [];
   // Honor projection: { _id: 0 } → strip _id from each doc. The API's `fl`
   // already excludes _id when an fl list is set; this catches the case where
@@ -1472,7 +1537,7 @@ async function tool_mongo_find(args) {
   return { count: arr.length, docs: arr };
 }
 
-async function tool_mongo_lookup_by_ids(args) {
+async function tool_mongo_lookup_by_ids(args, site) {
   const { collection, ids, projection } = args || {};
   if (!collection) throw new Error("collection required");
   if (!Array.isArray(ids)) throw new Error("ids must be an array");
@@ -1485,7 +1550,7 @@ async function tool_mongo_lookup_by_ids(args) {
   const fl = projectionToFl(projection);
   if (fl) params.fl = fl;
 
-  const docs = await collectionFetch(collection, params);
+  const docs = await collectionFetch(site, collection, params);
   const arr = Array.isArray(docs) ? docs : [];
   if (projection && projection._id === 0) {
     for (const d of arr) delete d._id;
@@ -3100,7 +3165,7 @@ function getPromptMessages(name, args = {}) {
 }
 
 // --- MCP request handler ---
-async function handleJsonRpc(msg, sessionId = null) {
+async function handleJsonRpc(msg, site, sessionId = null) {
   const { jsonrpc, id, method, params } = msg || {};
   if (jsonrpc !== "2.0" || typeof method !== "string") {
     return jsonRpcError(id ?? null, -32600, "Invalid Request");
@@ -3119,6 +3184,7 @@ async function handleJsonRpc(msg, sessionId = null) {
         prompts: SERVER_CAPABILITIES.prompts,
       },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+      instructions: siteInstructions(site),
     });
   }
 
@@ -3143,19 +3209,19 @@ async function handleJsonRpc(msg, sessionId = null) {
 
     const entry = TOOL_REGISTRY[name];
     if (!entry) {
-      log({ event: "tool_call", tool: name, status: "unknown_tool" });
+      log({ event: "tool_call", site: site.id, tool: name, status: "unknown_tool" });
       return jsonRpcError(id, -32601, `Unknown tool: ${name}`);
     }
 
     const t0 = Date.now();
     try {
-      const result = await entry.handler(toolArgs);
-      log({ event: "tool_call", tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
+      const result = await entry.handler(toolArgs, site);
+      log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcResult(id, {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       });
     } catch (e) {
-      log({ event: "tool_call", tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
+      log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcError(id, -32000, `Tool error: ${e?.message || String(e)}`);
     }
   }
@@ -3171,15 +3237,15 @@ async function handleJsonRpc(msg, sessionId = null) {
       return jsonRpcError(id, -32602, "Invalid params: missing prompt name");
     }
     if (!PROMPT_REGISTRY[name]) {
-      log({ event: "prompt_get", prompt: name, status: "unknown_prompt" });
+      log({ event: "prompt_get", site: site.id, prompt: name, status: "unknown_prompt" });
       return jsonRpcError(id, -32602, `Unknown prompt: ${name}`);
     }
     try {
       const result = getPromptMessages(name, promptArgs || {});
-      log({ event: "prompt_get", prompt: name, args: promptArgs, status: "ok", ...(sessionId && { session: sessionId }) });
+      log({ event: "prompt_get", site: site.id, prompt: name, args: promptArgs, status: "ok", ...(sessionId && { session: sessionId }) });
       return jsonRpcResult(id, result);
     } catch (e) {
-      log({ event: "prompt_get", prompt: name, args: promptArgs, status: "error", error: e?.message || String(e), ...(sessionId && { session: sessionId }) });
+      log({ event: "prompt_get", site: site.id, prompt: name, args: promptArgs, status: "error", error: e?.message || String(e), ...(sessionId && { session: sessionId }) });
       return jsonRpcError(id, -32602, e?.message || String(e));
     }
   }
@@ -3188,7 +3254,10 @@ async function handleJsonRpc(msg, sessionId = null) {
 }
 
 // --- Dashboard HTML ---
-function dashboardHtml() {
+// site === null renders the all-sites dashboard.
+function dashboardHtml(site) {
+  const scope = site ? site.id : "all sites";
+  const dataPath = site ? `/mcp/${site.id}/usage/data` : "/mcp/usage/data";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -3227,7 +3296,7 @@ function dashboardHtml() {
 </style>
 </head>
 <body>
-<h1>Gramene MCP — Usage Dashboard</h1>
+<h1>Gramene MCP — Usage Dashboard (${scope})</h1>
 <p class="subtitle" id="subtitle">Loading…</p>
 <div class="cards" id="cards"></div>
 <section>
@@ -3241,7 +3310,7 @@ function dashboardHtml() {
 </section>
 <section>
   <h2>Recent Calls (last 100)</h2>
-  <table><thead><tr><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>ms</th><th>Args</th></tr></thead>
+  <table><thead><tr><th>Time</th><th>Site</th><th>Session</th><th>Tool</th><th>Status</th><th>ms</th><th>Args</th></tr></thead>
   <tbody id="recent"></tbody></table>
 </section>
 <p class="meta" id="meta"></p>
@@ -3249,7 +3318,7 @@ function dashboardHtml() {
 let countdown = 30;
 async function load() {
   try {
-    const d = await fetch('/mcp/usage/data').then(r => r.json());
+    const d = await fetch('${dataPath}').then(r => r.json());
     document.getElementById('subtitle').textContent =
       new Date().toLocaleString() + ' — ' + d.total + ' total calls tracked (' + d.source + ')';
 
@@ -3298,6 +3367,7 @@ async function load() {
       const t = new Date(e.ts).toLocaleString();
       const sid = e.session ? e.session.slice(0,8) + '…' : '—';
       return '<tr><td>' + t + '</td>' +
+        '<td>' + (e.site||'—') + '</td>' +
         '<td class="session" title="' + (e.session||'') + '">' + sid + '</td>' +
         '<td class="tool">' + (e.tool||'') + '</td>' +
         '<td class="' + (e.status==='ok'?'ok':'error') + '">' + e.status + '</td>' +
@@ -3327,6 +3397,23 @@ setInterval(tick, 1000);
 }
 
 // --- HTTP server ---
+//
+// Routes (site = null when the path names no site):
+//   /mcp[/<site>]              MCP endpoint; bare /mcp serves DEFAULT_SITE
+//   /mcp[/<site>]/usage        usage dashboard; bare /mcp/usage covers all sites
+//   /mcp[/<site>]/usage/data   dashboard stats JSON
+function matchRoute(pathname) {
+  const parts = pathname.split("/").filter(Boolean);
+  if (parts.shift() !== "mcp") return null;
+  let site = null;
+  if (parts.length > 0 && parts[0] !== "usage") {
+    site = SITES.get(parts.shift());
+    if (!site) return null;
+  }
+  const view = parts.length === 0 ? "mcp" : parts.join("/");
+  return ["mcp", "usage", "usage/data"].includes(view) ? { site, view } : null;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const cors = corsHeaders(req);
@@ -3341,9 +3428,12 @@ const server = http.createServer(async (req, res) => {
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
+    const route = matchRoute(url.pathname);
+    if (!route) return send(res, 404, { error: "Not Found" }, cors);
+
     // Dashboard routes (GET only, no CORS restriction needed — read-only)
-    if (url.pathname === "/mcp/usage" && req.method === "GET") {
-      const html = dashboardHtml();
+    if (route.view === "usage" && req.method === "GET") {
+      const html = dashboardHtml(route.site);
       res.writeHead(200, {
         "Content-Type": "text/html; charset=utf-8",
         "Content-Length": Buffer.byteLength(html),
@@ -3352,8 +3442,9 @@ const server = http.createServer(async (req, res) => {
       return res.end(html);
     }
 
-    if (url.pathname === "/mcp/usage/data" && req.method === "GET") {
-      const events = LOG_FILE ? await readLogFile() : logBuffer;
+    if (route.view === "usage/data" && req.method === "GET") {
+      let events = LOG_FILE ? await readLogFile() : logBuffer;
+      if (route.site) events = events.filter((e) => e.site === route.site.id);
       const stats = computeStats(events);
       const body = JSON.stringify(stats);
       res.writeHead(200, {
@@ -3365,7 +3456,8 @@ const server = http.createServer(async (req, res) => {
       return res.end(body);
     }
 
-    if (url.pathname !== "/mcp") return send(res, 404, { error: "Not Found" }, cors);
+    if (route.view !== "mcp") return send(res, 404, { error: "Not Found" }, cors);
+    const site = route.site || DEFAULT_SITE;
 
     // Block state-changing or session-handshake requests from disallowed
     // origins. The preflight is already answered above; this guards the
@@ -3386,7 +3478,7 @@ const server = http.createServer(async (req, res) => {
           Allow: "POST, OPTIONS",
         });
       }
-      return send(res, 200, getServerDiscoveryDoc(), {
+      return send(res, 200, getServerDiscoveryDoc(site), {
         ...cors,
         "Cache-Control": "no-store",
       });
@@ -3401,10 +3493,10 @@ const server = http.createServer(async (req, res) => {
     if (msg?.method === "initialize") {
       pruneOldSessions();
       sessionId = randomUUID();
-      activeSessions.set(sessionId, { created: new Date().toISOString(), lastSeen: new Date().toISOString() });
-      log({ event: "session_start", session: sessionId });
+      activeSessions.set(sessionId, { site: site.id, created: new Date().toISOString(), lastSeen: new Date().toISOString() });
+      log({ event: "session_start", site: site.id, session: sessionId });
     } else {
-      sessionId = getOrCreateSession(sessionId);
+      sessionId = getOrCreateSession(sessionId, site);
       if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();
     }
 
@@ -3412,7 +3504,7 @@ const server = http.createServer(async (req, res) => {
       ...cors,
       ...(sessionId ? { [SESSION_HEADER]: sessionId } : {}),
     };
-    const reply = await handleJsonRpc(msg, sessionId);
+    const reply = await handleJsonRpc(msg, site, sessionId);
 
     if (reply === null) return send(res, 202, null, sessionHeaders);   // notification → no body
     return send(res, 200, reply, sessionHeaders);
@@ -3432,7 +3524,9 @@ if (USE_STDIO) {
 } else {
   server.listen(PORT, HOST, () => {
     console.error(`Gramene MCP server listening on http://${HOST}:${PORT}/mcp`);
-    console.error(`Backed by Gramene REST API at ${GRAMENE_API_BASE}`);
+    for (const s of SITES.values()) {
+      console.error(`  /mcp/${s.id} → ${s.apiBase}${s === DEFAULT_SITE ? "  (also /mcp)" : ""}`);
+    }
   });
 }
 
@@ -3449,13 +3543,21 @@ process.on("SIGTERM", shutdown);
 //
 // One JSON-RPC message per line, both directions. Anything written to stdout
 // that isn't a response will corrupt the stream — all logging goes to stderr.
+// Serves one site: `--site <id>` picks it, otherwise DEFAULT_SITE.
 function runStdio() {
-  console.error(`Gramene MCP server on stdio. Backed by ${GRAMENE_API_BASE}`);
+  const i = process.argv.indexOf("--site");
+  const site = i >= 0 ? SITES.get(process.argv[i + 1]) : DEFAULT_SITE;
+  if (!site) {
+    console.error(`Unknown --site "${process.argv[i + 1]}". Configured: ${[...SITES.keys()].join(", ")}`);
+    process.exit(1);
+  }
+  console.error(`Gramene MCP server on stdio. Site ${site.id} backed by ${site.apiBase}`);
   process.stdin.setEncoding("utf8");
 
   // stdio is single-session — synthesise a stable id for log correlation.
   const sessionId = randomUUID();
   activeSessions.set(sessionId, {
+    site: site.id,
     created: new Date().toISOString(),
     lastSeen: new Date().toISOString(),
   });
@@ -3468,14 +3570,14 @@ function runStdio() {
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
       if (!line) continue;
-      handleStdioLine(line, sessionId);
+      handleStdioLine(line, site, sessionId);
     }
   });
 
   process.stdin.on("end", () => process.exit(0));
 }
 
-async function handleStdioLine(line, sessionId) {
+async function handleStdioLine(line, site, sessionId) {
   let msg;
   try {
     msg = JSON.parse(line);
@@ -3485,7 +3587,7 @@ async function handleStdioLine(line, sessionId) {
     return;
   }
   try {
-    const reply = await handleJsonRpc(msg, sessionId);
+    const reply = await handleJsonRpc(msg, site, sessionId);
     if (reply !== null) process.stdout.write(JSON.stringify(reply) + "\n");
     // null reply = notification; nothing to send.
     if (sessionId) activeSessions.get(sessionId).lastSeen = new Date().toISOString();

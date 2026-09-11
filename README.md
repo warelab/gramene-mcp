@@ -25,7 +25,45 @@ npm install
 | `MCP_ALLOWED_ORIGINS` | _(localhost only)_ | Comma-separated CORS origins; set to `*` to allow all |
 | `MCP_LOG` | `true` | Write JSON request logs to stderr |
 | `MCP_LOG_FILE` | _(none)_ | Optional path for a persistent log file |
-| `GRAMENE_API_BASE` | `https://data.gramene.org/v69` | Gramene REST API base URL. Override to point at a species-focused stack. |
+| `GRAMENE_SITES` | _(none)_ | Serve several sites from one process: comma-separated `id=apiBase` pairs, or a JSON array of `{id, apiBase, description}`. See [Multiple sites](#multiple-sites). Takes precedence over `GRAMENE_API_BASE`. |
+| `GRAMENE_API_BASE` | `https://data.gramene.org/v69` | Single-site shorthand: Gramene REST API base URL. The site id is the URL's last path segment (e.g. `v69`). |
+
+### Multiple sites
+
+One server process can front several Gramene releases or species-focused stacks. Each site gets its own MCP endpoint, its own reference-data cache, and its own usage dashboard:
+
+```bash
+GRAMENE_SITES="v69=https://data.gramene.org/v69,sorghum_v11=https://data.sorghumbase.org/sorghum_v11,oryza_v9=https://data.gramene.org/oryza_v9" npm start
+```
+
+To tell MCP clients what each site contains, use the JSON form and give each site a `description`:
+
+```bash
+GRAMENE_SITES='[{"id":"v69","apiBase":"https://data.gramene.org/v69","description":"Gramene release 69: 233 plant and algal genomes."}]' npm start
+```
+
+On `initialize`, each site sends MCP `instructions` naming its site id, API base and description. Every site exposes the same tool names, so this is how a client connected to several sites tells them apart. [ecosystem.config.cjs](ecosystem.config.cjs) has a full example.
+
+| Path | Serves |
+|---|---|
+| `/mcp/<id>` | MCP endpoint for that site (e.g. `/mcp/sorghum_v11`) |
+| `/mcp/<id>/usage` | Usage dashboard for that site |
+| `/mcp` | Alias for the **first** site listed |
+| `/mcp/usage` | Usage dashboard across all sites |
+
+Site ids may contain letters, digits, `_`, `.` and `-`; `usage` is reserved. `GET /mcp/<id>` returns a discovery document listing every configured site.
+
+To publish the sites under a public host (e.g. `https://data.gramene.org/mcp/v69`), reverse-proxy the `/mcp/` prefix to the server unchanged. For nginx:
+
+```nginx
+location /mcp/ {
+    proxy_pass http://squam.cshl.edu:11065;   # no trailing slash: keeps the /mcp/ prefix
+    proxy_http_version 1.1;
+    proxy_buffering off;
+}
+```
+
+In stdio mode the server serves one site: pass `--site <id>` to choose it (default: the first site).
 
 ## Starting the server
 
@@ -40,7 +78,7 @@ npm run dev
 GRAMENE_API_BASE=https://data.gramene.org/v70 npm start
 ```
 
-The server listens for MCP JSON-RPC requests at `POST http://<MCP_HOST>:<MCP_PORT>/mcp`.
+The server listens for MCP JSON-RPC requests at `POST http://<MCP_HOST>:<MCP_PORT>/mcp/<site-id>`; bare `/mcp` serves the first configured site.
 
 ## Connecting to MCP clients
 
@@ -51,30 +89,27 @@ The server speaks two transports:
 
 The same `server.mjs` handles both — pass `--stdio` (or set `MCP_STDIO=1`) to switch into stdio mode.
 
-### Claude Desktop
+### Claude (claude.ai and Claude Desktop)
 
-Edit `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Remote — custom connectors.** Add each site as its own connector under **Settings → Connectors → Add custom connector**, leaving the OAuth fields empty:
 
-**stdio (recommended for local use):**
+| Connector | URL |
+|---|---|
+| Gramene v69 | `https://data.gramene.org/mcp/v69` |
+| SorghumBase v11 | `https://data.gramene.org/mcp/sorghum_v11` |
+| Gramene Oryza v9 | `https://data.gramene.org/mcp/oryza_v9` |
+
+Claude reaches connectors from Anthropic's cloud, so the URL must be publicly reachable over HTTPS; a `127.0.0.1` or firewalled address won't work. Connectors belong to your Claude account, so one added on claude.ai also appears in Claude Desktop. On Team and Enterprise plans an organization owner may need to add them. All sites expose the same tool names, so name connectors clearly and enable only the site a chat needs.
+
+**Local — stdio (Claude Desktop only).** Edit `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`). This file configures local servers only; remote URLs belong in Connectors. Add one entry per site:
 
 ```json
 {
   "mcpServers": {
-    "gramene": {
+    "gramene-oryza-v9": {
       "command": "node",
-      "args": ["/absolute/path/to/gramene-mcp/server.mjs", "--stdio"]
-    }
-  }
-}
-```
-
-**HTTP:**
-
-```json
-{
-  "mcpServers": {
-    "gramene": {
-      "url": "http://127.0.0.1:8787/mcp"
+      "args": ["/absolute/path/to/gramene-mcp/server.mjs", "--stdio"],
+      "env": { "GRAMENE_API_BASE": "https://data.gramene.org/oryza_v9" }
     }
   }
 }
@@ -82,18 +117,18 @@ Edit `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/
 
 Restart Claude Desktop after saving.
 
-### Claude Code / Cowork
+### Claude Code
+
+**HTTP** (one server per site):
+
+```bash
+claude mcp add --transport http gramene-v69 https://data.gramene.org/mcp/v69
+```
 
 **stdio:**
 
 ```bash
-claude mcp add gramene -- node /absolute/path/to/gramene-mcp/server.mjs --stdio
-```
-
-**HTTP:**
-
-```bash
-claude mcp add gramene --url http://127.0.0.1:8787/mcp
+claude mcp add gramene-oryza-v9 -e GRAMENE_API_BASE=https://data.gramene.org/oryza_v9 -- node /absolute/path/to/gramene-mcp/server.mjs --stdio
 ```
 
 ### VS Code (GitHub Copilot)
@@ -191,12 +226,14 @@ See the [Continue MCP docs](https://docs.continue.dev/customize/model-context-pr
 
 ### Any MCP-compliant client
 
-The server endpoint is:
+Each site's endpoint is:
 
 ```
-POST http://<host>:<port>/mcp
+POST http://<host>:<port>/mcp/<site-id>
 Content-Type: application/json
 ```
+
+Bare `/mcp` serves the first configured site.
 
 It accepts standard MCP JSON-RPC 2.0 messages (`initialize`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`). Sessions are tracked via the `Mcp-Session-Id` header returned on `initialize` — echo it back on subsequent requests if your client supports session continuity.
 

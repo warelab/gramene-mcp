@@ -58,6 +58,7 @@ describe("MCP protocol", () => {
     // Server picks the first supported protocol version on initialize.
     assert.ok(res.result.protocolVersion, "Expected protocolVersion in initialize result");
     assert.equal(res.result.serverInfo.name, "gramene-mcp");
+    assert.equal(typeof res.result.instructions, "string", "Expected site instructions");
     // Capabilities advertise both tools and prompts.
     assert.ok(res.result.capabilities?.tools, "Expected tools capability");
     assert.ok(res.result.capabilities?.prompts, "Expected prompts capability");
@@ -131,6 +132,11 @@ describe("HTTP edge cases", () => {
     assert.equal(res.status, 404);
   });
 
+  it("unknown site → 404", async () => {
+    const res = await fetch(new URL("/mcp/no_such_site", BASE), { method: "GET" });
+    assert.equal(res.status, 404);
+  });
+
   it("empty body → 400", async () => {
     const res = await fetch(BASE, {
       method: "POST",
@@ -138,6 +144,67 @@ describe("HTTP edge cases", () => {
       body: "",
     });
     assert.equal(res.status, 400);
+  });
+});
+
+// ─── Multi-site routing ──────────────────────────────────────────────
+
+describe("Multi-site routing", () => {
+  async function discovery() {
+    const res = await fetch(new URL("/mcp", BASE), { method: "GET" });
+    assert.equal(res.status, 200);
+    return res.json();
+  }
+
+  it("discovery document lists every configured site", async () => {
+    const doc = await discovery();
+    assert.ok(Array.isArray(doc.sites) && doc.sites.length > 0, "Expected sites[]");
+    for (const s of doc.sites) {
+      assert.ok(s.id && s.apiBase, "site needs id and apiBase");
+      assert.equal(s.mcp, `/mcp/${s.id}`);
+    }
+    // Bare /mcp is an alias for the first site.
+    assert.equal(doc.site.id, doc.sites[0].id);
+  });
+
+  it("each site endpoint answers initialize and reports itself", async () => {
+    const doc = await discovery();
+    for (const s of doc.sites) {
+      const url = new URL(s.mcp, BASE);
+      const init = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      });
+      assert.equal(init.status, 200, `initialize on ${s.mcp}`);
+      assert.ok(init.headers.get("mcp-session-id"), `session id from ${s.mcp}`);
+      const { result } = await init.json();
+      assert.ok(result.instructions.includes(`"${s.id}"`), `instructions should name ${s.id}`);
+      assert.ok(result.instructions.includes(s.apiBase), `instructions should name ${s.apiBase}`);
+      if (s.description) assert.ok(result.instructions.includes(s.description), "instructions should include description");
+      const siteDoc = await fetch(url).then((r) => r.json());
+      assert.equal(siteDoc.site.id, s.id);
+      assert.equal(siteDoc.site.apiBase, s.apiBase);
+    }
+  });
+
+  it("a session from one site is not honored on another", async (t) => {
+    const doc = await discovery();
+    if (doc.sites.length < 2) return t.skip("needs at least two configured sites");
+    const [a, b] = doc.sites.map((s) => new URL(s.mcp, BASE));
+    const init = await fetch(a, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const sid = init.headers.get("mcp-session-id");
+    const res = await fetch(b, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Mcp-Session-Id": sid },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("mcp-session-id"), null);
   });
 });
 
