@@ -1,6 +1,6 @@
 {
   "name": "gramene-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "MCP server bridging Claude to the Gramene REST API (data.gramene.org)",
   "type": "module",
   "main": "server.mjs",

@@ -241,10 +241,16 @@ If the server is on a remote host, make sure `MCP_ALLOWED_ORIGINS` is set to all
 
 ## Tools
 
-The server exposes 12 tools. They map onto two API endpoint families: `/search` and `/suggest` (Solr-backed) and `/<collection>` (MongoDB-backed).
+The server exposes 18 tools. They map onto two API endpoint families: `/search` and `/suggest` (Solr-backed) and `/<collection>` (MongoDB-backed).
 
 | Tool | Description |
 |---|---|
+| `gene_search` | **Start here for filter-style searches.** Runs the same filter tree the web UI uses, so a shared saved view can be executed verbatim. Absorbs expression attributes (categorical *and* numeric), MAKER model quality, faceting/stats and BED export as parameters |
+| `variant_genes` | rsID → the genes it falls in, summarized per genome. rsIDs are projected across the pan-genome, so one rsID fans out to hundreds of genes; this returns counts plus a sample rather than the raw documents. `severity` selects all / protein-altering / protein-truncating |
+| `expand_gene_set` | Expand seed genes to orthologs, a single ortholog class, paralogs, their whole Compara tree, or a genomic/compara neighbourhood window |
+| `gene_sequence` | Genomic/CDS/cDNA/protein sequence for genes, or any interval, from the Ensembl REST mirror. Species is inferred from the index; regions are validated against the assembly |
+| `resolve_gene_ids` | Normalize identifiers before anything else — resolves current *and* legacy/alternate ids, and separates resolved / ambiguous / unknown |
+| `saved_searches` | Discover published saved views and gene lists; a view's filter tree feeds straight back into `gene_search` |
 | `solr_search` | Full Solr query against `/search` — field lists, filters, facets, sorting, pagination. Use for single-gene cards (`q="id:…"`) and to produce facet-count arrays consumed by the client-side enrichment skill |
 | `solr_suggest` | Calls `/suggest`. Entry point for free-text concepts (gene name, family, pathway, species, ontology, trait) → `fq_field`/`fq_value`. Always start here before `mongo_find`. Returns the Solr grouped envelope (`grouped.category.groups[].doclist.docs[]`). |
 | `solr_search_bool` | Structured AND/OR/NOT boolean queries compiled into `/search` `fq` clauses |
