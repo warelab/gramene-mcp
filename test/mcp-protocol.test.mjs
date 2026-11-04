@@ -73,17 +73,23 @@ describe("MCP protocol", () => {
     const res = await rpc("tools/list");
     const names = res.result.tools.map((t) => t.name).sort();
     assert.deepEqual(names, [
+      "expand_gene_set",
       "expression_for_genes",
+      "gene_search",
+      "gene_sequence",
       "genes_in_region",
       "kb_relations",
       "mongo_find",
       "mongo_list_collections",
       "mongo_lookup_by_ids",
       "pubmed_for_genes",
+      "resolve_gene_ids",
+      "saved_searches",
       "solr_graph",
       "solr_search",
       "solr_search_bool",
       "solr_suggest",
+      "variant_genes",
       "vep_for_gene",
     ]);
   });
@@ -987,5 +993,200 @@ describe("prompts/get", () => {
         assert.ok(a.description, `arg.description required (${p.name}.${a.name})`);
       }
     }
+  });
+});
+
+// --- SorghumBase v11 tools -----------------------------------------------------
+// These exercise sorghum-specific fields, so they are skipped against any other site.
+// Fixture counts were measured against the v11 index; they are exact on purpose — a
+// silent change in the index is exactly the kind of thing this suite should catch.
+const SB11 = {
+  gene:      "SORBI_3001G000200",   // minus strand, exons emit start>end in BED
+  midGene:   "SORBI_3001G100000",   // gene_idx 1059, compara_idx 1028 — different spaces
+  legacyId:  "Sb01g000200",         // resolves to SORBI_3001G000100
+  rsidLarge: "rs872208282",         // 327 genes across 100 genomes
+  map:       "GCA_000003195.3",
+};
+
+async function callTool(name, args) {
+  return rpc("tools/call", { name, arguments: args });
+}
+
+// Probe once: these fixtures only exist in the sorghum v11 index.
+let _sb11 = null;
+async function sb11() {
+  if (_sb11 === null) {
+    try {
+      const res = await callTool("gene_search", {
+        filters: { fq_field: "id", fq_value: SB11.gene }, output: "count",
+      });
+      _sb11 = !res.error && JSON.parse(res.result.content[0].text).numFound === 1;
+    } catch { _sb11 = false; }
+  }
+  return _sb11;
+}
+
+describe("SorghumBase v11 tools", () => {
+
+  it("solr_suggest returns results for free text", async (t) => {
+    if (!(await sb11())) return t.skip();
+    // Regression pin: /suggest has no default field, so a bare term used to match
+    // NOTHING. The tool now supplies the same boosts the web client sends.
+    const out = toolResult(await callTool("solr_suggest", { term: "msd2", rows: 2 }));
+    assert.ok(out.grouped.category.matches > 0, "free-text suggest returned no matches");
+  });
+
+  it("variant_genes summarizes the pan-genome fan-out", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge }));
+    assert.equal(out.n_genes, 327);
+    assert.equal(out.n_genomes, 100);
+    assert.equal(out.by_genome.length, 100);
+    assert.ok(out.sample_genes.length <= 5);
+  });
+
+  it("variant_genes severity is a ladder (PTV ⊆ PAV ⊆ all)", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const all = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge, severity: "all", sample_size: 0 }));
+    const pav = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge, severity: "PAV", sample_size: 0 }));
+    const ptv = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge, severity: "PTV", sample_size: 0 }));
+    assert.ok(ptv.n_genes <= pav.n_genes && pav.n_genes <= all.n_genes);
+  });
+
+  it("variant_genes rejects a non-rsID", async () => {
+    const res = await callTool("variant_genes", { rsid: "notanrsid" });
+    assert.ok(res.error, "expected a tool error");
+  });
+
+  it("expand_gene_set: inverted homology fields", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const orth = toolResult(await callTool("expand_gene_set", { gene_ids: [SB11.gene], mode: "orthologs", rows: 0 }));
+    assert.equal(orth.n_genes, 69);
+    const para = toolResult(await callTool("expand_gene_set", { gene_ids: [SB11.gene], mode: "paralogs", rows: 0 }));
+    assert.equal(para.n_genes, 14);
+  });
+
+  it("expand_gene_set: neighbourhood modes use DIFFERENT seed index spaces", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const genomic = toolResult(await callTool("expand_gene_set", { gene_ids: [SB11.midGene], mode: "neighborhood", window: 10, rows: 0 }));
+    const compara = toolResult(await callTool("expand_gene_set", { gene_ids: [SB11.midGene], mode: "compara_neighborhood", window: 10, rows: 0 }));
+    assert.equal(genomic.seed_field, "gene_idx");
+    assert.equal(compara.seed_field, "compara_idx");
+    // The trap: seeding compara_neighbors_N with a gene_idx returns a plausible but
+    // WRONG count (22 instead of 21). Both windows are 2*10+1.
+    assert.notEqual(genomic.seeds[0].gene_idx, compara.seeds[0].compara_idx);
+    assert.equal(genomic.n_genes, 21);
+    assert.equal(compara.n_genes, 21);
+  });
+
+  it("gene_search escapes organ:level values", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("gene_search", {
+      filters: { fq_field: "expr_organ_level__attr_ss", fq_value: "leaf:high" }, output: "count",
+    }));
+    assert.match(out.query, /expr_organ_level__attr_ss:leaf\\:high/);
+    assert.equal(out.numFound, 16638);
+  });
+
+  it("gene_search sorts children and honours negate", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("gene_search", {
+      filters: {
+        operation: "AND",
+        children: [
+          { fq_field: "expr_specific_to__attr_ss", fq_value: "root" },
+          { fq_field: "expr_class__attr_ss", fq_value: "tissue_specific", negate: true },
+        ],
+      },
+      output: "count",
+    }));
+    // Sorted before joining, so NOT-prefixed clause sorts first regardless of input order.
+    assert.match(out.query, /^\*:\* AND \(\(NOT expr_class__attr_ss:tissue_specific AND expr_specific_to__attr_ss:root\)\)$/);
+  });
+
+  it("gene_search rewrites containment intervals to overlap", async (t) => {
+    if (!(await sb11())) return t.skip();
+    // QTL suggestion docs store start:[S TO E] with no end clause, which drops every
+    // gene spanning the boundary. SORBI_3001G000200 (11180-14899) spans this window.
+    const out = toolResult(await callTool("gene_search", {
+      filters: { fq_field: "location", fq_value: `(map:${SB11.map} AND region:1 AND start:[14000 TO 14100])` },
+      output: "count",
+    }));
+    assert.match(out.query, /start:\[\* TO 14100\] AND end:\[14000 TO \*\]/);
+    assert.equal(out.numFound, 1);
+  });
+
+  it("gene_search refuses both filters and saved_view_hash", async () => {
+    const res = await callTool("gene_search", { filters: { fq_field: "id", fq_value: "x" }, saved_view_hash: "abc" });
+    assert.ok(res.error);
+  });
+
+  it("gene_search BED output has valid coordinates", async (t) => {
+    if (!(await sb11())) return t.skip();
+    // Upstream emits chromStart > chromEnd on minus-strand features; we normalize.
+    const out = toolResult(await callTool("gene_search", {
+      filters: { fq_field: "id", fq_value: SB11.gene }, output: "bed", bed_feature: "exon",
+    }));
+    const bad = out.bed.split("\n").filter(Boolean).filter((l) => {
+      const f = l.split("\t");
+      return Number(f[1]) > Number(f[2]);
+    });
+    assert.equal(bad.length, 0, `invalid BED lines: ${bad.slice(0, 2).join(" | ")}`);
+  });
+
+  it("resolve_gene_ids resolves legacy identifiers", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("resolve_gene_ids", {
+      ids: [SB11.gene, SB11.legacyId, "BOGUS_ID_1"],
+    }));
+    assert.equal(out.counts.resolved, 2);
+    assert.deepEqual(out.unknown, ["BOGUS_ID_1"]);
+    assert.ok(out.resolved.some((r) => r.input === SB11.legacyId && r.id === "SORBI_3001G000100"));
+  });
+
+  it("gene_sequence returns protein and infers species", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("gene_sequence", { gene_ids: [SB11.gene], type: "protein" }));
+    assert.equal(out.n_sequences, 1);
+    const s = out.sequences[0];
+    assert.equal(s.query, SB11.gene);
+    assert.equal(s.species, "sorghum_bicolor");
+    assert.equal(s.molecule, "protein");
+    assert.ok(s.seq.startsWith("MKKWGNSGQ"));
+  });
+
+  it("gene_sequence validates regions against the assembly", async (t) => {
+    if (!(await sb11())) return t.skip();
+    // sorghum_tx430nano is a contig assembly with no chromosome '1'.
+    const res = await callTool("gene_sequence", {
+      region: { species: "sorghum_tx430nano", region: "1", start: 1000, end: 2000 },
+    });
+    assert.ok(res.error);
+    assert.match(res.error.message, /not a top-level region/);
+  });
+
+  it("saved_searches round-trips a view into gene_search", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const list = toolResult(await callTool("saved_searches", { kind: "views" }));
+    const withFilters = list.items.find((i) => i.has_filters);
+    if (!withFilters) return t.skip();
+    const out = toolResult(await callTool("gene_search", { saved_view_hash: withFilters.hash, output: "count" }));
+    assert.equal(out.saved_view.hash, withFilters.hash);
+    assert.ok(typeof out.numFound === "number");
+  });
+
+  it("gene lists report that membership is unavailable", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const out = toolResult(await callTool("saved_searches", { kind: "lists" }));
+    assert.ok(out.warning, "expected a warning that list membership cannot be resolved");
+  });
+
+  it("large results are capped but stay parseable", async (t) => {
+    if (!(await sb11())) return t.skip();
+    const res = await callTool("solr_search", { q: "*:*", rows: 1000, fl: "*" });
+    const text = res.result.content[0].text;
+    assert.ok(text.length <= 220000, `result was ${text.length} bytes`);
+    const parsed = JSON.parse(text);
+    assert.ok(parsed._truncated, "expected a _truncated note");
   });
 });

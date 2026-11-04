@@ -97,7 +97,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.3.0";
+const SERVER_VERSION = "0.5.0";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -585,6 +585,13 @@ const COLLECTIONS = [
   "genes", "genetrees", "maps", "domains", "taxonomy",
   "GO", "PO", "TO", "qtls", "pathways",
   "expression", "assays", "experiments", "germplasm",
+  // Rich per-gene expression summary: the Mongo source behind the expr_*__attr_*
+  // search fields (tau, max_tpm, breadth, per_organ, activated_by/repressed_by).
+  // Use gene_search to FIND genes by those values; this to READ one gene's profile.
+  "expression_attributes",
+  // "homologs" (2.68M docs) is deliberately NOT listed yet: the /{collection}
+  // catch-all that serves it is fixed in the deployed swagger tree but the service
+  // has not been restarted, so requests still fail. Add it once that lands.
 ];
 
 // --- Gramene REST API helpers ---
@@ -610,9 +617,22 @@ function apiUrl(site, path, params) {
   return url.toString();
 }
 
+// Requests to the Gramene API had no timeout at all: a slow Solr query (a wide facet
+// over a 5.4M-doc core, say) would hang the tool call forever, and this process serves
+// three sites, so one stuck call ties up a connection for everyone.
+const API_TIMEOUT_MS = Number(process.env.GRAMENE_API_TIMEOUT_MS || "30000");
+
 async function apiGet(site, path, params) {
   const url = apiUrl(site, path, params);
-  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  const r = await fetch(url, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  }).catch((e) => {
+    if (e?.name === "TimeoutError" || /abort/i.test(e?.message || "")) {
+      throw new Error(`Gramene API timed out after ${API_TIMEOUT_MS}ms on ${path} — narrow the query (fewer rows, smaller facet.limit)`);
+    }
+    throw e;
+  });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
     throw new Error(`Gramene API HTTP ${r.status} on ${path}: ${txt || r.statusText}`);
@@ -717,12 +737,189 @@ async function collectionFetch(site, collection, params) {
   return apiGet(site, `/${collection}`, params || {});
 }
 
+// --- Result-size policy -------------------------------------------------------
+// Every tool result is pretty-printed into ONE text block that lands directly in the
+// model's context. A 1000-doc Solr response is megabytes of JSON, which exhausts the
+// context before the agent can read any of it. Cap centrally, in the dispatcher, so
+// the pre-existing tools are covered too.
+const RESULT_MAX_BYTES = Number(process.env.MCP_MAX_RESULT_BYTES || "200000");
+const RESULT_SAMPLE_DOCS = 20;
+const DEFAULT_GENE_FL =
+  "id,name,description,system_name,taxon_id,region,start,end,strand,biotype";
+
+function capRows(rows, { def = 50, max = 200, name = "rows" } = {}) {
+  if (rows === undefined || rows === null) return def;
+  if (!Number.isInteger(rows) || rows < 0) throw new Error(`${name} must be a non-negative integer`);
+  return Math.min(rows, max);
+}
+
+function capArray(a, max, name) {
+  if (!Array.isArray(a) || a.length === 0) throw new Error(`${name} must be a non-empty array`);
+  if (a.length > max) throw new Error(`${name} accepts at most ${max} entries (got ${a.length})`);
+  return a;
+}
+
+// Trim the biggest doc array and SAY SO, rather than truncating the JSON text (which
+// would hand the model unparseable output) or silently dropping rows.
+function capResultText(result) {
+  let text = JSON.stringify(result, null, 2);
+  if (Buffer.byteLength(text) <= RESULT_MAX_BYTES) return text;
+  const trimmed = structuredClone(result);
+  const paths = [["response", "docs"], ["docs"], ["genes"], ["sequences"], ["items"], ["by_genome"]];
+  // Trim repeatedly: one pass is not enough. With fl=* a single gene document can carry
+  // thousands of rsIDs, so even 20 docs can exceed the budget on their own. Halve until
+  // it fits or we are down to a single element.
+  let keep = RESULT_SAMPLE_DOCS;
+  for (let pass = 0; pass < 8; pass++) {
+    let touched = false;
+    for (const path of paths) {
+      let node = trimmed;
+      for (let i = 0; i < path.length - 1; i++) node = node?.[path[i]];
+      const key = path[path.length - 1];
+      const arr = node?.[key];
+      if (Array.isArray(arr) && arr.length > keep) {
+        const total = trimmed._truncated?.total ?? arr.length;
+        node[key] = arr.slice(0, keep);
+        trimmed._truncated = {
+          reason: `result exceeded ${RESULT_MAX_BYTES} bytes`,
+          path: path.join("."), kept: keep, total,
+          advice: "narrow 'fl' (attribute fields like rsid__attr_ss hold thousands of values), lower 'rows', or ask for a summary (rows:0 with a facet).",
+        };
+        touched = true;
+      }
+    }
+    text = JSON.stringify(trimmed, null, 2);
+    if (Buffer.byteLength(text) <= RESULT_MAX_BYTES) return text;
+    if (!touched && keep <= 1) break;
+    keep = keep > 1 ? Math.floor(keep / 2) : 1;
+    if (keep < 1) keep = 1;
+  }
+  // Still too big with a single element — the individual document is the problem. Say so
+  // rather than handing back unparseable truncated JSON.
+  if (Buffer.byteLength(text) > RESULT_MAX_BYTES) {
+    return JSON.stringify({
+      _truncated: {
+        reason: `result exceeded ${RESULT_MAX_BYTES} bytes even at one element`,
+        advice: "a single document is too large — request specific fields with 'fl' instead of '*'.",
+      },
+      ...(trimmed._truncated && { detail: trimmed._truncated }),
+    }, null, 2);
+  }
+  return text;
+}
+
 function solrEscapeValue(v) {
   // Wraps value in quotes for use in fq clauses (field:"value").
   // Safe for spaces and special chars; fine for numeric IDs too.
   const s = String(v);
   const escaped = s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   return `"${escaped}"`;
+}
+
+// --- Filter-tree serialization -------------------------------------------------
+// Verbatim port of gramene-search src/bundles/filters.js:
+// selectGrameneFiltersQueryString (:641-695), EXPANSIONS (:91-116),
+// escapeForQuery (:150-152), formatIntervalValue (:43-46).
+// Keep the regexes and the BRANCH ORDER character-identical: if this drifts, the same
+// saved view returns different genes in the web UI and here, silently.
+const FT_HAS_SPACES    = /^[^\[\(].*\s/;
+const FT_IS_QUERY      = /\([a-zA-Z0-9_]+:[a-zA-Z0-9_]+\s/;
+const FT_IS_REGION     = /^\(map:/;
+const FT_ID_WITH_COLON = /^[a-zA-Z0-9_]+:[a-zA-Z0-9_]+$/;
+
+const FT_EXPANSIONS = {
+  orthologs:    { from: "homology__all_orthologs",          to: "id" },
+  paralogs:     { from: "homology__within_species_paralog", to: "id" },
+  neighborhood: { from: "compara_neighbors_10",             to: "compara_idx_multi" },
+};
+
+// Backslash FIRST, then quote — the order matters, or the backslashes added for the
+// colon-escaped values get un-escaped by Solr's inner parser and the query degenerates
+// to the whole index (5,407,132 rows instead of 789,630, HTTP 200, no error).
+function ftEscapeForQuery(sub) {
+  return String(sub).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+// QTL suggestion documents in sorghum_suggestions11 store a CONTAINMENT interval —
+// "(map:M AND region:R AND start:[S TO E])" — with no end clause, so every gene that
+// starts before the interval and reaches into it is missed. The client's
+// formatIntervalValue already emits the correct OVERLAP form; these 13,461 stored docs
+// predate it. Rewrite on the way past so callers get the right genes without waiting
+// for a suggestions reindex.
+const FT_INTERVAL_CONTAIN =
+  /^\(map:(\S+) AND region:(\S+) AND start:\[(\d+) TO (\d+)\]\)$/;
+function ftNormalizeInterval(v) {
+  const m = FT_INTERVAL_CONTAIN.exec(String(v));
+  if (!m) return String(v);
+  return `(map:${m[1]} AND region:${m[2]} AND start:[* TO ${m[4]}] AND end:[${m[3]} TO *])`;
+}
+
+function ftOwnQuery(node, depth) {
+  if (depth > 12) throw new Error("filter tree nested deeper than 12 levels");
+  if (Object.prototype.hasOwnProperty.call(node, "children")) {
+    // Only AND and OR are valid infix operators; anything else would be interpolated
+    // raw and produce a Solr 400 that surfaces as blank results, not an error.
+    const op = (node.operation === "AND" || node.operation === "OR") ? node.operation : "OR";
+    const kids = Array.isArray(node.children) ? node.children : [];
+    if (kids.length > 200) throw new Error("filter node has more than 200 children");
+    // SORT before joining — keeps query strings canonical across clients.
+    return `(${kids.map((c) => ftGetQuery(c, depth + 1)).sort().join(` ${op} `)})`;
+  }
+  if (!node.fq_field || node.fq_value === undefined || node.fq_value === null) {
+    throw new Error("filter leaf requires 'fq_field' and 'fq_value'");
+  }
+  const raw = node.fq_field === "location" ? ftNormalizeInterval(node.fq_value) : String(node.fq_value);
+  // Branch order is load-bearing and matches filters.js exactly.
+  if (node.fq_field === "location" && FT_IS_REGION.test(raw)) return `${raw}`;
+  if (FT_IS_QUERY.test(raw))       return `${raw.replace(/:/g, "\\:")}`;
+  if (FT_HAS_SPACES.test(raw))     return `${node.fq_field}:"${raw}"`;
+  if (FT_ID_WITH_COLON.test(raw))  return `${node.fq_field}:${raw.replace(/:/g, "\\:")}`;
+  return `${node.fq_field}:${raw}`;
+}
+
+function ftGetQuery(node, depth = 0) {
+  if (!node || typeof node !== "object" || Array.isArray(node)) {
+    throw new Error("each filter node must be an object");
+  }
+  const negate = node.negate ? "NOT " : "";
+  const clause = ftOwnQuery(node, depth);
+  const expType = (typeof node.expand === "string" && node.expand) ? node.expand : null;
+  if (!expType) return `${negate}${clause}`;
+  const spec = FT_EXPANSIONS[expType];
+  // Unknown expansion (e.g. a link from a newer client): degrade to the un-expanded
+  // clause rather than emitting something broken.
+  if (!spec) return `${negate}${clause}`;
+  // An expansion of nothing must match nothing; '*:*' here would turn an empty group
+  // into "every gene in the index".
+  if (!clause || clause === "()") return `${negate}(*:* AND NOT *:*)`;
+  // The braces MUST stay inside the quoted _query_ value. A bare {!graph …} in q fails
+  // SILENTLY — 0 rows in some shapes, millions in others, always HTTP 200.
+  const graph = `{!graph from=${spec.from} to=${spec.to} maxDepth=1 returnRoot=true}`;
+  return `${negate}(_query_:"${graph}${ftEscapeForQuery(clause)}")`;
+}
+
+function ftQueryString(root) {
+  if (!root || typeof root !== "object") throw new Error("gene_search: 'filters' must be an object");
+  if (root.rightIdx === 1) return "*:*";          // empty tree, per filters.js:693
+  return `*:* AND (${ftGetQuery(root, 0)})`;
+}
+
+// gramene-bedify emits chromStart > chromEnd for minus-strand features (verified:
+// "1 14899 14503 EER93047-1 0 -"), which bedtools and IGV reject. Normalize on the way
+// out; the upstream bug is filed separately.
+function normalizeBed(raw) {
+  return String(raw)
+    .split("\n")
+    .filter((l) => l.length > 0)
+    .map((line) => {
+      const f = line.split("\t");
+      if (f.length >= 3) {
+        const a = Number(f[1]), b = Number(f[2]);
+        if (Number.isFinite(a) && Number.isFinite(b) && a > b) { f[1] = String(b); f[2] = String(a); }
+      }
+      return f.join("\t");
+    })
+    .join("\n");
 }
 
 function compileBoolFilter(node) {
@@ -1443,13 +1640,31 @@ async function tool_solr_search(args, site) {
   return searchFetch(site, args);
 }
 
+// /suggest does NOT apply field boosts of its own — it pipes `q` straight to Solr's
+// /query handler, which has no default field, so a bare term matches NOTHING.
+// Verified: q=msd2 -> 0 groups; the boosted form below -> 5. The web client has always
+// supplied the boosts itself (gramene-search/src/bundles/api.js:33); so must we.
+const SUGGEST_SIMPLE = /^[A-Za-z0-9_.:+-]+$/;
+
+function boostedSuggestQuery(term) {
+  const t = String(term).trim();
+  if (!t) throw new Error("solr_suggest: 'term' is empty");
+  if (t.length > 200) throw new Error("solr_suggest: 'term' longer than 200 chars");
+  if (!SUGGEST_SIMPLE.test(t)) {
+    // Phrases and Lucene metacharacters: quote it and drop the prefix wildcards,
+    // which are meaningless against a phrase.
+    const p = `"${t.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    return `{!boost b=relevance}name:${p}^5 synonym:${p}^3 text:${p}^1`;
+  }
+  return `{!boost b=relevance}name:${t}^5 ids:${t}^5 ids:${t}*^3 ` +
+         `synonym:${t}^3 synonym:${t}*^2 text:${t}*^1`;
+}
+
 async function tool_solr_suggest(args, site) {
   const { term, q, fq, rows = 10, start = 0 } = args || {};
-  // The API's /suggest endpoint applies its own field boosts. Pass either
-  // 'term' (free text) or 'q' (a raw query — useful for `name:"…"` lookups).
-  // 'term' takes precedence if both are provided.
-  const query = term || q;
-  if (!query) throw new Error("solr_suggest requires 'term' or 'q'");
+  if (!term && !q) throw new Error("solr_suggest requires 'term' or 'q'");
+  // 'term' = free text, gets the boosts. 'q' = caller-built raw Solr query, verbatim.
+  const query = term ? boostedSuggestQuery(term) : q;
   return suggestFetch(site, { q: query, fq, rows, start });
 }
 
@@ -1662,7 +1877,737 @@ const SOLR_QUERY_SCHEMA = {
   required: ["q"],
 };
 
+// --- SorghumBase v11 tools -----------------------------------------------------
+
+// /saved_views and /gene_lists key on a site FAMILY ("sorghum"), not the release id
+// ("sorghum_v11"). Override per site with userDataSite in GRAMENE_SITES if that ever
+// stops holding.
+function userDataSite(site) {
+  return site.userDataSite || String(site.id).replace(/_v\d+[a-z]?$/, "");
+}
+
+const GENE_SEARCH_MAX_BED_IDS = 5000;
+
+async function tool_gene_search(args, site) {
+  const {
+    filters, saved_view_hash, genomes, extra_fq, fl, sort,
+    facets, facet_limit = 50, stats,
+    output = "docs", bed_feature = "gene", bed_combiner = "canonical", start = 0,
+  } = args || {};
+  const rows = capRows(args?.rows, { def: 50, max: 200 });
+
+  let tree = filters;
+  let savedView = null;
+  if (saved_view_hash) {
+    if (filters) throw new Error("gene_search: pass either 'filters' or 'saved_view_hash', not both");
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(saved_view_hash)) throw new Error("gene_search: bad saved_view_hash");
+    const got = await apiGet(site, "/saved_views", { hash: saved_view_hash });
+    const doc = Array.isArray(got) ? got[0] : got;
+    tree = doc?.state?.filters;
+    if (!tree) throw new Error(`gene_search: saved view ${saved_view_hash} has no state.filters (private views need a Bearer token)`);
+    savedView = { hash: saved_view_hash, label: doc.label ?? null, site: doc.site ?? null };
+  }
+  if (!tree) throw new Error("gene_search requires 'filters' or 'saved_view_hash'");
+
+  const q = ftQueryString(tree);
+  const fq = [];
+  // The genome subset belongs in fq, never in q. These are SYNTHETIC per-assembly
+  // taxon ids (4558006 …), not NCBI ids — get them from /maps.
+  if (genomes !== undefined) {
+    const g = capArray(genomes, 300, "genomes");
+    for (const t of g) if (!Number.isInteger(t)) throw new Error("genomes must be integers");
+    fq.push(`taxon_id:(${g.join(" OR ")})`);
+  }
+  if (extra_fq !== undefined) {
+    if (!Array.isArray(extra_fq) || extra_fq.length > 10) throw new Error("extra_fq must be an array of at most 10 strings");
+    for (const c of extra_fq) if (typeof c !== "string") throw new Error("extra_fq entries must be strings");
+    fq.push(...extra_fq);
+  }
+
+  if (output === "count") {
+    const res = await searchFetch(site, { q, fq, rows: 0 });
+    return { query: q, fq, ...(savedView && { saved_view: savedView }), numFound: res.response?.numFound ?? 0 };
+  }
+
+  if (output === "bed") {
+    // wt=bed on /search is broken (it routes to /export, which needs docValues on id).
+    // Resolve ids first, then use the Mongo-backed /genes path, which works.
+    if (!["gene", "transcript", "exon", "intron", "CDS", "utr5", "utr3"].includes(bed_feature)) {
+      throw new Error(`gene_search: bad bed_feature '${bed_feature}'`);
+    }
+    if (!["canonical", "all"].includes(bed_combiner)) throw new Error("gene_search: bed_combiner must be 'canonical' or 'all'");
+    const hits = await searchFetch(site, { q, fq, fl: "id", rows: GENE_SEARCH_MAX_BED_IDS, sort: "gene_idx asc" });
+    const total = hits.response?.numFound ?? 0;
+    const ids = (hits.response?.docs || []).map((d) => d.id);
+    if (total > ids.length) {
+      throw new Error(`gene_search: ${total} genes exceeds the ${GENE_SEARCH_MAX_BED_IDS}-gene BED cap — narrow the filter`);
+    }
+    if (!ids.length) return { query: q, fq, n_genes: 0, bed: "" };
+    const url = apiUrl(site, "/genes", { idList: ids, wt: "bed", bedFeature: bed_feature, bedCombiner: bed_combiner, rows: ids.length });
+    const r = await fetch(url, { headers: { Accept: "text/plain" }, signal: AbortSignal.timeout(API_TIMEOUT_MS) });
+    if (!r.ok) throw new Error(`gene_search bed: HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 300)}`);
+    return {
+      query: q, fq, n_genes: ids.length, bed_feature, bed_combiner,
+      bed: normalizeBed(await r.text()),
+      note: "chromStart/chromEnd normalized here; the upstream BED writer emits start>end on minus-strand features.",
+    };
+  }
+
+  const res = await searchFetch(site, {
+    q, fq, start,
+    rows: output === "facets" ? 0 : rows,
+    fl: output === "facets" ? undefined : (fl || DEFAULT_GENE_FL),
+    sort,
+    ...(facets && { facet: { field: capArray(facets, 5, "facets"), limit: facet_limit, mincount: 1 } }),
+    ...(stats && { stats: { field: capArray(stats, 5, "stats") } }),
+  });
+  return { query: q, fq, ...(savedView && { saved_view: savedView }), ...res };
+}
+
+// PTV ⊆ PAV ⊆ all. Counts are genes carrying the field, across all 128 genomes.
+const RSID_SEVERITY_FIELD = {
+  all: "rsid__attr_ss",
+  PAV: "rsid_PAV__attr_ss",
+  PTV: "rsid_PTV__attr_ss",
+};
+
+async function tool_variant_genes(args, site) {
+  const { rsid, severity = "all", genomes, sample_size = 5 } = args || {};
+  if (typeof rsid !== "string" || !/^rs\d{1,20}$/.test(rsid)) {
+    throw new Error("variant_genes: 'rsid' must match /^rs\\d+$/ (e.g. rs162569336)");
+  }
+  const field = RSID_SEVERITY_FIELD[severity];
+  if (!field) throw new Error(`variant_genes: severity must be one of ${Object.keys(RSID_SEVERITY_FIELD).join(", ")}`);
+  if (!Number.isInteger(sample_size) || sample_size < 0 || sample_size > 50) {
+    throw new Error("variant_genes: sample_size must be an integer 0..50");
+  }
+  const fq = [];
+  if (genomes !== undefined) {
+    const g = capArray(genomes, 300, "genomes");
+    for (const t of g) if (!Number.isInteger(t)) throw new Error("genomes must be integers");
+    fq.push(`taxon_id:(${g.join(" OR ")})`);
+  }
+  const q = `${field}:${solrEscapeValue(rsid)}`;
+  const res = await searchFetch(site, {
+    q, fq, rows: sample_size, sort: "system_name asc",
+    fl: "id,system_name,taxon_id,region,start,end,biotype",
+    facet: { field: "system_name", limit: -1, mincount: 1 },
+  });
+  const ff = res.facet_counts?.facet_fields?.system_name || [];
+  const byGenome = [];
+  for (let i = 0; i < ff.length; i += 2) byGenome.push({ system_name: ff[i], n_genes: ff[i + 1] });
+  return {
+    rsid, severity, solr_field: field, query: q,
+    n_genes: res.response?.numFound ?? 0,
+    n_genomes: byGenome.length,
+    by_genome: byGenome,
+    sample_genes: res.response?.docs || [],
+    note:
+      "rsIDs are PROJECTED across the pan-genome, so one rsID maps to the orthologous " +
+      "gene in every assembly carrying it: n_genes is a fan-out, not a count of distinct " +
+      "variants. PTV (truncating) subset of PAV (protein-altering) subset of all. For full " +
+      `docs in one genome, call gene_search with {"fq_field":"${field}","fq_value":"${rsid}"} ` +
+      "plus genomes:[<taxon_id>].",
+  };
+}
+
+// Homology fields are INVERTED: gene B's homology__* lists gene A's id, so one query on
+// A's id returns every homolog of A — no second round-trip, no graph traversal.
+// The neighborhood modes are two-step, and the seed fields are DIFFERENT INDEX SPACES:
+// neighbors_N is keyed on gene_idx, compara_neighbors_N on compara_idx. Seeding the
+// compara field with a gene_idx returns a plausible but WRONG answer (22 vs 21 genes
+// for SORBI_3001G100000, whose gene_idx is 1059 and compara_idx 1028).
+const EXPAND_MODES = {
+  orthologs:            { field: "homology__all_orthologs",          seed: "id" },
+  one2one:              { field: "homology__ortholog_one2one",       seed: "id" },
+  one2many:             { field: "homology__ortholog_one2many",      seed: "id" },
+  many2many:            { field: "homology__ortholog_many2many",     seed: "id" },
+  paralogs:             { field: "homology__within_species_paralog", seed: "id" },
+  gene_split:           { field: "homology__gene_split",             seed: "id" },
+  tree:                 { field: "gene_tree",                        seed: "gene_tree" },
+  neighborhood:         { field: "neighbors_",                       seed: "gene_idx" },
+  compara_neighborhood: { field: "compara_neighbors_",               seed: "compara_idx" },
+};
+
+async function tool_expand_gene_set(args, site) {
+  const { gene_ids, mode, window = 10, genomes, fl, facet_by_genome = true } = args || {};
+  capArray(gene_ids, 50, "gene_ids");
+  for (const g of gene_ids) {
+    if (typeof g !== "string" || !g || g.length > 128) throw new Error("gene_ids must be non-empty strings of at most 128 chars");
+  }
+  const spec = EXPAND_MODES[mode];
+  if (!spec) throw new Error(`expand_gene_set: mode must be one of ${Object.keys(EXPAND_MODES).join(", ")}`);
+  const rows = capRows(args?.rows, { def: 50, max: 200 });
+  const twoStep = spec.seed !== "id";
+  if (twoStep && ![5, 10, 20].includes(window)) throw new Error("expand_gene_set: window must be 5, 10 or 20");
+
+  let clauses, seeds = null;
+  if (!twoStep) {
+    clauses = gene_ids.map((g) => `${spec.field}:${solrEscapeValue(g)}`);
+  } else {
+    const look = await searchFetch(site, {
+      q: `id:(${gene_ids.map(solrEscapeValue).join(" OR ")})`,
+      fl: `id,${spec.seed}`, rows: gene_ids.length,
+    });
+    seeds = (look.response?.docs || []).filter((d) => d[spec.seed] !== undefined && d[spec.seed] !== null);
+    if (!seeds.length) throw new Error(`expand_gene_set: none of the seed genes has a ${spec.seed} value (mode ${mode})`);
+    const fieldName = spec.field.endsWith("_") ? `${spec.field}${window}` : spec.field;
+    clauses = seeds.map((d) => `${fieldName}:${solrEscapeValue(d[spec.seed])}`);
+  }
+
+  const fq = [];
+  if (genomes !== undefined) {
+    const g = capArray(genomes, 300, "genomes");
+    for (const t of g) if (!Number.isInteger(t)) throw new Error("genomes must be integers");
+    fq.push(`taxon_id:(${g.join(" OR ")})`);
+  }
+  const q = clauses.join(" OR ");
+  const res = await searchFetch(site, {
+    q, fq, rows, fl: fl || DEFAULT_GENE_FL,
+    sort: twoStep ? "gene_idx asc" : "system_name asc",
+    ...(facet_by_genome && { facet: { field: "system_name", limit: -1, mincount: 1 } }),
+  });
+  const ff = res.facet_counts?.facet_fields?.system_name || [];
+  const byGenome = [];
+  for (let i = 0; i < ff.length; i += 2) byGenome.push({ system_name: ff[i], n_genes: ff[i + 1] });
+  return {
+    mode, query: q,
+    ...(twoStep && { window, seed_field: spec.seed, seeds }),
+    n_genes: res.response?.numFound ?? 0,
+    n_genomes: byGenome.length,
+    by_genome: byGenome,
+    genes: res.response?.docs || [],
+    note: twoStep
+      ? `neighbors_${window}/compara_neighbors_${window} hold the centre gene's own index AND its ±${window} neighbours, so one query returns the whole ${2 * window + 1}-gene window. Seeded from ${spec.seed} — gene_idx and compara_idx are different index spaces.`
+      : "Homology fields are inverted, so this is a single query on the seed id, not a traversal.",
+  };
+}
+
+const RESOLVE_MAX_IDS = 1000;
+
+async function tool_resolve_gene_ids(args, site) {
+  const { ids } = args || {};
+  capArray(ids, RESOLVE_MAX_IDS, "ids");
+  for (const v of ids) {
+    if (typeof v !== "string" || !v) throw new Error("every id must be a non-empty string");
+    if (v.length > 255) throw new Error(`id longer than 255 chars: ${v.slice(0, 40)}…`);
+  }
+  const r = await fetch(apiUrl(site, "/gene_lists/validate", {}), {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(ids),
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
+  if (!r.ok) throw new Error(`resolve_gene_ids: HTTP ${r.status}: ${(await r.text().catch(() => "")).slice(0, 300)}`);
+  const v = await r.json();
+  return {
+    ...v,
+    counts: {
+      submitted: ids.length,
+      resolved: v.resolved?.length ?? 0,
+      ambiguous: v.ambiguous?.length ?? 0,
+      unknown: v.unknown?.length ?? 0,
+    },
+    note:
+      "Matches the stable id AND alt_id (alt_id is indexed lowercased, so case is ignored). " +
+      "An input hitting more than one gene lands in 'ambiguous' even if one hit is an exact " +
+      "stable id. Feed resolved[].id into gene_search / expand_gene_set / gene_sequence.",
+  };
+}
+
+async function tool_saved_searches(args, site) {
+  const { kind = "views", hash, is_public = true } = args || {};
+  if (!["views", "lists"].includes(kind)) throw new Error("saved_searches: kind must be 'views' or 'lists'");
+  const rows = capRows(args?.rows, { def: 20, max: 100 });
+  const siteKey = userDataSite(site);
+
+  if (kind === "views" && hash) {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(hash)) throw new Error("saved_searches: bad hash");
+    const got = await apiGet(site, "/saved_views", { hash });
+    const d = Array.isArray(got) ? got[0] : got;
+    if (!d) throw new Error(`saved_searches: no saved view with hash ${hash} (private views need a Bearer token)`);
+    return {
+      hash, label: d.label ?? null, site: d.site ?? null, createdAt: d.createdAt ?? null,
+      filters: d.state?.filters ?? null,
+      genomes: d.state?.genomes ?? null,
+      note: "Pass 'filters' straight to gene_search, or call gene_search with saved_view_hash.",
+    };
+  }
+
+  const docs = await apiGet(site, kind === "views" ? "/saved_views" : "/gene_lists",
+                            { site: siteKey, isPublic: !!is_public, rows });
+  const arr = Array.isArray(docs) ? docs : [];
+  return {
+    kind, site: siteKey, n: arr.length,
+    items: arr.map((d) => ({
+      hash: d.hash ?? null, label: d.label ?? null, createdAt: d.createdAt ?? null,
+      ...(kind === "lists" ? { n_genes: d.n_genes ?? null } : { has_filters: !!d.state?.filters }),
+    })),
+    ...(kind === "lists" && {
+      warning:
+        "Metadata only. A gene list stores a hash, not its member ids; membership lives as " +
+        "saved_search tags on gene documents, and q=saved_search:* returns 0 in this release " +
+        "(the existing lists were tagged against the previous core). Lists saved against v11 " +
+        "will resolve.",
+    }),
+  };
+}
+
+// --- Ensembl REST client (pansite mirror) --------------------------------------
+// Deliberately NOT routed through apiGet: this is a different service with different
+// failure modes, and one process serves three sites, so a hung Ensembl call must not
+// tie up unrelated traffic. Patterns ported from the swagger app's hardened variation
+// client (gramene-swagger/api/helpers/primers/variation/client.js: createLru :91-116,
+// readCapped :206-232, breaker :265-290, origin-pinned buildUrl :300-330), with its
+// tuning constants (primers/config.js:51-83) kept identical so the two age together.
+// Release 115 is static, so caching is aggressive. No retry loop by design: timeout +
+// breaker + cache, never a thundering herd.
+const ENS_BASE = (process.env.GRAMENE_ENSEMBL_BASE || "https://data.gramene.org/pansite-ensembl-115").replace(/\/$/, "");
+const ENS = {
+  timeoutMs: 8000, maxConcurrent: 4, maxBytes: 1_000_000,
+  cacheEntries: 500, cacheTtlMs: 3_600_000,
+  breakerFailures: 3, breakerWindowMs: 60_000, breakerOpenMs: 60_000,
+};
+const ENS_MAX_IDS = 25, ENS_MAX_EXPAND = 10_000, ENS_MAX_REGION_BP = 1_000_000;
+
+const ensState = { cache: new Map(), inflight: new Map(), fails: [], openUntil: 0, active: 0, queue: [] };
+
+function ensCacheGet(key) {
+  const hit = ensState.cache.get(key);
+  if (!hit) return undefined;
+  if (hit.expires <= Date.now()) { ensState.cache.delete(key); return undefined; }
+  ensState.cache.delete(key); ensState.cache.set(key, hit);   // LRU bump
+  return hit.value;
+}
+function ensCacheSet(key, value) {
+  ensState.cache.set(key, { value, expires: Date.now() + ENS.cacheTtlMs });
+  while (ensState.cache.size > ENS.cacheEntries) ensState.cache.delete(ensState.cache.keys().next().value);
+}
+function ensRecordFailure() {
+  const now = Date.now();
+  ensState.fails = ensState.fails.filter((t) => now - t < ENS.breakerWindowMs);
+  ensState.fails.push(now);
+  if (ensState.fails.length >= ENS.breakerFailures) {
+    ensState.openUntil = now + ENS.breakerOpenMs;
+    ensState.fails = [];
+  }
+}
+async function ensAcquire() {
+  if (ensState.active < ENS.maxConcurrent) { ensState.active++; return; }
+  await new Promise((resolve) => ensState.queue.push(resolve));
+  ensState.active++;
+}
+function ensRelease() {
+  ensState.active--;
+  const next = ensState.queue.shift();
+  if (next) next();
+}
+// An Ensembl overlap response can be megabytes; stop reading rather than buffering it.
+async function ensReadCapped(res, cap) {
+  const len = Number(res.headers.get("content-length") || "0");
+  if (len > cap) throw new Error(`Ensembl response larger than ${cap} bytes`);
+  const reader = res.body?.getReader?.();
+  if (!reader) return (await res.text()).slice(0, cap + 1);
+  const chunks = []; let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > cap) { try { await reader.cancel(); } catch {} throw new Error(`Ensembl response larger than ${cap} bytes`); }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8");
+}
+
+function ensUrl(path, params) {
+  const u = new URL(String(path).replace(/^\//, ""), ENS_BASE + "/");
+  if (u.href.indexOf(ENS_BASE + "/") !== 0) throw new Error("ensembl: refusing off-origin URL");
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v !== undefined && v !== null && v !== false && v !== "") u.searchParams.set(k, String(v));
+  }
+  u.searchParams.set("content-type", "application/json");
+  return u.href;
+}
+
+async function ensFetch(path, params, body) {
+  if (Date.now() < ensState.openUntil) {
+    throw new Error("Ensembl REST is temporarily unavailable (circuit open after repeated failures); retry in ~60s");
+  }
+  const url = ensUrl(path, params);
+  const key = (body ? "POST " : "GET ") + url + (body ? "\n" + JSON.stringify(body) : "");
+  const cached = ensCacheGet(key);
+  if (cached !== undefined) return cached;
+  if (ensState.inflight.has(key)) return ensState.inflight.get(key);
+
+  const run = (async () => {
+    await ensAcquire();
+    try {
+      const r = await fetch(url, {
+        method: body ? "POST" : "GET",
+        redirect: "error",
+        headers: {
+          Accept: "application/json",
+          "User-Agent": `${SERVER_NAME}/${SERVER_VERSION}`,
+          ...(body && { "Content-Type": "application/json" }),
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(ENS.timeoutMs),
+      });
+      const text = await ensReadCapped(r, ENS.maxBytes);
+      if (!r.ok) {
+        // Error bodies are not always JSON — /map/translation returns an HTML 500.
+        let msg = text.slice(0, 200);
+        try { msg = JSON.parse(text).error || msg; } catch {}
+        if (r.status === 429 || r.status >= 500) ensRecordFailure();
+        throw new Error(`Ensembl REST HTTP ${r.status} on ${path}: ${msg}`);
+      }
+      const value = JSON.parse(text);
+      ensCacheSet(key, value);
+      return value;
+    } catch (e) {
+      if (e?.name === "TimeoutError" || /abort|fetch failed|ECONN|network/i.test(e?.message || "")) ensRecordFailure();
+      throw e;
+    } finally {
+      ensRelease();
+      ensState.inflight.delete(key);
+    }
+  })();
+  ensState.inflight.set(key, run);
+  return run;
+}
+
+// sorghum_tx430nano is a CONTIG assembly (Contig_1, Contig_10 …) with no chromosomes,
+// so a chr:start-end request against it fails with "No slice found". Validate first.
+async function ensAssertRegion(species, region) {
+  const info = await ensFetch(`/info/assembly/${encodeURIComponent(species)}`, {});
+  const names = new Set((info.top_level_region || []).map((r) => String(r.name)));
+  if (names.size && !names.has(String(region))) {
+    const sample = [...names].slice(0, 5).join(", ");
+    throw new Error(`region '${region}' is not a top-level region of ${species} (it has ${names.size}, e.g. ${sample})`);
+  }
+}
+
+// species= is effectively mandatory: without it Ensembl scans all 267 cores — measured
+// 6.64s vs 0.08s, and one cold species-less call returned 502 after 60s. One Solr query
+// gets system_name for the whole batch.
+async function ensSpeciesForGenes(site, geneIds) {
+  const res = await searchFetch(site, {
+    q: `id:(${geneIds.map(solrEscapeValue).join(" OR ")})`,
+    fl: "id,system_name", rows: geneIds.length,
+  });
+  const bySpecies = new Map();
+  const found = new Set();
+  for (const d of res.response?.docs || []) {
+    if (!d.system_name) continue;
+    found.add(d.id);
+    if (!bySpecies.has(d.system_name)) bySpecies.set(d.system_name, []);
+    bySpecies.get(d.system_name).push(d.id);
+  }
+  const missing = geneIds.filter((g) => !found.has(g));
+  if (!bySpecies.size) {
+    throw new Error(`gene_sequence: none of those ids are in this index — run resolve_gene_ids first (${missing.slice(0, 3).join(", ")}…)`);
+  }
+  return { bySpecies, missing };
+}
+
+async function tool_gene_sequence(args, site) {
+  const {
+    gene_ids, region, species, type = "genomic",
+    expand_5prime = 0, expand_3prime = 0, mask, multiple_sequences = true,
+  } = args || {};
+  if (!["genomic", "cds", "cdna", "protein"].includes(type)) throw new Error(`gene_sequence: bad type '${type}'`);
+  if (mask !== undefined && !["hard", "soft"].includes(mask)) throw new Error("gene_sequence: mask must be 'hard' or 'soft'");
+  for (const [n, v] of [["expand_5prime", expand_5prime], ["expand_3prime", expand_3prime]]) {
+    if (!Number.isInteger(v) || v < 0 || v > ENS_MAX_EXPAND) throw new Error(`gene_sequence: ${n} must be an integer 0..${ENS_MAX_EXPAND}`);
+  }
+  if (!!gene_ids === !!region) throw new Error("gene_sequence: pass exactly one of 'gene_ids' or 'region'");
+
+  if (region) {
+    const { species: sp, region: r, start, end, strand = 1 } = region || {};
+    if (typeof sp !== "string" || !/^[a-z0-9_]{1,64}$/.test(sp)) throw new Error("gene_sequence: region.species is required (Ensembl system_name)");
+    if (typeof r !== "string" || !r) throw new Error("gene_sequence: region.region is required");
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) throw new Error("gene_sequence: bad region.start/region.end");
+    if (end - start > ENS_MAX_REGION_BP) throw new Error(`gene_sequence: region wider than ${ENS_MAX_REGION_BP} bp`);
+    if (![1, -1].includes(strand)) throw new Error("gene_sequence: region.strand must be 1 or -1");
+    await ensAssertRegion(sp, r);
+    const got = await ensFetch(`/sequence/region/${encodeURIComponent(sp)}/${encodeURIComponent(r)}:${start}..${end}:${strand}`,
+                               { mask, expand_5prime: expand_5prime || undefined, expand_3prime: expand_3prime || undefined });
+    return { species: sp, region: `${r}:${start}-${end}`, strand, length: (got.seq || "").length, ...got };
+  }
+
+  capArray(gene_ids, ENS_MAX_IDS, "gene_ids");
+  for (const g of gene_ids) if (typeof g !== "string" || !g || g.length > 128) throw new Error("gene_ids must be non-empty strings");
+
+  let bySpecies, missing = [];
+  if (species) {
+    if (!/^[a-z0-9_]{1,64}$/.test(species)) throw new Error("gene_sequence: 'species' must be an Ensembl system_name (e.g. sorghum_bicolor)");
+    bySpecies = new Map([[species, gene_ids]]);
+  } else {
+    ({ bySpecies, missing } = await ensSpeciesForGenes(site, gene_ids));
+  }
+
+  const sequences = [];
+  for (const [sp, ids] of bySpecies) {
+    const got = await ensFetch("/sequence/id", {
+      species: sp, type,
+      mask, expand_5prime: expand_5prime || undefined, expand_3prime: expand_3prime || undefined,
+      // Without this, type != genomic on a multi-transcript gene is a hard 400. Setting
+      // it turns each response into an array, which is why we always normalize below.
+      ...(type !== "genomic" && multiple_sequences && { multiple_sequences: 1 }),
+    }, { ids });
+    for (const seq of (Array.isArray(got) ? got : [got])) {
+      sequences.push({
+        species: sp,
+        query: seq.query ?? null,
+        id: seq.id ?? null,
+        molecule: seq.molecule ?? type,
+        length: (seq.seq || "").length,
+        seq: seq.seq ?? null,
+      });
+    }
+  }
+  return {
+    type, n_sequences: sequences.length,
+    total_bp: sequences.reduce((a, x) => a + x.length, 0),
+    ...(missing.length && { not_in_index: missing }),
+    sequences,
+    gotchas: [
+      "protein/cds responses carry the TRANSCRIPT or TRANSLATION id in 'id'; the id you asked for is echoed in 'query'.",
+      "canonical_transcript from /lookup/id has a TRAILING DOT ('SORBI_3004G085600.1.') — strip it before reuse.",
+      "this mirror has NO Compara (/info/comparas is empty), so /homology and /genetree do not work: use expand_gene_set for orthologs and paralogs.",
+    ],
+  };
+}
+
 const TOOL_REGISTRY = {
+  gene_search: {
+    definition: {
+      name: "gene_search",
+      description: [
+        "Search SorghumBase genes with the SAME filter tree the web UI uses. Start here for",
+        "anything expressible as a filter; it is the only tool that can run a saved view.",
+        "",
+        "Routing:",
+        "  free text ('what genes relate to drought?') -> solr_suggest FIRST, then paste the",
+        "    returned fq_field/fq_value in here as a leaf",
+        "  coordinates -> genes_in_region      homology -> expand_gene_set",
+        "  one rsID    -> variant_genes        raw Solr -> solr_search",
+        "  one gene's full expression profile -> mongo_find(collection:'expression_attributes')",
+        "",
+        "Filter tree. Leaf: {fq_field, fq_value}. Branch: {operation:'AND'|'OR', children:[…]}.",
+        "Any node may carry negate:true (applies to the whole subtree) and",
+        "expand:'orthologs'|'paralogs'|'neighborhood' (graph-expands that node's match set).",
+        "",
+        "Worked leaves (counts verified against this release):",
+        "  expression, categorical",
+        "    {fq_field:'expr_class__attr_ss',        fq_value:'tissue_specific'}",
+        "    {fq_field:'expr_specific_to__attr_ss',  fq_value:'root'}       # 16 organs",
+        "    {fq_field:'expr_organ_level__attr_ss',  fq_value:'leaf:high'}  # ~16,638 genes",
+        "      pass organ:level RAW — the colon is escaped for you",
+        "    {fq_field:'expressed_in_gxa_attr_ss',   fq_value:'E-MTAB-5956'}",
+        "      note the SINGLE underscore before attr_ss, unlike every other expr_* field",
+        "  expression, numeric (not in the suggestion index — only reachable here)",
+        "    {fq_field:'expr_tau__attr_f',               fq_value:'[0.9 TO *]'}",
+        "    {fq_field:'expr_max_tpm__attr_f',           fq_value:'[100 TO *]'}",
+        "    {fq_field:'expr_n_organs_detected__attr_i', fq_value:'[10 TO *]'}",
+        "  MAKER gene-model quality (DOUBLE underscores)",
+        "    {fq_field:'MAKER__AED__attr_f', fq_value:'[0 TO 0.1]'}  # ~259,782 high-confidence",
+        "    AED 0 = fully evidence-supported, 1 = unsupported. For the distribution use",
+        "    stats:['MAKER__AED__attr_f'] with output:'facets', not a facet (it is a float).",
+        "  variants   {fq_field:'rsid_PTV__attr_ss', fq_value:'rs872208282'}",
+        "  ontology   {fq_field:'GO__ancestors', fq_value:'6950'}  # integer ids",
+        "",
+        "genomes:[…] takes SYNTHETIC per-assembly taxon ids (4558006 …, from /maps), not NCBI",
+        "ids, and is applied as a filter query — never put it in the tree.",
+        "",
+        "output: 'docs' (default) | 'facets' (rows:0 + facet counts, for whole-set questions)",
+        "| 'count' | 'bed' (genome-browser track for the matched genes, max 5000).",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          filters: { type: "object", description: "Filter tree. Leaf {fq_field,fq_value}; branch {operation,children}; optional negate/expand on any node." },
+          saved_view_hash: { type: "string", description: "Run a shared saved view's stored filter tree. Mutually exclusive with 'filters'." },
+          genomes: { type: "array", items: { type: "integer" }, maxItems: 300, description: "Synthetic per-assembly taxon ids; omit for all genomes." },
+          extra_fq: { type: "array", items: { type: "string" }, maxItems: 10 },
+          fl: { type: "string", description: "Field list. Default omits attribute fields — name them explicitly to get rsid/expr/MAKER values back." },
+          rows: { type: "integer", minimum: 0, maximum: 200, description: "Default 50, capped at 200." },
+          start: { type: "integer", minimum: 0 },
+          sort: { type: "string" },
+          facets: { type: "array", items: { type: "string" }, maxItems: 5 },
+          facet_limit: { type: "integer", description: "Default 50; -1 for unlimited." },
+          stats: { type: "array", items: { type: "string" }, maxItems: 5, description: "Numeric fields for min/max/mean/stddev." },
+          output: { type: "string", enum: ["docs", "facets", "count", "bed"] },
+          bed_feature: { type: "string", enum: ["gene", "transcript", "exon", "intron", "CDS", "utr5", "utr3"] },
+          bed_combiner: { type: "string", enum: ["canonical", "all"] },
+        },
+      },
+    },
+    handler: tool_gene_search,
+  },
+
+  variant_genes: {
+    definition: {
+      name: "variant_genes",
+      description: [
+        "Find the genes a dbSNP-style rsID falls in, summarized by genome.",
+        "",
+        "rsIDs are PROJECTED across the pan-genome, so one rsID lands on the orthologous gene",
+        "in every assembly carrying it: rs872208282 hits 327 genes across 100 genomes. The",
+        "returned n_genes is therefore a fan-out, NOT a count of distinct variants. This tool",
+        "returns per-genome counts plus a small sample instead of 327 near-identical documents.",
+        "",
+        "severity is a ladder, PTV subset of PAV subset of all:",
+        "  all  rsid__attr_ss      any overlapping variant",
+        "  PAV  rsid_PAV__attr_ss  protein-altering (missense, in-frame indel, and all PTVs)",
+        "  PTV  rsid_PTV__attr_ss  protein-truncating (stop gained/lost, start lost,",
+        "                          frameshift, splice site)",
+        "",
+        "For full gene documents in one genome, use gene_search with the same field and value",
+        "plus genomes:[<taxon_id>]. To discover valid rsIDs, solr_suggest returns them under",
+        "the 'Variants: rsID' category.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          rsid: { type: "string", description: "e.g. rs162569336" },
+          severity: { type: "string", enum: ["all", "PAV", "PTV"], description: "Default 'all'." },
+          genomes: { type: "array", items: { type: "integer" }, maxItems: 300 },
+          sample_size: { type: "integer", minimum: 0, maximum: 50, description: "Example genes to return. Default 5." },
+        },
+        required: ["rsid"],
+      },
+    },
+    handler: tool_variant_genes,
+  },
+
+  expand_gene_set: {
+    definition: {
+      name: "expand_gene_set",
+      description: [
+        "Expand seed genes to their homologs, gene-tree family, or genomic neighbourhood.",
+        "",
+        "modes:",
+        "  orthologs   all orthologs (one2one + one2many + many2many)",
+        "  one2one / one2many / many2many   a single ortholog class",
+        "  paralogs    within-species paralogs        gene_split  split-gene relations",
+        "  tree        every gene in the seed's Compara tree (whole family)",
+        "  neighborhood          +/- window genes in GENOME order",
+        "  compara_neighborhood  +/- window genes in COMPARA order (syntenic, crosses genomes)",
+        "",
+        "The homology fields are INVERTED — a gene's record lists the ids it is a homolog OF —",
+        "so this is one query per seed, not a traversal. The two neighbourhood modes are seeded",
+        "from different index spaces (gene_idx vs compara_idx) and the tool picks the right one;",
+        "mixing them returns a plausible but wrong answer.",
+        "",
+        "window is 5, 10 or 20 and returns 2*window+1 genes (the seed plus its neighbours).",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          gene_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 50 },
+          mode: { type: "string", enum: ["orthologs", "one2one", "one2many", "many2many", "paralogs", "gene_split", "tree", "neighborhood", "compara_neighborhood"] },
+          window: { type: "integer", enum: [5, 10, 20], description: "Neighbourhood modes only. Default 10." },
+          genomes: { type: "array", items: { type: "integer" }, maxItems: 300 },
+          fl: { type: "string" },
+          rows: { type: "integer", minimum: 0, maximum: 200 },
+          facet_by_genome: { type: "boolean", description: "Per-genome counts. Default true." },
+        },
+        required: ["gene_ids", "mode"],
+      },
+    },
+    handler: tool_expand_gene_set,
+  },
+
+  gene_sequence: {
+    definition: {
+      name: "gene_sequence",
+      description: [
+        "Fetch sequence from the Ensembl REST mirror: genomic, CDS, cDNA or protein for genes,",
+        "or any genomic interval. Covers all 128 genomes in this release.",
+        "",
+        "Two ways to call it:",
+        "  gene_ids:[…]  up to 25 ids; species is inferred from the index automatically",
+        "  region:{species,region,start,end,strand}  fastest path when you already have",
+        "                                            coordinates (validated against the assembly)",
+        "",
+        "expand_5prime / expand_3prime add flanking sequence (promoter analysis); mask:'hard'",
+        "replaces repeats with N, mask:'soft' lower-cases them.",
+        "",
+        "This mirror has NO Compara, so it cannot answer homology — use expand_gene_set. It",
+        "also has no gene symbols or xrefs: use solr_suggest / gene_search for those.",
+        "Protein and CDS responses identify the transcript or translation in 'id'; the id you",
+        "asked for comes back in 'query'.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          gene_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 25 },
+          region: { type: "object", description: "{species, region, start, end, strand?} — species is an Ensembl system_name such as sorghum_bicolor." },
+          species: { type: "string", description: "Optional for gene_ids (inferred); supplying it skips a lookup." },
+          type: { type: "string", enum: ["genomic", "cds", "cdna", "protein"], description: "Default 'genomic'." },
+          expand_5prime: { type: "integer", minimum: 0, maximum: 10000 },
+          expand_3prime: { type: "integer", minimum: 0, maximum: 10000 },
+          mask: { type: "string", enum: ["hard", "soft"] },
+          multiple_sequences: { type: "boolean", description: "Default true; required for non-genomic types on multi-transcript genes." },
+        },
+      },
+    },
+    handler: tool_gene_sequence,
+  },
+
+  resolve_gene_ids: {
+    definition: {
+      name: "resolve_gene_ids",
+      description: [
+        "Normalize gene identifiers before using them anywhere else. Resolves both current",
+        "stable ids and alternate/legacy ids (case-insensitively), and separates the input into",
+        "resolved / ambiguous / unknown.",
+        "",
+        "Run this first whenever ids come from a paper, a spreadsheet, or an older annotation —",
+        "alternate ids are NOT matchable by a plain field query, so an unresolved id silently",
+        "returns nothing. Example: Sb01g000200 resolves to SORBI_3001G000100.",
+        "",
+        "Up to 1000 ids per call.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 1000 },
+        },
+        required: ["ids"],
+      },
+    },
+    handler: tool_resolve_gene_ids,
+  },
+
+  saved_searches: {
+    definition: {
+      name: "saved_searches",
+      description: [
+        "Discover saved views and gene lists that people have published on this site.",
+        "",
+        "kind:'views' lists shared searches; pass a hash to get one, including its stored filter",
+        "tree, which you can hand straight to gene_search (or use gene_search's saved_view_hash).",
+        "This is the way to reproduce or extend someone else's analysis.",
+        "",
+        "kind:'lists' returns gene-list METADATA only in this release — a list stores a hash",
+        "rather than its members, and the tags that recorded membership are not present in the",
+        "current gene index.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["views", "lists"], description: "Default 'views'." },
+          hash: { type: "string", description: "views only: fetch one view by its share token." },
+          is_public: { type: "boolean", description: "Default true." },
+          rows: { type: "integer", minimum: 1, maximum: 100 },
+        },
+      },
+    },
+    handler: tool_saved_searches,
+  },
+
   solr_search: {
     definition: {
       name: "solr_search",
@@ -3216,9 +4161,10 @@ async function handleJsonRpc(msg, site, sessionId = null) {
     const t0 = Date.now();
     try {
       const result = await entry.handler(toolArgs, site);
-      log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
+      const text = capResultText(result);
+      log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, bytes: Buffer.byteLength(text), ...(sessionId && { session: sessionId }) });
       return jsonRpcResult(id, {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        content: [{ type: "text", text }],
       });
     } catch (e) {
       log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
