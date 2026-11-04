@@ -22,6 +22,14 @@ module.exports = {
               "Chlamydomonas, Drosophila).",
           },
           {
+            id: "v70",
+            apiBase: "https://data.gramene.org/v70",
+            description:
+              "Gramene release 70: comparative genomics across 267 plant and algal genomes, " +
+              "including pan-genome sets for barley (77 genomes), oats (33), rice (26) and " +
+              "wheat (24).",
+          },
+          {
             id: "v69",
             apiBase: "https://data.gramene.org/v69",
             description:
