@@ -1,0 +1,23 @@
+{
+  "name": "gramene-mcp-tbrowse-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MCP App view: the tbrowse gene-tree viewer, bundled into one HTML file that gramene-mcp serves as ui://gramene-mcp/tbrowse.html",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "tbrowse": "^2.14.0",
+    "tbrowse-core": "^1.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "vite": "^5.4.0",
+    "vite-plugin-singlefile": "^2.0.0"
+  }
+}

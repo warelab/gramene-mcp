@@ -77,6 +77,7 @@ describe("MCP protocol", () => {
       "expression_for_genes",
       "gene_search",
       "gene_sequence",
+      "gene_tree_view",
       "genes_in_region",
       "kb_relations",
       "mongo_find",
@@ -104,6 +105,74 @@ describe("MCP protocol", () => {
     const res = await rpc("tools/call", { name: "nonexistent", arguments: {} });
     assert.ok(res.error);
     assert.equal(res.error.code, -32601);
+  });
+});
+
+// ─── MCP App: gene_tree_view + ui:// resource ────────────────────────
+// These need ui/tbrowse.html (npm run build:ui); it is committed, so a fresh
+// checkout has it.
+
+describe("gene_tree_view MCP App", () => {
+  const UI_URI = "ui://gramene-mcp/tbrowse.html";
+  const UI_MIME = "text/html;profile=mcp-app";
+
+  it("initialize advertises resources", async () => {
+    const res = await rpc("initialize");
+    assert.ok(res.result.capabilities?.resources, "Expected resources capability");
+  });
+
+  it("the tool links to the UI resource", async () => {
+    const res = await rpc("tools/list");
+    const tool = res.result.tools.find((t) => t.name === "gene_tree_view");
+    assert.equal(tool?._meta?.ui?.resourceUri, UI_URI);
+  });
+
+  it("resources/list names the page", async () => {
+    const res = await rpc("resources/list");
+    const entry = res.result.resources.find((r) => r.uri === UI_URI);
+    assert.ok(entry, "Expected the tbrowse page in resources/list");
+    assert.equal(entry.mimeType, UI_MIME);
+  });
+
+  it("resources/read returns self-contained HTML and opens only the API origin", async () => {
+    const res = await rpc("resources/read", { uri: UI_URI });
+    const [item] = res.result.contents;
+    assert.equal(item.uri, UI_URI);
+    assert.equal(item.mimeType, UI_MIME);
+    assert.match(item.text, /^<!doctype html>/i);
+    // Everything is inlined: no script or stylesheet may point off-page.
+    assert.doesNotMatch(item.text, /<script[^>]+src=/i);
+    assert.doesNotMatch(item.text, /<link[^>]+rel="stylesheet"/i);
+    const domains = item._meta?.ui?.csp?.connectDomains;
+    assert.ok(Array.isArray(domains) && domains.length === 1, "Expected one connect domain");
+    assert.match(domains[0], /^https?:\/\/[^/]+$/);
+  });
+
+  it("resources/read of an unknown uri → -32002", async () => {
+    const res = await rpc("resources/read", { uri: "ui://gramene-mcp/nope.html" });
+    assert.equal(res.error?.code, -32002);
+  });
+
+  it("gene_id resolves to its tree, as text and structuredContent", async () => {
+    const res = await rpc("tools/call", { name: "gene_tree_view", arguments: { gene_id: REAL.geneId } });
+    const data = toolResult(res);
+    assert.equal(data.geneId, REAL.geneId);
+    assert.equal(data.treeId, REAL.geneTree);
+    assert.match(data.apiBase, /^https?:\/\//);
+    assert.ok(data.geneCount > 1, "Expected the tree to hold several genes");
+    assert.deepEqual(res.result.structuredContent, data);
+  });
+
+  it("tree_id alone works", async () => {
+    const res = await rpc("tools/call", { name: "gene_tree_view", arguments: { tree_id: REAL.geneTree } });
+    const data = toolResult(res);
+    assert.equal(data.treeId, REAL.geneTree);
+    assert.equal(data.geneId, undefined);
+  });
+
+  it("no arguments → tool error", async () => {
+    const res = await rpc("tools/call", { name: "gene_tree_view", arguments: {} });
+    assert.ok(res.error, "Expected an error without gene_id or tree_id");
   });
 });
 

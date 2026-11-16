@@ -241,11 +241,12 @@ If the server is on a remote host, make sure `MCP_ALLOWED_ORIGINS` is set to all
 
 ## Tools
 
-The server exposes 18 tools. They map onto two API endpoint families: `/search` and `/suggest` (Solr-backed) and `/<collection>` (MongoDB-backed).
+The server exposes 19 tools. They map onto two API endpoint families: `/search` and `/suggest` (Solr-backed) and `/<collection>` (MongoDB-backed).
 
 | Tool | Description |
 |---|---|
 | `gene_search` | **Start here for filter-style searches.** Runs the same filter tree the web UI uses, so a shared saved view can be executed verbatim. Absorbs expression attributes (categorical *and* numeric), MAKER model quality, faceting/stats and BED export as parameters |
+| `gene_tree_view` | **MCP App.** Shows the user an interactive [tbrowse](https://github.com/warelab/tbrowse) gene-tree viewer for a gene's family (see [Gene tree viewer](#gene-tree-viewer-mcp-app)). Takes `gene_id` or `tree_id`; returns only a short summary to the model |
 | `variant_genes` | rsID → the genes it falls in, summarized per genome. rsIDs are projected across the pan-genome, so one rsID fans out to hundreds of genes; this returns counts plus a sample rather than the raw documents. `severity` selects all / protein-altering / protein-truncating |
 | `expand_gene_set` | Expand seed genes to orthologs, a single ortholog class, paralogs, their whole Compara tree, or a genomic/compara neighbourhood window |
 | `gene_sequence` | Genomic/CDS/cDNA/protein sequence for genes, or any interval, from the Ensembl REST mirror. Species is inferred from the index; regions are validated against the assembly |
@@ -270,6 +271,25 @@ Build foreground and background facet-count arrays via `solr_search` (with
 `pathways__ancestors`, or `domains__ancestors`) and pass them to a
 client-side enrichment skill that operates on (ontology, foreground array,
 background array).
+
+## Gene tree viewer (MCP App)
+
+`gene_tree_view` is an [MCP App](https://github.com/modelcontextprotocol/ext-apps): its tool definition carries `_meta.ui.resourceUri = "ui://gramene-mcp/tbrowse.html"`, and a host that supports the `io.modelcontextprotocol/ui` extension (Claude, Claude Desktop, VS Code, …) fetches that resource with `resources/read` and renders it in a sandboxed iframe beside the tool result. Other hosts just get the text summary.
+
+The page is the [tbrowse](https://github.com/warelab/tbrowse) viewer with the tree, labels, MSA, neighbourhood and gene-structure zones. How the pieces fit:
+
+- The tool resolves `gene_id` to its tree and returns `{site, apiBase, treeId, treeField, geneId, geneCount, genomes}` as both text and `structuredContent`. No tree data passes through the conversation.
+- The page receives that result from the host, then loads the tree and its companion data directly from the site's REST API with tbrowse-core's `grameneGeneTreeSource` (the loader gramene-search's Homology panel uses).
+- `resources/read` declares the site's API origin in `_meta.ui.csp.connectDomains`, so the sandbox allows exactly that origin. Each site (`/mcp/<id>`) gets its own.
+- In the viewer, a leaf's tooltip has an "Ask about this gene" button that sends a message to the conversation, and the toolbar has a full-screen toggle when the host offers that display mode.
+
+The page source is in `apps/tbrowse/` (React + tbrowse + `@modelcontextprotocol/ext-apps`, bundled by Vite into one HTML file). The built file, `ui/tbrowse.html`, is committed, so the server still runs with no install. Rebuild it after changing the app or to pick up a new tbrowse release:
+
+```bash
+npm run build:ui
+```
+
+The server reads the file once at startup, so restart it after a rebuild. If the file is missing, `gene_tree_view` stays available but is not linked to a UI. `MCP_UI_TBROWSE_HTML` overrides the path.
 
 ## Workflow prompts
 
