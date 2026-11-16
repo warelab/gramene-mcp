@@ -14,6 +14,9 @@ import { randomUUID } from "node:crypto";
  *   MCP_LOG              Set to "false" to disable JSON logging to stderr  (default: true)
  *   MCP_LOG_FILE         Path to append JSON log lines (persists across restarts)
  *   MCP_LOG_BUFFER_SIZE  Max tool_call events kept in memory for the dashboard (default: 10000)
+ *   MCP_UI_TBROWSE_HTML  Path to the built tbrowse MCP App page (default: ui/tbrowse.html
+ *                        beside this file). When the file is missing the gene_tree_view
+ *                        tool still works but returns text only.
  *
  *   GRAMENE_SITES        Sites to serve, as comma-separated id=apiBase pairs, e.g.
  *                          v69=https://data.gramene.org/v69,sorghum_v11=https://data.sorghumbase.org/sorghum_v11
@@ -97,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.6.0";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -109,9 +112,56 @@ const SESSION_HEADER = "Mcp-Session-Id";
 const SERVER_CAPABILITIES = {
   tools:     { listChanged: false },
   prompts:   { listChanged: false },
-  resources: false,
+  resources: { listChanged: false },
   logging:   false,
 };
+
+// --- MCP Apps (SEP-1865, extension "io.modelcontextprotocol/ui") ---
+// A tool whose definition carries `_meta.ui.resourceUri` asks the host to
+// render that `ui://` resource in a sandboxed iframe next to the tool result.
+// The page is one self-contained HTML file, built from apps/tbrowse into
+// ui/tbrowse.html (see apps/tbrowse/vite.config.js) and read once at startup.
+const UI_MIME_TYPE = "text/html;profile=mcp-app";
+const TBROWSE_UI_URI = "ui://gramene-mcp/tbrowse.html";
+const TBROWSE_UI_PATH =
+  process.env.MCP_UI_TBROWSE_HTML || new URL("./ui/tbrowse.html", import.meta.url);
+
+function loadUiHtml(path) {
+  try {
+    return fs.readFileSync(path, "utf8");
+  } catch (e) {
+    console.error(`MCP App page not found (${e?.message || e}); gene_tree_view will return text only. Build it with: npm run build:ui`);
+    return null;
+  }
+}
+
+const UI_RESOURCES = new Map();
+{
+  const html = loadUiHtml(TBROWSE_UI_PATH);
+  if (html !== null) {
+    UI_RESOURCES.set(TBROWSE_UI_URI, {
+      uri: TBROWSE_UI_URI,
+      name: "tbrowse_gene_tree",
+      title: "Gene tree viewer (tbrowse)",
+      description:
+        "Interactive gene-tree viewer: phylogeny, labels, protein alignment, gene " +
+        "neighbourhoods and gene structures. Rendered by hosts that support MCP Apps " +
+        "when gene_tree_view is called.",
+      html,
+    });
+  }
+}
+
+// The page fetches the tree and its companion data straight from the site's
+// REST API, so that origin (and only that one) is opened in the sandbox CSP.
+function uiResourceMeta(site) {
+  return {
+    ui: {
+      csp: { connectDomains: [new URL(site.apiBase).origin] },
+      prefersBorder: true,
+    },
+  };
+}
 
 function getServerDiscoveryDoc(site) {
   return {
@@ -2379,7 +2429,137 @@ async function tool_gene_sequence(args, site) {
   };
 }
 
+// --- gene_tree_view: open a gene tree in the tbrowse MCP App ---
+// The model-facing result is a short summary; the page itself loads the tree
+// from the site's API, so nothing large passes through the conversation.
+const NOT_TREE_KEYS = new Set(["homologous_genes", "supertree"]);
+
+// Mirrors tbrowse-core's grameneGeneTreeRef: `homology.gene_tree`, or the
+// first clade tree set (v70: `homology.wheat = {id}`), whose key is also the
+// Solr field holding the tree id.
+function geneTreeRef(homology) {
+  if (!homology || typeof homology !== "object") return null;
+  const idOf = (v) => (v && typeof v === "object" && typeof v.id === "string" && v.id ? v.id : null);
+  const main = idOf(homology.gene_tree);
+  if (main) return { id: main, field: "gene_tree" };
+  for (const [key, v] of Object.entries(homology)) {
+    if (NOT_TREE_KEYS.has(key)) continue;
+    const id = idOf(v);
+    if (id) return { id, field: key };
+  }
+  return null;
+}
+
+const TREE_ID_PATTERN = /^[A-Za-z0-9_.-]+$/;
+
+async function tool_gene_tree_view(args, site) {
+  const geneId = typeof args?.gene_id === "string" ? args.gene_id.trim() : "";
+  let treeId = typeof args?.tree_id === "string" ? args.tree_id.trim() : "";
+  if (!geneId && !treeId) throw new Error("Provide gene_id or tree_id");
+  if (treeId && !TREE_ID_PATTERN.test(treeId)) throw new Error(`Invalid tree_id "${treeId}"`);
+
+  let treeField = "gene_tree";
+  let gene = null;
+  if (geneId) {
+    const docs = await apiGet(site, "/genes", { idList: geneId });
+    const doc = Array.isArray(docs) ? docs[0] : null;
+    if (!doc) throw new Error(`Gene ${geneId} not found on site ${site.id}. Use solr_suggest or gene_search to find the stable id.`);
+    gene = {
+      id: doc._id,
+      name: doc.name ?? null,
+      description: doc.description ?? null,
+      system_name: doc.system_name ?? null,
+    };
+    if (!treeId) {
+      const ref = geneTreeRef(doc.homology);
+      if (!ref) throw new Error(`Gene ${doc._id} has no gene tree on site ${site.id} (its genome may not be in the Compara analysis).`);
+      treeId = ref.id;
+      treeField = ref.field;
+    }
+  }
+
+  // Size of the tree, for the model's summary. Best effort: the view does
+  // not depend on it.
+  let geneCount = null;
+  let genomes = null;
+  try {
+    const r = await apiGet(site, "/search", {
+      q: `${treeField}:${treeId}`,
+      rows: 0,
+      facet: true,
+      "facet.field": "system_name",
+      "facet.limit": -1,
+      "facet.mincount": 1,
+    });
+    geneCount = r?.response?.numFound ?? null;
+    const flat = r?.facet_counts?.facet_fields?.system_name;
+    if (Array.isArray(flat)) {
+      genomes = 0;
+      for (let i = 1; i < flat.length; i += 2) if (flat[i] > 0) genomes++;
+    }
+  } catch {
+    // leave the counts null
+  }
+  if (geneCount === 0 && !geneId) {
+    throw new Error(`No genes on site ${site.id} belong to tree ${treeId}. Check the id, or pass gene_id instead.`);
+  }
+
+  return {
+    site: site.id,
+    apiBase: site.apiBase,
+    treeId,
+    treeField,
+    ...(gene ? { geneId: gene.id, gene } : {}),
+    geneCount,
+    genomes,
+    view: UI_RESOURCES.has(TBROWSE_UI_URI)
+      ? "An interactive tbrowse viewer for this tree is shown to the user in hosts that support MCP Apps. Do not repeat the tree as text."
+      : "No interactive viewer is installed on this server; describe the tree from other tools if needed.",
+  };
+}
+
 const TOOL_REGISTRY = {
+  gene_tree_view: {
+    definition: {
+      name: "gene_tree_view",
+      title: "View gene tree",
+      description: [
+        "Show the user an interactive gene-tree viewer (tbrowse) for one gene family: the",
+        "Compara phylogeny with speciation/duplication nodes, gene labels, the protein",
+        "alignment with domains, ±10-gene neighbourhoods and gene structures. In hosts that",
+        "support MCP Apps the viewer appears inline; the user can collapse, prune and search",
+        "the tree there.",
+        "",
+        "Use when the user asks to see, show, browse or visualise a gene tree, gene family,",
+        "homologs or orthologs/paralogs of a gene. Pass gene_id (the tree is pivoted on that",
+        "gene) or a known tree_id. Find a gene id first with solr_suggest or gene_search.",
+        "",
+        "Returns only a summary (tree id, number of genes and genomes) — the viewer loads the",
+        "tree itself. For homolog lists as data, use expand_gene_set instead.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          gene_id: {
+            type: "string",
+            description: "Gene stable ID whose tree to show (e.g. SORBI_3006G095600). The view is centred on this gene.",
+          },
+          tree_id: {
+            type: "string",
+            description: "Gene tree ID, when already known (the gene doc's homology.gene_tree.id). Optional if gene_id is given.",
+          },
+        },
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+      ...(UI_RESOURCES.has(TBROWSE_UI_URI)
+        ? { _meta: { ui: { resourceUri: TBROWSE_UI_URI }, "ui/resourceUri": TBROWSE_UI_URI } }
+        : {}),
+    },
+    handler: tool_gene_tree_view,
+    // Also return the result object as structuredContent: the MCP App reads
+    // it from there (hosts do not add structuredContent to model context).
+    structured: true,
+  },
   gene_search: {
     definition: {
       name: "gene_search",
@@ -4127,6 +4307,7 @@ async function handleJsonRpc(msg, site, sessionId = null) {
       capabilities: {
         tools: SERVER_CAPABILITIES.tools,
         prompts: SERVER_CAPABILITIES.prompts,
+        resources: SERVER_CAPABILITIES.resources,
       },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions: siteInstructions(site),
@@ -4165,11 +4346,38 @@ async function handleJsonRpc(msg, site, sessionId = null) {
       log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "ok", ms: Date.now() - t0, bytes: Buffer.byteLength(text), ...(sessionId && { session: sessionId }) });
       return jsonRpcResult(id, {
         content: [{ type: "text", text }],
+        ...(entry.structured && result && typeof result === "object" ? { structuredContent: result } : {}),
       });
     } catch (e) {
       log({ event: "tool_call", site: site.id, tool: name, args: toolArgs, status: "error", error: e?.message || String(e), ms: Date.now() - t0, ...(sessionId && { session: sessionId }) });
       return jsonRpcError(id, -32000, `Tool error: ${e?.message || String(e)}`);
     }
+  }
+
+  // Resources — only the MCP App pages (ui:// URIs).
+  if (method === "resources/list") {
+    return jsonRpcResult(id, {
+      resources: [...UI_RESOURCES.values()].map(({ uri, name, title, description }) => ({
+        uri, name, title, description, mimeType: UI_MIME_TYPE, _meta: uiResourceMeta(site),
+      })),
+    });
+  }
+
+  if (method === "resources/templates/list") {
+    return jsonRpcResult(id, { resourceTemplates: [] });
+  }
+
+  if (method === "resources/read") {
+    const uri = params?.uri;
+    const entry = typeof uri === "string" ? UI_RESOURCES.get(uri) : undefined;
+    if (!entry) {
+      log({ event: "resource_read", site: site.id, uri, status: "unknown_resource" });
+      return jsonRpcError(id, -32002, `Resource not found: ${uri}`, { uri });
+    }
+    log({ event: "resource_read", site: site.id, uri, status: "ok", ...(sessionId && { session: sessionId }) });
+    return jsonRpcResult(id, {
+      contents: [{ uri: entry.uri, mimeType: UI_MIME_TYPE, text: entry.html, _meta: uiResourceMeta(site) }],
+    });
   }
 
   // Prompts
