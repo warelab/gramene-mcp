@@ -720,7 +720,7 @@ describe("expression_for_genes", () => {
   it("returns expression data for a known sorghum gene", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId] },
+      arguments: { detail: "full", gene_ids: [REAL.geneId] },
     });
     const data = toolResult(res);
     assert.equal(data.gene_count, 1, "Expected gene_count to reflect requested gene_ids");
@@ -737,7 +737,7 @@ describe("expression_for_genes", () => {
   it("baseline rows expose value, tissue, and factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline" },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline" },
     });
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
@@ -755,7 +755,7 @@ describe("expression_for_genes", () => {
   it("differential rows expose contrast structure with control + treatment factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Differential" },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Differential" },
     });
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
@@ -777,8 +777,8 @@ describe("expression_for_genes", () => {
 
   it("taxon_id filter reduces experiment count", async () => {
     const [all, sorghum] = await Promise.all([
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId] } }),
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], taxon_id: 4558 } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], taxon_id: 4558 } }),
     ]);
     const nAll    = toolResult(all).experiment_count;
     const nSorghum = toolResult(sorghum).experiment_count;
@@ -790,8 +790,8 @@ describe("expression_for_genes", () => {
   it("po_terms filter restricts to tissue-matched assays", async () => {
     // PO:0009001 (int_id 9001) = fruit/grain
     const [all, grain] = await Promise.all([
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline" } }),
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [9001] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline" } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [9001] } }),
     ]);
     const allBaseline   = toolResult(all).genes?.[REAL.geneId]?.baseline ?? [];
     const grainBaseline = toolResult(grain).genes?.[REAL.geneId]?.baseline ?? [];
@@ -806,7 +806,7 @@ describe("expression_for_genes", () => {
     // but its ancestors include endosperm (9089) which does match.
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [5360] },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [5360] },
     });
     const data = toolResult(res);
     assert.ok(data.po_filter, "Expected po_filter metadata");
@@ -820,7 +820,7 @@ describe("expression_for_genes", () => {
   it("non-existent gene returns an empty entry, not a missing one", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: ["FAKE_GENE_DOES_NOT_EXIST_XYZ"] },
+      arguments: { detail: "full", gene_ids: ["FAKE_GENE_DOES_NOT_EXIST_XYZ"] },
     });
     const data = toolResult(res);
     assert.equal(data.gene_count, 1, "gene_count counts requested ids, not Solr matches");
@@ -834,7 +834,7 @@ describe("expression_for_genes", () => {
   it("empty gene_ids → tool error", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [] },
+      arguments: { detail: "full", gene_ids: [] },
     });
     assert.ok(res.error || res.result?.isError, "Expected error for empty gene_ids");
   });
@@ -915,6 +915,47 @@ describe("solr_search — facets", () => {
 // For nested counts, build a `json.facet` clause and pass it through solr_search.
 // (No automated tests cover that here — verify by hand against your dataset.)
 
+
+describe("expression_for_genes — summary mode", () => {
+  it("detail:summary collapses rows by tissue and contrast", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "summary" } }));
+    assert.equal(data.detail, "summary");
+    const gene = data.genes[REAL.geneId];
+    assert.equal(gene.baseline, undefined, "summary must not carry the row arrays");
+    const tissues = gene.baseline_summary.by_tissue;
+    assert.ok(tissues.length > 0, "Expected per-tissue rows");
+    assert.ok(tissues.every((x, i) => i === 0 || tissues[i - 1].max >= x.max), "by_tissue must be sorted by max");
+    assert.ok(tissues[0].max_in.experiment.startsWith("E-"));
+    assert.ok(tissues.length <= 20);
+    assert.equal(gene.baseline_summary.n_tissues, tissues.length + (gene.baseline_summary.tissues_not_listed ?? 0));
+    assert.ok(gene.baseline_summary.n_rows >= tissues.reduce((n, x) => n + x.n_samples, 0));
+    const d = gene.differential_summary;
+    assert.equal(d.n_significant, d.n_up + d.n_down);
+    assert.ok(d.top_significant.length <= 12);
+  });
+
+  it("detail:auto summarises a large result and stays small", async () => {
+    const [auto, full] = await Promise.all([
+      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "full" } }),
+    ]);
+    const f = toolResult(full).genes[REAL.geneId];
+    const rows = f.baseline.length + f.differential.length;
+    assert.equal(toolResult(auto).detail, rows > 60 ? "summary" : "full");
+    if (rows > 60) {
+      assert.ok(auto.result.content[0].text.length < full.result.content[0].text.length / 2,
+        "summary should be much smaller than the rows");
+    }
+  });
+
+  it("rejects an unknown detail value", async () => {
+    const res = await rpc("tools/call", {
+      name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "everything" } });
+    assert.ok(res.error, "Expected a tool error");
+  });
+});
+
 // ─── vep_for_gene ─────────────────────────────────────────────────────
 
 describe("vep_for_gene — tool registration", () => {
@@ -957,6 +998,38 @@ describe("vep_for_gene — shape", () => {
     assert.ok(Array.isArray(gene.groups), "Expected groups array");
   });
 });
+describe("vep_for_gene — max_accessions", () => {
+  it("max_accessions:0 keeps the counts and lists no accessions", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], max_accessions: 0 } }));
+    for (const grp of data.genes[REAL.geneId].groups) {
+      assert.equal(grp.accessions.length, 0);
+      assert.ok(grp.count > 0);
+      assert.equal(grp.accessions_listed, 0);
+    }
+  });
+
+  it("the default lists at most 20 accessions per group but reports the full count", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], include_germplasm_details: false } }));
+    const g = data.genes[REAL.geneId];
+    for (const grp of g.groups) {
+      assert.ok(grp.accessions.length <= 20);
+      assert.equal(grp.accessions.length, Math.min(20, grp.count));
+    }
+    if (g.groups.length) {
+      const listed = g.groups.reduce((n, grp) => n + grp.count, 0);
+      assert.ok(listed >= g.summary.total_lof_accessions || g.summary.total_lof_accessions > 0);
+    }
+  });
+
+  it("rejects a negative max_accessions", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], max_accessions: -1 } });
+    assert.ok(res.error, "Expected a tool error");
+  });
+});
+
 // ─── pubmed_for_genes ────────────────────────────────────────────────
 
 describe("pubmed_for_genes", () => {

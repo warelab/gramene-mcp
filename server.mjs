@@ -100,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.6.2";
+const SERVER_VERSION = "0.6.3";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -1266,7 +1266,11 @@ async function tool_expression_for_genes(args, site) {
     experiment_type,  // "Baseline" | "Differential" | undefined (both)
     taxon_id,         // integer — filter experiments by species (the species the experiment was done in)
     po_terms,         // int[] — PO term int_ids; either control or treatment assay must match
+    detail = "auto",  // "auto" | "summary" | "full"
   } = args || {};
+  if (!["auto", "summary", "full"].includes(detail)) {
+    throw new Error("expression_for_genes: detail must be 'auto', 'summary' or 'full'");
+  }
 
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
     throw new Error("expression_for_genes requires a non-empty 'gene_ids' array");
@@ -1479,13 +1483,101 @@ async function tool_expression_for_genes(args, site) {
     if (anyMatched) poInfo.expanded = true;
   }
 
+  // One gene can carry hundreds of sample rows (~450 bytes each). Past a
+  // modest row count, hand back per-tissue and per-contrast summaries instead
+  // unless the caller asked for the rows.
+  const totalRows = Object.values(genes).reduce((n, g) => n + g.baseline.length + g.differential.length, 0);
+  const summarize = detail === "summary" || (detail === "auto" && totalRows > EXPRESSION_AUTO_FULL_ROWS);
+  if (summarize) {
+    for (const [id, g] of Object.entries(genes)) genes[id] = summarizeExpression(g);
+  }
+
   const result = {
     gene_count:       gene_ids.length,
     experiment_count: allowedExperiments.size,
+    detail:           summarize ? "summary" : "full",
+    ...(summarize && {
+      note: `${totalRows} sample rows were summarised (baseline by tissue, differential as counts plus the strongest ` +
+        `significant contrasts). For the rows themselves pass detail:"full" and narrow the request with ` +
+        `experiment_type, po_terms, taxon_id or fewer genes.`,
+    }),
     genes,
   };
   if (po_terms && po_terms.length > 0) result.po_filter = poInfo;
   return result;
+}
+
+// Row count up to which detail:"auto" returns every row (about 25 kB).
+const EXPRESSION_AUTO_FULL_ROWS = 60;
+const EXPRESSION_TOP_CONTRASTS = 12;
+const EXPRESSION_TOP_TISSUES = 20;
+
+// Collapse one gene's rows: baseline → one line per tissue (max, median, the
+// experiment with the highest value); differential → counts and the
+// significant contrasts with the largest fold change.
+function summarizeExpression(g) {
+  const byTissue = new Map();
+  for (const row of g.baseline) {
+    const key = row.tissue ?? "unspecified";
+    if (!byTissue.has(key)) byTissue.set(key, []);
+    byTissue.get(key).push(row);
+  }
+  const median = (xs) => {
+    const a = [...xs].sort((x, y) => x - y);
+    const m = Math.floor(a.length / 2);
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  };
+  const round = (x) => Math.round(x * 100) / 100;
+  const baselineByTissue = [...byTissue.entries()].map(([tissue, rows]) => {
+    const top = rows.reduce((best, r) => (Number(r.value) > Number(best.value) ? r : best));
+    return {
+      tissue,
+      n_samples: rows.length,
+      n_experiments: new Set(rows.map((r) => r.experiment)).size,
+      max: round(Number(top.value)),
+      median: round(median(rows.map((r) => Number(r.value)))),
+      max_in: { experiment: top.experiment, experiment_name: top.experiment_name, group: top.group },
+    };
+  }).sort((a, b) => b.max - a.max);
+
+  const isSig = (r) => r.p_value !== null && r.p_value < 0.05 && r.l2fc !== null && Math.abs(r.l2fc) >= 1;
+  const sig = g.differential.filter(isSig).sort((a, b) => Math.abs(b.l2fc) - Math.abs(a.l2fc));
+  const describe = (r) => ({
+    experiment: r.experiment,
+    experiment_name: r.experiment_name,
+    tissue: r.treatment_tissue ?? r.control_tissue,
+    contrast: r.contrast.map((c) => `${c.type}: ${c.control ?? "—"} → ${c.treatment ?? "—"}`),
+    l2fc: round(r.l2fc),
+    p_value: r.p_value,
+  });
+
+  const names = new Map();
+  for (const r of [...g.baseline, ...g.differential]) if (!names.has(r.experiment)) names.set(r.experiment, r.experiment_name);
+
+  return {
+    name: g.name,
+    description: g.description,
+    n_experiments_with_data: g.experiments_with_data.length,
+    experiments: [...names.entries()].map(([experiment, experiment_name]) => ({ experiment, experiment_name })),
+    baseline_summary: {
+      n_rows: g.baseline.length,
+      unit: "TPM/FPKM",
+      n_tissues: baselineByTissue.length,
+      // Highest first; the tail is the tissues where the gene is lowest.
+      by_tissue: baselineByTissue.slice(0, EXPRESSION_TOP_TISSUES),
+      ...(baselineByTissue.length > EXPRESSION_TOP_TISSUES && {
+        tissues_not_listed: baselineByTissue.length - EXPRESSION_TOP_TISSUES,
+      }),
+    },
+    differential_summary: {
+      n_contrasts: g.differential.length,
+      n_significant: sig.length,
+      significance: "p_value < 0.05 and |l2fc| >= 1",
+      n_up: sig.filter((r) => r.l2fc > 0).length,
+      n_down: sig.filter((r) => r.l2fc < 0).length,
+      top_significant: sig.slice(0, EXPRESSION_TOP_CONTRASTS).map(describe),
+    },
+  };
 }
 
 // --- VEP (Variant Effect Prediction) tool ---
@@ -1560,10 +1652,20 @@ function parseVepFieldName(fieldName) {
   return null;
 }
 
+const VEP_DEFAULT_ACCESSIONS = 20;
+const VEP_MAX_ACCESSIONS = 5000;
+
 async function tool_vep_for_gene(args, site) {
   const { gene_ids, include_germplasm_details = true } = args || {};
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
     throw new Error("vep_for_gene requires a non-empty 'gene_ids' array");
+  }
+  // A gene can have well over a thousand carrier accessions (~75 bytes each
+  // before metadata), which no client will pass to the model. Every group
+  // always reports its full `count`; this caps how many accessions it lists.
+  const maxAccessions = args?.max_accessions === undefined ? VEP_DEFAULT_ACCESSIONS : Number(args.max_accessions);
+  if (!Number.isInteger(maxAccessions) || maxAccessions < 0 || maxAccessions > VEP_MAX_ACCESSIONS) {
+    throw new Error(`vep_for_gene: max_accessions must be an integer from 0 to ${VEP_MAX_ACCESSIONS}`);
   }
   if (gene_ids.length > 50) {
     throw new Error("vep_for_gene: max 50 gene_ids per call");
@@ -1581,13 +1683,15 @@ async function tool_vep_for_gene(args, site) {
 
   const solrDocs = solrResp?.response?.docs ?? [];
 
-  // 2. Collect all germplasm ens_ids referenced across genes.
+  // 2. Collect the germplasm ens_ids that will actually be listed (the first
+  //    max_accessions of each consequence group; the merged totals list none).
   const allEnsIds = new Set();
   for (const doc of solrDocs) {
     for (const [field, values] of Object.entries(doc)) {
-      if (field.startsWith("VEP__") && Array.isArray(values)) {
-        values.forEach((v) => allEnsIds.add(v));
-      }
+      if (!field.startsWith("VEP__") || !Array.isArray(values)) continue;
+      const parsed = parseVepFieldName(field);
+      if (!parsed || parsed.merged) continue;
+      values.slice(0, maxAccessions).forEach((v) => allEnsIds.add(v));
     }
   }
 
@@ -1618,7 +1722,7 @@ async function tool_vep_for_gene(args, site) {
       }
 
       // Enrich with germplasm metadata when available
-      const accessions = values.map((ens_id) => {
+      const accessions = values.slice(0, maxAccessions).map((ens_id) => {
         const g = germplasmMap[ens_id];
         if (!g) return { ens_id };
         const entry = { ens_id, pub_id: g.pub_id, stock_center: g.stock_center };
@@ -1636,8 +1740,9 @@ async function tool_vep_for_gene(args, site) {
         species:      parsed.species,
         study_label:  parsed.study_label,
         study_type:   parsed.study_type,
-        count:        accessions.length,
+        count:        values.length,
         accessions,
+        ...(values.length > accessions.length && { accessions_listed: accessions.length }),
       });
     }
 
@@ -1667,7 +1772,15 @@ async function tool_vep_for_gene(args, site) {
     }
   }
 
-  return { gene_count: Object.keys(result).length, genes: result };
+  const truncated = Object.values(result).some((g) => g.groups.some((grp) => grp.accessions_listed !== undefined));
+  return {
+    gene_count: Object.keys(result).length,
+    ...(truncated && {
+      note: `Groups list at most ${maxAccessions} accessions (accessions_listed); 'count' is always the full number. ` +
+        `Pass max_accessions (up to ${VEP_MAX_ACCESSIONS}) for more, ideally for one gene at a time.`,
+    }),
+    genes: result,
+  };
 }
 
 // Enrichment analysis is intentionally NOT exposed as an MCP tool. It is
@@ -3211,6 +3324,20 @@ const TOOL_REGISTRY = {
         `                                             control and treatment ({type, control, treatment})`,
         `                          shared_factors[] — factor types with identical values in both assays`,
         ``,
+        `Result size (detail): one gene can have hundreds of sample rows. With detail:"auto"`,
+        `(default) the rows above are returned only when there are at most 60 in total;`,
+        `otherwise each gene gets a summary and the response says detail:"summary":`,
+        `  experiments[]         — { experiment, experiment_name } for the rows that were read`,
+        `  baseline_summary      — { n_rows, n_tissues, by_tissue: [{ tissue, n_samples, n_experiments,`,
+        `                            max, median, max_in: { experiment, experiment_name, group } }] }`,
+        `                          sorted by max, so the first entry is where the gene peaks; the 20`,
+        `                          highest tissues are listed (tissues_not_listed counts the rest)`,
+        `  differential_summary  — { n_contrasts, n_significant, n_up, n_down, top_significant[] }`,
+        `                          significant = p_value < 0.05 and |l2fc| >= 1; top_significant`,
+        `                          lists the 12 largest fold changes with experiment, tissue and contrast`,
+        `Use detail:"summary" to always summarise, or detail:"full" for the rows — then narrow the`,
+        `request (experiment_type, po_terms, taxon_id, fewer genes) or the result may be too large.`,
+        ``,
         `Filters:`,
         `  experiment_type = "Baseline" | "Differential" — narrow the field set returned.`,
         `  taxon_id (plain NCBI int) — restrict to experiments performed in that species.`,
@@ -3256,6 +3383,11 @@ const TOOL_REGISTRY = {
             items: { type: "integer" },
             description: "PO term int IDs to restrict to trait-relevant tissues/conditions. E.g. [9001, 9089] for grain/endosperm.",
           },
+          detail: {
+            type: "string",
+            enum: ["auto", "summary", "full"],
+            description: "auto (default): every row when there are at most 60, otherwise a per-tissue / per-contrast summary. summary: always summarise. full: always return every row.",
+          },
         },
         required: ["gene_ids"],
       },
@@ -3279,6 +3411,11 @@ const TOOL_REGISTRY = {
         ``,
         `Also returns the merged EMS and NAT totals from VEP__merged__EMS/NAT__attr_ss.`,
         ``,
+        `Result size: each group reports its full 'count' but lists only the first`,
+        `max_accessions accessions (default ${VEP_DEFAULT_ACCESSIONS}; 'accessions_listed' marks a shortened group).`,
+        `A common gene can have over a thousand carriers. Use max_accessions:0 for counts only,`,
+        `or raise it (up to ${VEP_MAX_ACCESSIONS}) when the user needs the full list for one gene.`,
+        ``,
         `Germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) is enriched`,
         `from the /germplasm collection endpoint when available.`,
         ``,
@@ -3297,7 +3434,13 @@ const TOOL_REGISTRY = {
           },
           include_germplasm_details: {
             type: "boolean",
-            description: "Whether to enrich accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from the /germplasm endpoint. Default true. Set false for a count-only summary.",
+            description: "Whether to enrich the listed accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from the /germplasm endpoint. Default true. False returns bare accession IDs; it does not shorten the lists (use max_accessions for that).",
+          },
+          max_accessions: {
+            type: "integer",
+            minimum: 0,
+            maximum: VEP_MAX_ACCESSIONS,
+            description: `Accessions listed per consequence/zygosity/study group. Default ${VEP_DEFAULT_ACCESSIONS}. 0 = counts only. Each group's 'count' is the full number regardless.`,
           },
         },
         required: ["gene_ids"],
