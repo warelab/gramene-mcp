@@ -1,0 +1,9 @@
+export SOLR_BASE_URL="http://localhost:8983/solr"
+export SOLR_GENES_CORE="sorghum_genes10"
+export SOLR_SUGGESTIONS_CORE="sorghum_suggestions10"
+export MONGO_URI="mongodb://localhost:27017"
+export MONGO_DB="sorghum10"
+export MCP_HOST="squam.cshl.edu"
+export MCP_PORT=11065
+export MCP_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
+node server.mjs

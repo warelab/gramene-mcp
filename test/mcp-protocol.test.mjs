@@ -215,6 +215,27 @@ describe("facet and stats translation", () => {
     assert.equal(typeof st.mean, "number");
   });
 
+  it("a top-level OR in q finds both genes", async () => {
+    const ids = [REAL.geneId, "AT1G17420"];
+    for (const q of [`id:${ids[0]} OR id:${ids[1]}`, `id:(${ids[0]} OR ${ids[1]})`]) {
+      const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: { q, fl: "id", rows: 5 } }));
+      assert.deepEqual(res.response.docs.map((d) => d.id).sort(), [...ids].sort(), q);
+    }
+  });
+
+  it("expand_gene_set accepts several seeds and counts them in the result", async () => {
+    const one = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0 } }));
+    const two = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId, "AT5G10140"], mode: "orthologs", rows: 0 } }));
+    assert.ok(one.n_genes > 1, "Expected orthologs for one seed");
+    assert.ok(two.n_genes > one.n_genes, "A second seed from another family must add genes");
+    const off = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0, facet_by_genome: false } }));
+    assert.equal(off.n_genomes, undefined);
+    assert.equal(off.n_genes, one.n_genes);
+  });
+
   it("expand_gene_set lists every genome, zeros included", async () => {
     const res = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
       gene_ids: [REAL.geneId], mode: "orthologs", rows: 0 } }));
@@ -633,8 +654,8 @@ describe("solr_graph", () => {
 // ─── genes_in_region ─────────────────────────────────────────────────
 
 describe("genes_in_region", () => {
-  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb in sorghum bicolor (taxon 4558)
-  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, taxon_id: 4558 };
+  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb of sorghum BTx623 v3.
+  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, map: "GCA_000003195.3" };
 
   it("returns a valid Solr response envelope", async () => {
     const res = await rpc("tools/call", {
@@ -657,25 +678,31 @@ describe("genes_in_region", () => {
     assert.ok(ids.includes(REAL.geneId), `Expected ${REAL.geneId} in region results`);
   });
 
-  it("returns fewer genes when taxon_id narrows to sorghum only", async () => {
-    const [all, sorghum] = await Promise.all([
-      rpc("tools/call", { name: "genes_in_region", arguments: { region: MSD2_REGION.region, start: MSD2_REGION.start, end: MSD2_REGION.end, rows: 0 } }),
-      rpc("tools/call", { name: "genes_in_region", arguments: { ...MSD2_REGION, rows: 0 } }),
-    ]);
-    const nAll     = toolResult(all).response.numFound;
-    const nSorghum = toolResult(sorghum).response.numFound;
-    assert.ok(nAll > 0,           "Expected genes without taxon filter");
-    assert.ok(nSorghum > 0,       "Expected sorghum genes in region");
-    assert.ok(nSorghum <= nAll,   "Taxon filter should not increase count");
+  it("returns only genes on the named assembly", async () => {
+    const res = await rpc("tools/call", {
+      name: "genes_in_region",
+      arguments: { ...MSD2_REGION, fl: "id,map", rows: 100 },
+    });
+    const docs = toolResult(res).response.docs;
+    assert.ok(docs.length > 0, "Expected genes in the interval");
+    assert.ok(docs.every((d) => d.map === MSD2_REGION.map), "Every gene must be on the requested map");
   });
 
   it("returns empty for a non-existent region", async () => {
     const res = await rpc("tools/call", {
       name: "genes_in_region",
-      arguments: { region: "99", start: 1, end: 1000 },
+      arguments: { region: "99", start: 1, end: 1000, map: MSD2_REGION.map },
     });
     const data = toolResult(res);
     assert.equal(data.response.numFound, 0);
+  });
+
+  it("missing map → tool error that says how to find one", async () => {
+    const res = await rpc("tools/call", {
+      name: "genes_in_region",
+      arguments: { region: "6", start: 46500000, end: 46650000 },
+    });
+    assert.match(res.error?.message || "", /requires 'map'/);
   });
 
   it("missing required fields → tool error", async () => {

@@ -100,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.6.1";
+const SERVER_VERSION = "0.6.2";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -710,6 +710,13 @@ async function searchFetch(site, args) {
     throw new Error("search requires a non-empty string 'q'");
   }
 
+  // The Gramene API returns no documents for a `q` whose top level is a
+  // disjunction ("a:1 OR a:2", "id:(X OR Y)"), on every site, while the same
+  // expression nested under a conjunction works. Anchor such queries on *:*.
+  // Local-param queries ({!graph …}) are left alone: wrapping would change
+  // what the parser applies to.
+  const solrQ = /^\s*\{!/.test(q) || !/\sOR\s|\|\|/.test(q) ? q : `*:* AND (${q})`;
+
   // Faceting and stats. The Gramene API forwards only `facet.field`,
   // `json.facet` and `stats.field` to Solr; every other facet.* / f.<field>.*
   // parameter is dropped without an error. So:
@@ -777,7 +784,7 @@ async function searchFetch(site, args) {
   }
 
   const res = await apiGet(site, "/search", {
-    q, fq, fl, rows, start, sort, defType, wt: "json",
+    q: solrQ, fq, fl, rows, start, sort, defType, wt: "json",
     ...facetParams, ...statsParams,
   });
   return Object.keys(jsonFacet).length ? foldJsonFacets(res, facet, jsonFacet) : res;
@@ -1151,6 +1158,14 @@ async function tool_genes_in_region(args, site) {
   if (!region || start === undefined || end === undefined) {
     throw new Error("genes_in_region requires 'region', 'start', and 'end'");
   }
+  // Coordinates only mean something on one assembly, and a chromosome name
+  // alone matches every genome that has a "6".
+  if (!mapFilter || typeof mapFilter !== "string") {
+    throw new Error(
+      "genes_in_region requires 'map': the assembly the coordinates are on (e.g. 'GCA_000003195.3'). " +
+      "Coordinates are not comparable between assemblies. List assemblies with mongo_find(collection:'maps'); " +
+      "a gene's is location.map, a QTL's is location.map.");
+  }
   // Return genes whose coordinates overlap [start, end]:
   //   gene.start <= region_end  AND  gene.end >= region_start
   const q = `region:${solrEscapeValue(String(region))}`;
@@ -1158,11 +1173,9 @@ async function tool_genes_in_region(args, site) {
     `start:[* TO ${Number(end)}]`,
     `end:[${Number(start)} TO *]`,
   ];
-  // Apply species filter via taxonomy__ancestors (plain NCBI taxon ID).
-  // This matches all subspecies/assemblies under that taxon and avoids the
-  // NCBI×1000+suffix encoding required by the Solr `taxon_id` field.
+  fq.push(`map:${solrEscapeValue(mapFilter)}`);
+  // No longer advertised (map already fixes the genome) but still honoured.
   if (taxon_id !== undefined) fq.push(`taxonomy__ancestors:${Number(taxon_id)}`);
-  if (mapFilter) fq.push(`map:${solrEscapeValue(mapFilter)}`);
   return searchFetch(site, { q, fq, fl, rows, sort });
 }
 
@@ -2093,7 +2106,7 @@ async function tool_gene_search(args, site) {
   return { query: q, fq, ...(savedView && { saved_view: savedView }), ...res };
 }
 
-// PTV ⊆ PAV ⊆ all. Counts are genes carrying the field, across all 128 genomes.
+// PTV ⊆ PAV ⊆ all. Counts are genes carrying the field, across all genomes of the site.
 const RSID_SEVERITY_FIELD = {
   all: "rsid__attr_ss",
   PAV: "rsid_PAV__attr_ss",
@@ -2206,9 +2219,9 @@ async function tool_expand_gene_set(args, site) {
     mode, query: q,
     ...(twoStep && { window, seed_field: spec.seed, seeds }),
     n_genes: res.response?.numFound ?? 0,
-    n_genomes: byGenome.filter((g) => g.n_genes > 0).length,
     ...(facet_by_genome && {
-      by_genome_note: "Every genome on the site is listed. n_genes 0 means no member there: the gene is absent, " +
+      n_genomes: byGenome.filter((g) => g.n_genes > 0).length,
+      by_genome_note: "Every genome on the site is listed, and the seed gene is counted in its own genome. n_genes 0 means no member there: the gene is absent, " +
         "was not annotated, the genome is not in the gene trees (maps.in_compara false), or it is outside the genomes filter.",
     }),
     by_genome: byGenome,
@@ -2661,12 +2674,14 @@ const TOOL_REGISTRY = {
         "Any node may carry negate:true (applies to the whole subtree) and",
         "expand:'orthologs'|'paralogs'|'neighborhood' (graph-expands that node's match set).",
         "",
-        "Worked leaves (counts verified against this release):",
+        "Worked leaves (ids and counts in the examples are from SorghumBase; fields are the same on every site):",
         "  expression, categorical",
         "    {fq_field:'expr_class__attr_ss',        fq_value:'tissue_specific'}",
         "    {fq_field:'expr_specific_to__attr_ss',  fq_value:'root'}       # 16 organs",
-        "    {fq_field:'expr_organ_level__attr_ss',  fq_value:'leaf:high'}  # ~16,638 genes",
+        "    {fq_field:'expr_organ_level__attr_ss',  fq_value:'leaf:high'}",
         "      pass organ:level RAW — the colon is escaped for you",
+        "      levels: not_expressed < low < medium < high < very_high. Each is a separate value:",
+        "      'leaf:high' does NOT include 'leaf:very_high', so OR the levels you mean.",
         "    {fq_field:'expressed_in_gxa_attr_ss',   fq_value:'E-MTAB-5956'}",
         "      note the SINGLE underscore before attr_ss, unlike every other expr_* field",
         "  expression, numeric (not in the suggestion index — only reachable here)",
@@ -2758,6 +2773,10 @@ const TOOL_REGISTRY = {
         "  neighborhood          +/- window genes in GENOME order",
         "  compara_neighborhood  +/- window genes in COMPARA order (syntenic, crosses genomes)",
         "",
+        "The seed genes are part of the result: they appear in `genes`, in `n_genes` and in their",
+        "own genome's row of `by_genome`. So paralogs of one gene returns the gene plus its paralogs,",
+        "and a single-copy ortholog shows 1 in every genome including the seed's.",
+        "",
         "The homology fields are INVERTED — a gene's record lists the ids it is a homolog OF —",
         "so this is one query per seed, not a traversal. The two neighbourhood modes are seeded",
         "from different index spaces (gene_idx vs compara_idx) and the tool picks the right one;",
@@ -2774,7 +2793,7 @@ const TOOL_REGISTRY = {
           genomes: { type: "array", items: { type: "integer" }, maxItems: 300 },
           fl: { type: "string" },
           rows: { type: "integer", minimum: 0, maximum: 200 },
-          facet_by_genome: { type: "boolean", description: "Per-genome counts for every genome on the site, including zeros (see by_genome_note). Default true." },
+          facet_by_genome: { type: "boolean", description: "Per-genome counts for every genome on the site, including zeros (see by_genome_note), plus n_genomes. Default true; false omits both." },
         },
         required: ["gene_ids", "mode"],
       },
@@ -2787,7 +2806,7 @@ const TOOL_REGISTRY = {
       name: "gene_sequence",
       description: [
         "Fetch sequence from the Ensembl REST mirror: genomic, CDS, cDNA or protein for genes,",
-        "or any genomic interval. Covers all 128 genomes in this release.",
+        "or any genomic interval. Covers the genomes of this site.",
         "",
         "Two ways to call it:",
         "  gene_ids:[…]  up to 25 ids; species is inferred from the index automatically",
@@ -2937,14 +2956,15 @@ const TOOL_REGISTRY = {
         `  - "All X-family genes" or other broad set → pick the candidate with the LARGEST num_genes,`,
         `    not the highest-ranked. InterPro/domain matches (fq_field=domains__ancestors) often`,
         `    give the cleanest, broadest scope. Example: 'lipoxygenase' → InterPro 'LipOase' with`,
-        `    fq_field=domains__ancestors covers ~1488 genes across 123 genomes.`,
+        `    fq_field=domains__ancestors covers every member in every genome (on SorghumBase,`,
+        `    about 1,500 genes across more than 100 genomes).`,
         ``,
         `IMPORTANT — looking up pathways and species:`,
         `  'term' ranks across all categories and is dominated by InterPro/GO. Pathway and species`,
         `  hits often miss the top. For exact lookups, use 'q' with a field-qualified match:`,
         `    Pathway:    q='name:"Jasmonic acid biosynthesis"'  → fq_field=pathways__ancestors`,
         `    Species:    q='name:"Sorghum bicolor"'             → fq_field=taxonomy__ancestors`,
-        `    TO term:    q='name:"plant height"' fq=['category:Trait Ontology']`,
+        `    TO term:    q='name:"plant height"' fq=['category:"Trait ontology"']`,
         `  Then use the returned fq_field + fq_value directly as fq filters in solr_search.`,
         ``,
         `Canonical two-step pattern for "genes in pathway X in species Y":`,
@@ -2957,7 +2977,7 @@ const TOOL_REGISTRY = {
         properties: {
           term: { type: "string", description: "Free-text search term — handed verbatim to the API's boosted suggester." },
           q:    { type: "string", description: "Field-qualified Solr query (e.g. 'name:\"Sorghum bicolor\"'). Overridden by 'term' if both are provided." },
-          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:Trait Ontology'])." },
+          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:\"Trait ontology\"']). Category names are case-sensitive and must be quoted when they contain a space." },
           rows: { type: "integer", minimum: 0, maximum: 1000, description: "Max results to return (default 10)." },
           start: { type: "integer", minimum: 0, description: "Offset for pagination." },
           include_taxa: { type: "boolean", description: "Return each suggestion's full taxon_id / taxon_freq arrays. By default a suggestion found in more than 8 genomes carries n_genomes and top_genomes (the five genomes with most genes) instead." },
@@ -3013,7 +3033,9 @@ const TOOL_REGISTRY = {
         "index) instead.",
         "",
         "Common patterns:",
-        "  - Genome assembly metadata (Compara membership): filter:{ in_compara: true } on 'maps'",
+        "  - Genome assembly metadata (Compara membership): call 'maps' with NO filter and read",
+        "    in_compara on each document. Boolean values cannot be filtered: filter:{ in_compara: true }",
+        "    returns nothing.",
         "  - Ontology term lookup by ID: prefer mongo_lookup_by_ids over an ad-hoc find().",
         "  - Experiment metadata: filter:{ _id: { $in: [<exp_ids>] } } on 'experiments' or 'assays'",
         "",
@@ -3136,9 +3158,12 @@ const TOOL_REGISTRY = {
         `Returns genes where gene.start ≤ end AND gene.end ≥ start on the given region (chromosome).`,
         `Useful as the first step in QTL candidate gene analysis.`,
         ``,
-        `Species filter: pass the plain NCBI taxon ID via 'taxon_id' — it is applied internally`,
-        `as taxonomy__ancestors:<id>, matching all subspecies and assemblies under that taxon.`,
-        `Do NOT pass the NCBI×1000+suffix encoding (e.g. 4558001); use the plain ID (e.g. 4558).`,
+        `'map' is required: it names the assembly the coordinates are on (the _id of a 'maps'`,
+        `document, e.g. 'GCA_000003195.3'). Genomic coordinates are not stable across assemblies,`,
+        `so an interval is only meaningful on one. Find it with mongo_find(collection:'maps'), or`,
+        `read it from the record the interval came from: a gene's location.map, a QTL's location.map.`,
+        `An assembly can carry more than one annotation set (rice Nipponbare has three); request`,
+        `system_name in 'fl' to tell them apart.`,
         ``,
         `Key fields to request via 'fl':`,
         `  id, name, biotype, start, end, strand, system_name`,
@@ -3153,13 +3178,12 @@ const TOOL_REGISTRY = {
           region:   { type: "string",  description: "Chromosome / scaffold name (e.g. '6', 'Chr01')." },
           start:    { type: "integer", description: "Interval start coordinate (bp, inclusive)." },
           end:      { type: "integer", description: "Interval end coordinate (bp, inclusive)." },
-          taxon_id: { type: "integer", description: "Plain NCBI taxon ID (e.g. 4558 for Sorghum bicolor). Applied as taxonomy__ancestors filter; matches all subspecies/assemblies." },
-          map:      { type: "string",  description: "Assembly accession to filter by (e.g. 'GCA_000003195.3')." },
+          map:      { type: "string",  description: "Assembly the coordinates are on: the _id of a 'maps' document (e.g. 'GCA_000003195.3')." },
           fl:       { type: "string",  description: "Comma-separated Solr field list to return." },
           rows:     { type: "integer", minimum: 0, maximum: 1000, description: "Max genes to return (default 200)." },
           sort:     { type: "string",  description: "Sort clause, e.g. 'start asc'." },
         },
-        required: ["region", "start", "end"],
+        required: ["region", "start", "end", "map"],
       },
     },
     handler: tool_genes_in_region,
@@ -3403,7 +3427,7 @@ fetching detail records once you already have a specific ID.
 | Single gene by ID ("tell me about SORBI_…") | \`solr_search\` (q="id:…") | — (build a gene card) |
 | Gene name / function lookup | \`solr_suggest\` (term=) | \`gene_lookup\` |
 | "Genes in pathway X for species Y" | \`solr_suggest\` (q= for pathway and species) | \`pathway_genes\` |
-| Trait → QTL discovery ("QTLs for plant height") | \`solr_suggest\` (q='name:"…"' fq='category:Trait Ontology') | \`qtl_discovery\` |
+| Trait → QTL discovery ("QTLs for plant height") | \`solr_suggest\` (q='name:"…"' fq='category:"Trait ontology"') | \`qtl_discovery\` |
 | QTL interval / trait candidate analysis | \`genes_in_region\` | \`qtl_candidate_ranking\` |
 | "What's known about gene X?" | \`solr_search\` for metadata | \`literature_search\` |
 | Cross-species comparison for a gene | \`solr_search\` for \`gene_tree\` | \`cross_species_comparison\`, \`orthologs_paralogs\` |
@@ -3423,8 +3447,8 @@ two frequency arrays.
 **Taxon ID — use the plain NCBI ID.**
 - Filter with \`taxonomy__ancestors:<plain NCBI id>\` (e.g. \`4558\` sorghum,
   \`3702\` Arabidopsis, \`39947\` rice). Matches all subspecies/assemblies.
-- The \`genes_in_region\` \`taxon_id\` parameter takes the plain NCBI ID and
-  applies it as \`taxonomy__ancestors\` internally.
+- \`genes_in_region\` takes no taxon: it requires \`map\`, the assembly the
+  coordinates are on (a \`maps\` _id such as \`GCA_000003195.3\`).
 - The Solr \`taxon_id\` *field* on individual gene documents uses
   NCBI×1000+suffix (e.g. \`4558001\` for sorghum BTx623). Avoid filtering on
   it directly unless you specifically need a single assembly.
@@ -3629,6 +3653,7 @@ InterPro/GO and may not surface Reactome entries.
         { name: "start", description: "Interval start (bp, inclusive).", required: false },
         { name: "end", description: "Interval end (bp, inclusive).", required: false },
         { name: "taxon_id", description: "Plain NCBI taxon ID for the species (e.g. 4558 for sorghum). Applied as taxonomy__ancestors filter.", required: true },
+        { name: "map", description: "Assembly the interval's coordinates are on (a maps _id, e.g. 'GCA_000003195.3'). Required by genes_in_region; a QTL record carries it as location.map.", required: false },
       ],
     },
     template: `# Workflow: QTL candidate gene ranking
@@ -3647,7 +3672,7 @@ InterPro/GO and may not surface Reactome entries.
 ## Step 0 — Resolve the trait if only a name is known
 If the user gave a trait name rather than a TO ID:
 \`\`\`
-solr_suggest(q: 'name:"<trait>"', fq: ['category:Trait Ontology'])
+solr_suggest(q: 'name:"<trait>"', fq: ['category:"Trait ontology"'])
   → returns fq_value (TO integer ID) and the canonical TO:NNNNNNN string
 \`\`\`
 
@@ -3665,7 +3690,7 @@ genes_in_region(
   region: "{{region}}",
   start: {{start}},
   end: {{end}},
-  taxon_id: {{taxon_id}},
+  map: "{{map}}",   # assembly the coordinates are on; if blank, use the QTL's location.map or look it up in mongo maps
   fl: "id,name,biotype,start,end,gene_tree,TO__ancestors,GO__ancestors,compara_idx_multi,closest_rep_id,closest_rep_name,closest_rep_description,model_rep_id,model_rep_name,model_rep_description"
 )
 \`\`\`
@@ -4103,7 +4128,7 @@ questions; use the chained-graph variant when you also want ±10-gene
 neighborhood context, or to seed from any homolog rather than the gene tree.
 
 **Caveat:** not all genomes participated in the Compara gene tree analysis.
-Always check the \`maps\` MongoDB collection (\`in_compara: true\`) to get
+Always read \`in_compara\` from the \`maps\` MongoDB collection (fetched unfiltered) to get
 the genomes that *should* have homology data — that is the denominator when
 interpreting absence.
 
@@ -4120,8 +4145,9 @@ solr_search(q: "id:{{gene_id}}",
   → extract gene_tree id
 
 # 2. Genomes that participated in Compara (denominator)
-mongo_find(collection: "maps", filter: { in_compara: true },
-           projection: { _id: 1, name: 1, system_name: 1 })
+mongo_find(collection: "maps",
+           projection: { _id: 1, system_name: 1, in_compara: 1 })
+  → keep the documents with in_compara true (a boolean filter returns nothing)
 
 # 3. Facet members of the family by genome
 solr_search(q: "gene_tree:<tree_id>", rows: 0,
@@ -4274,7 +4300,7 @@ solr_search(
 \`\`\`
 solr_suggest(
   q:  'name:"{{trait}}"',
-  fq: ['category:Trait Ontology']
+  fq: ['category:"Trait ontology"']
 )
   → returns one or more matches; each has fq_field=TO__ancestors and
     fq_value=<TO integer id>. Note also the canonical TO:NNNNNNN string.
@@ -4282,7 +4308,7 @@ solr_suggest(
 
 If the exact name doesn't match, fall back to a fuzzy term lookup:
 \`\`\`
-solr_suggest(term: "{{trait}}", fq: ['category:Trait Ontology'])
+solr_suggest(term: "{{trait}}", fq: ['category:"Trait ontology"'])
 \`\`\`
 
 ## Step 2 — List QTLs annotated with that TO term

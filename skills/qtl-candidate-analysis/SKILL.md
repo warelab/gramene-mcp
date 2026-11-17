@@ -90,7 +90,7 @@ the most discriminating tissues from the data itself.
 ```
 genes_in_region(
   region: "<chr>", start: <start>, end: <end>,
-  taxon_id: <taxon_id>,
+  map: "<assembly the coordinates are on, e.g. GCA_000003195.3 — a QTL's location.map>",
   fl: "id,name,description,biotype,start,end,strand,gene_tree,
        homology__ortholog_one2one,homology__all_orthologs,
        GO__ancestors,TO__ancestors,PO__ancestors,

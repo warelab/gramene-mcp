@@ -259,7 +259,7 @@ The server exposes 19 tools. They map onto two API endpoint families: `/search` 
 | `solr_suggest` | Calls `/suggest`. Entry point for free-text concepts (gene name, family, pathway, species, ontology, trait) → `fq_field`/`fq_value`. Always start here before `mongo_find`. Returns the Solr grouped envelope (`grouped.category.groups[].doclist.docs[]`). |
 | `solr_search_bool` | Structured AND/OR/NOT boolean queries compiled into `/search` `fq` clauses |
 | `solr_graph` | Single-hop `{!graph}` traversal via `/search` (e.g. genomic neighbourhoods through `compara_neighbors_10`). Multi-hop relationships are expressed by chaining two queries |
-| `genes_in_region` | Find all genes overlapping a chromosomal interval. `taxon_id` is the plain NCBI ID |
+| `genes_in_region` | Find all genes overlapping a chromosomal interval. Requires `map`, the assembly the coordinates are on |
 | `expression_for_genes` | Baseline (TPM/FPKM) and differential (log₂FC) expression by tissue and condition. Joins gene expression fields with `/experiments` and `/assays`. |
 | `vep_for_gene` | Germplasm accessions carrying predicted loss-of-function alleles (Ensembl VEP), grouped by consequence, zygosity, and study. Joins with `/germplasm`. |
 | `pubmed_for_genes` | PubMed and DOI cross-references for a set of genes (returns IDs only — pipe to a PubMed-focused MCP for bibliographic detail) |
