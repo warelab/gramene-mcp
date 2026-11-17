@@ -100,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.6.0";
+const SERVER_VERSION = "0.6.4";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -710,60 +710,119 @@ async function searchFetch(site, args) {
     throw new Error("search requires a non-empty string 'q'");
   }
 
-  // Classic Solr field faceting — expand the 'facet' convenience object into
-  // individual URL params (facet=true, facet.field=X, facet.pivot=A,B, etc.)
+  // The Gramene API returns no documents for a `q` whose top level is a
+  // disjunction ("a:1 OR a:2", "id:(X OR Y)"), on every site, while the same
+  // expression nested under a conjunction works. Anchor such queries on *:*.
+  // Local-param queries ({!graph …}) are left alone: wrapping would change
+  // what the parser applies to.
+  const solrQ = /^\s*\{!/.test(q) || !/\sOR\s|\|\|/.test(q) ? q : `*:* AND (${q})`;
+
+  // Faceting and stats. The Gramene API forwards only `facet.field`,
+  // `json.facet` and `stats.field` to Solr; every other facet.* / f.<field>.*
+  // parameter is dropped without an error. So:
+  //   - per-field options (limit, mincount, missing) ride along as local
+  //     params on facet.field — `{!facet.limit=-1 facet.mincount=1}field`;
+  //   - pivot and range facets are sent as json.facet and their response is
+  //     folded back into the classic facet_counts.facet_pivot / facet_ranges
+  //     shapes (see foldJsonFacets);
+  //   - percentiles go as local params on stats.field.
+  // Without this a field facet silently fell back to Solr's default of 100
+  // values including zero counts, and pivots and ranges returned nothing.
   const facetParams = {};
+  const jsonFacet = {};
   if (facet) {
     facetParams["facet"] = "true";
+    const mincount = facet.mincount ?? 1;
     if (facet.field) {
-      facetParams["facet.field"] = Array.isArray(facet.field) ? facet.field : [facet.field];
+      const local = [`facet.mincount=${Number(mincount)}`];
+      if (facet.limit !== undefined) local.push(`facet.limit=${Number(facet.limit)}`);
+      if (facet.missing) local.push("facet.missing=true");
+      const fields = Array.isArray(facet.field) ? facet.field : [facet.field];
+      facetParams["facet.field"] = fields.map((f) =>
+        String(f).startsWith("{!") ? String(f) : `{!${local.join(" ")}}${f}`);
     }
-    if (facet.mincount !== undefined) facetParams["facet.mincount"] = String(facet.mincount);
-    if (facet.limit    !== undefined) facetParams["facet.limit"]    = String(facet.limit);
-    if (facet.missing  !== undefined) facetParams["facet.missing"]  = facet.missing ? "true" : "false";
-    // Pivot faceting: facet.pivot=field1,field2 gives nested counts.
-    // Pass a comma-separated string (one pivot) or array of strings (multiple pivots).
+    // Pivot: "field1,field2[,field3]" → nested terms facets.
     if (facet.pivot) {
-      facetParams["facet.pivot"] = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
+      const pivots = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
+      const limit = facet.limit !== undefined ? Number(facet.limit) : 100;
+      const pivotMin = Number(facet.pivot_mincount ?? mincount);
+      pivots.forEach((spec, i) => {
+        const fields = String(spec).split(",").map((f) => f.trim()).filter(Boolean);
+        let node = null;
+        for (const f of fields.reverse()) {
+          node = { type: "terms", field: f, limit, mincount: pivotMin, ...(node && { facet: { pivot: node } }) };
+        }
+        if (node) jsonFacet[`pivot_${i}`] = node;
+      });
     }
-    if (facet.pivot_mincount !== undefined) facetParams["facet.pivot.mincount"] = String(facet.pivot_mincount);
-    // Range faceting: distribute numeric values into fixed-width buckets.
-    // facet.range = { field, start, end, gap, include?, other?, hardend? }
-    // Returns facet_counts.facet_ranges.<field>.counts as [bucket_start, count, ...]
+    // Range: { field, start, end, gap, include?, other?, hardend? }.
     if (facet.range) {
       const ranges = Array.isArray(facet.range) ? facet.range : [facet.range];
-      for (const r of ranges) {
-        if (!r.field) continue;
-        facetParams["facet.range"]            = [...(facetParams["facet.range"] || []), r.field];
-        facetParams[`f.${r.field}.facet.range.start`] = String(r.start ?? 0);
-        facetParams[`f.${r.field}.facet.range.end`]   = String(r.end);
-        facetParams[`f.${r.field}.facet.range.gap`]   = String(r.gap);
-        if (r.include) facetParams[`f.${r.field}.facet.range.include`] = r.include;
-        if (r.other)   facetParams[`f.${r.field}.facet.range.other`]   = r.other;
-        if (r.hardend !== undefined) facetParams[`f.${r.field}.facet.range.hardend`] = r.hardend ? "true" : "false";
-      }
+      ranges.forEach((r, i) => {
+        if (!r?.field) return;
+        jsonFacet[`range_${i}`] = {
+          type: "range", field: r.field, start: r.start ?? 0, end: r.end, gap: r.gap,
+          ...(r.include && { include: r.include }),
+          ...(r.other && { other: r.other }),
+          ...(r.hardend !== undefined && { hardend: !!r.hardend }),
+        };
+      });
     }
+    if (Object.keys(jsonFacet).length) facetParams["json.facet"] = JSON.stringify(jsonFacet);
   }
 
-  // Solr field statistics: min, max, sum, mean, stddev, percentiles, count, missing.
-  // stats = { field: "field_name" } or { field: ["f1","f2"], percentiles: "25,50,75,95" }
   const statsParams = {};
   if (stats) {
     statsParams["stats"] = "true";
     const fields = Array.isArray(stats.field) ? stats.field : [stats.field];
-    statsParams["stats.field"] = fields;
-    if (stats.percentiles) {
-      // Apply percentile config to each field
-      for (const f of fields) {
-        statsParams[`f.${f}.stats.percentiles`] = String(stats.percentiles);
-      }
-    }
+    // Naming percentiles as a local param switches off the default statistics,
+    // so list those explicitly alongside it.
+    const pct = stats.percentiles ? String(stats.percentiles).replace(/[^0-9.,]/g, "") : "";
+    statsParams["stats.field"] = fields.map((f) => (pct
+      ? `{!percentiles="${pct}" min=true max=true sum=true count=true missing=true mean=true stddev=true}${f}`
+      : f));
   }
 
-  return apiGet(site, "/search", {
-    q, fq, fl, rows, start, sort, defType, wt: "json",
+  const res = await apiGet(site, "/search", {
+    q: solrQ, fq, fl, rows, start, sort, defType, wt: "json",
     ...facetParams, ...statsParams,
   });
+  return Object.keys(jsonFacet).length ? foldJsonFacets(res, facet, jsonFacet) : res;
+}
+
+// Rewrite a json.facet response (`facets`) into the classic shapes the tool
+// descriptions promise: facet_counts.facet_pivot["a,b"] = [{field, value,
+// count, pivot?}] and facet_counts.facet_ranges[field] = {counts: [start,
+// count, …], gap, start, end, before?, after?, between?}.
+function foldJsonFacets(res, facet, jsonFacet) {
+  const raw = res?.facets;
+  if (!raw || typeof raw !== "object") return res;
+  const fc = (res.facet_counts ??= {});
+  const pivotNode = (def, bucket) => ({
+    field: def.field, value: bucket.val, count: bucket.count,
+    ...(def.facet?.pivot && { pivot: (bucket.pivot?.buckets || []).map((b) => pivotNode(def.facet.pivot, b)) }),
+  });
+  const pivots = Array.isArray(facet.pivot) ? facet.pivot : facet.pivot ? [facet.pivot] : [];
+  pivots.forEach((spec, i) => {
+    const def = jsonFacet[`pivot_${i}`];
+    if (!def) return;
+    (fc.facet_pivot ??= {})[String(spec)] = (raw[`pivot_${i}`]?.buckets || []).map((b) => pivotNode(def, b));
+  });
+  const ranges = Array.isArray(facet.range) ? facet.range : facet.range ? [facet.range] : [];
+  ranges.forEach((r, i) => {
+    const def = jsonFacet[`range_${i}`];
+    const got = raw[`range_${i}`];
+    if (!def || !got) return;
+    (fc.facet_ranges ??= {})[r.field] = {
+      counts: (got.buckets || []).flatMap((b) => [b.val, b.count]),
+      gap: def.gap, start: def.start, end: def.end,
+      ...(got.before && { before: got.before.count }),
+      ...(got.after && { after: got.after.count }),
+      ...(got.between && { between: got.between.count }),
+    };
+  });
+  delete res.facets;
+  return res;
 }
 
 // /suggest wraps the Solr suggestions core. Only q / fq / rows / start are
@@ -1099,6 +1158,14 @@ async function tool_genes_in_region(args, site) {
   if (!region || start === undefined || end === undefined) {
     throw new Error("genes_in_region requires 'region', 'start', and 'end'");
   }
+  // Coordinates only mean something on one assembly, and a chromosome name
+  // alone matches every genome that has a "6".
+  if (!mapFilter || typeof mapFilter !== "string") {
+    throw new Error(
+      "genes_in_region requires 'map': the assembly the coordinates are on (e.g. 'GCA_000003195.3'). " +
+      "Coordinates are not comparable between assemblies. List assemblies with mongo_find(collection:'maps'); " +
+      "a gene's is location.map, a QTL's is location.map.");
+  }
   // Return genes whose coordinates overlap [start, end]:
   //   gene.start <= region_end  AND  gene.end >= region_start
   const q = `region:${solrEscapeValue(String(region))}`;
@@ -1106,11 +1173,9 @@ async function tool_genes_in_region(args, site) {
     `start:[* TO ${Number(end)}]`,
     `end:[${Number(start)} TO *]`,
   ];
-  // Apply species filter via taxonomy__ancestors (plain NCBI taxon ID).
-  // This matches all subspecies/assemblies under that taxon and avoids the
-  // NCBI×1000+suffix encoding required by the Solr `taxon_id` field.
+  fq.push(`map:${solrEscapeValue(mapFilter)}`);
+  // No longer advertised (map already fixes the genome) but still honoured.
   if (taxon_id !== undefined) fq.push(`taxonomy__ancestors:${Number(taxon_id)}`);
-  if (mapFilter) fq.push(`map:${solrEscapeValue(mapFilter)}`);
   return searchFetch(site, { q, fq, fl, rows, sort });
 }
 
@@ -1201,7 +1266,11 @@ async function tool_expression_for_genes(args, site) {
     experiment_type,  // "Baseline" | "Differential" | undefined (both)
     taxon_id,         // integer — filter experiments by species (the species the experiment was done in)
     po_terms,         // int[] — PO term int_ids; either control or treatment assay must match
+    detail = "auto",  // "auto" | "summary" | "full"
   } = args || {};
+  if (!["auto", "summary", "full"].includes(detail)) {
+    throw new Error("expression_for_genes: detail must be 'auto', 'summary' or 'full'");
+  }
 
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
     throw new Error("expression_for_genes requires a non-empty 'gene_ids' array");
@@ -1335,7 +1404,7 @@ async function tool_expression_for_genes(args, site) {
         const exp = experimentDocs.get(ref.experiment);
         baseline.push({
           experiment:      ref.experiment,
-          experiment_name: exp?.name ?? null,
+          experiment_name: experimentLabel(exp),
           group:           ref.group,
           value:           ref.value,
           tissue:          assayTissue(assay),
@@ -1366,7 +1435,7 @@ async function tool_expression_for_genes(args, site) {
         const { contrast, shared } = diffAssayFactors(cAssay, tAssay);
         differential.push({
           experiment:      slot.experiment,
-          experiment_name: exp?.name ?? null,
+          experiment_name: experimentLabel(exp),
           control_group:   slot.control_group,
           treatment_group: slot.treatment_group,
           control_tissue:    assayTissue(cAssay),
@@ -1414,13 +1483,117 @@ async function tool_expression_for_genes(args, site) {
     if (anyMatched) poInfo.expanded = true;
   }
 
+  // One gene can carry hundreds of sample rows (~450 bytes each). Past a
+  // modest row count, hand back per-tissue and per-contrast summaries instead
+  // unless the caller asked for the rows.
+  const totalRows = Object.values(genes).reduce((n, g) => n + g.baseline.length + g.differential.length, 0);
+  const summarize = detail === "summary" ||
+    (detail === "auto" && Buffer.byteLength(JSON.stringify(genes)) > EXPRESSION_AUTO_FULL_BYTES);
+  if (summarize) {
+    for (const [id, g] of Object.entries(genes)) genes[id] = summarizeExpression(g);
+  }
+
   const result = {
     gene_count:       gene_ids.length,
     experiment_count: allowedExperiments.size,
+    detail:           summarize ? "summary" : "full",
+    ...(summarize && {
+      note: `${totalRows} sample rows were summarised (baseline by tissue, differential as counts plus the strongest ` +
+        `significant contrasts). For the rows themselves pass detail:"full" and narrow the request with ` +
+        `experiment_type, po_terms, taxon_id or fewer genes.`,
+    }),
     genes,
   };
   if (po_terms && po_terms.length > 0) result.po_filter = poInfo;
   return result;
+}
+
+// Size up to which detail:"auto" returns every row. Measured in bytes, not
+// rows: a differential row carries both assays' factors and runs ~1.7 kB,
+// four times a baseline row.
+const EXPRESSION_AUTO_FULL_BYTES = 25_000;
+
+// Differential experiments have no short `name`, only a long description.
+function experimentLabel(exp) {
+  if (!exp) return null;
+  if (exp.name) return exp.name;
+  const d = typeof exp.description === "string" ? exp.description.trim() : "";
+  return d ? (d.length > 140 ? `${d.slice(0, 137)}…` : d) : null;
+}
+const EXPRESSION_TOP_CONTRASTS = 12;
+const EXPRESSION_TOP_TISSUES = 20;
+
+// Collapse one gene's rows: baseline → one line per tissue (max, median, the
+// experiment with the highest value); differential → counts and the
+// significant contrasts with the largest fold change.
+function summarizeExpression(g) {
+  const byTissue = new Map();
+  for (const row of g.baseline) {
+    const key = row.tissue ?? "unspecified";
+    if (!byTissue.has(key)) byTissue.set(key, []);
+    byTissue.get(key).push(row);
+  }
+  const median = (xs) => {
+    const a = [...xs].sort((x, y) => x - y);
+    const m = Math.floor(a.length / 2);
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+  };
+  const round = (x) => Math.round(x * 100) / 100;
+  const baselineByTissue = [...byTissue.entries()].map(([tissue, rows]) => {
+    const top = rows.reduce((best, r) => (Number(r.value) > Number(best.value) ? r : best));
+    return {
+      tissue,
+      n_samples: rows.length,
+      n_experiments: new Set(rows.map((r) => r.experiment)).size,
+      max: round(Number(top.value)),
+      median: round(median(rows.map((r) => Number(r.value)))),
+      // The sample behind `max`, with its factors: a tissue label alone does
+      // not say which stage, cultivar or treatment gave the value.
+      max_in: {
+        experiment: top.experiment, experiment_name: top.experiment_name, group: top.group,
+        factors: (top.factors || []).map((f) => `${f.type}: ${f.label}`),
+      },
+    };
+  }).sort((a, b) => b.max - a.max);
+
+  const isSig = (r) => r.p_value !== null && r.p_value < 0.05 && r.l2fc !== null && Math.abs(r.l2fc) >= 1;
+  const sig = g.differential.filter(isSig).sort((a, b) => Math.abs(b.l2fc) - Math.abs(a.l2fc));
+  const describe = (r) => ({
+    experiment: r.experiment,
+    experiment_name: r.experiment_name,
+    tissue: r.treatment_tissue ?? r.control_tissue,
+    contrast: r.contrast.map((c) => `${c.type}: ${c.control ?? "—"} → ${c.treatment ?? "—"}`),
+    l2fc: round(r.l2fc),
+    p_value: r.p_value,
+  });
+
+  const names = new Map();
+  for (const r of [...g.baseline, ...g.differential]) if (!names.has(r.experiment)) names.set(r.experiment, r.experiment_name);
+
+  return {
+    name: g.name,
+    description: g.description,
+    n_experiments_with_data: g.experiments_with_data.length,
+    experiments: [...names.entries()].map(([experiment, experiment_name]) => ({ experiment, experiment_name })),
+    baseline_summary: {
+      n_rows: g.baseline.length,
+      unit: "TPM/FPKM",
+      n_tissues: baselineByTissue.length,
+      // Highest first; the tail is the tissues where the gene is lowest.
+      by_tissue: baselineByTissue.slice(0, EXPRESSION_TOP_TISSUES),
+      ...(baselineByTissue.length > EXPRESSION_TOP_TISSUES && {
+        tissues_not_listed: baselineByTissue.length - EXPRESSION_TOP_TISSUES,
+      }),
+    },
+    differential_summary: {
+      n_contrasts: g.differential.length,
+      n_significant: sig.length,
+      significance: "p_value < 0.05 and |l2fc| >= 1",
+      n_up: sig.filter((r) => r.l2fc > 0).length,
+      n_down: sig.filter((r) => r.l2fc < 0).length,
+      top_significant: sig.slice(0, EXPRESSION_TOP_CONTRASTS).map(describe),
+    },
+  };
 }
 
 // --- VEP (Variant Effect Prediction) tool ---
@@ -1495,10 +1668,20 @@ function parseVepFieldName(fieldName) {
   return null;
 }
 
+const VEP_DEFAULT_ACCESSIONS = 20;
+const VEP_MAX_ACCESSIONS = 5000;
+
 async function tool_vep_for_gene(args, site) {
   const { gene_ids, include_germplasm_details = true } = args || {};
   if (!Array.isArray(gene_ids) || gene_ids.length === 0) {
     throw new Error("vep_for_gene requires a non-empty 'gene_ids' array");
+  }
+  // A gene can have well over a thousand carrier accessions (~75 bytes each
+  // before metadata), which no client will pass to the model. Every group
+  // always reports its full `count`; this caps how many accessions it lists.
+  const maxAccessions = args?.max_accessions === undefined ? VEP_DEFAULT_ACCESSIONS : Number(args.max_accessions);
+  if (!Number.isInteger(maxAccessions) || maxAccessions < 0 || maxAccessions > VEP_MAX_ACCESSIONS) {
+    throw new Error(`vep_for_gene: max_accessions must be an integer from 0 to ${VEP_MAX_ACCESSIONS}`);
   }
   if (gene_ids.length > 50) {
     throw new Error("vep_for_gene: max 50 gene_ids per call");
@@ -1516,13 +1699,15 @@ async function tool_vep_for_gene(args, site) {
 
   const solrDocs = solrResp?.response?.docs ?? [];
 
-  // 2. Collect all germplasm ens_ids referenced across genes.
+  // 2. Collect the germplasm ens_ids that will actually be listed (the first
+  //    max_accessions of each consequence group; the merged totals list none).
   const allEnsIds = new Set();
   for (const doc of solrDocs) {
     for (const [field, values] of Object.entries(doc)) {
-      if (field.startsWith("VEP__") && Array.isArray(values)) {
-        values.forEach((v) => allEnsIds.add(v));
-      }
+      if (!field.startsWith("VEP__") || !Array.isArray(values)) continue;
+      const parsed = parseVepFieldName(field);
+      if (!parsed || parsed.merged) continue;
+      values.slice(0, maxAccessions).forEach((v) => allEnsIds.add(v));
     }
   }
 
@@ -1553,7 +1738,7 @@ async function tool_vep_for_gene(args, site) {
       }
 
       // Enrich with germplasm metadata when available
-      const accessions = values.map((ens_id) => {
+      const accessions = values.slice(0, maxAccessions).map((ens_id) => {
         const g = germplasmMap[ens_id];
         if (!g) return { ens_id };
         const entry = { ens_id, pub_id: g.pub_id, stock_center: g.stock_center };
@@ -1571,8 +1756,9 @@ async function tool_vep_for_gene(args, site) {
         species:      parsed.species,
         study_label:  parsed.study_label,
         study_type:   parsed.study_type,
-        count:        accessions.length,
+        count:        values.length,
         accessions,
+        ...(values.length > accessions.length && { accessions_listed: accessions.length }),
       });
     }
 
@@ -1602,7 +1788,15 @@ async function tool_vep_for_gene(args, site) {
     }
   }
 
-  return { gene_count: Object.keys(result).length, genes: result };
+  const truncated = Object.values(result).some((g) => g.groups.some((grp) => grp.accessions_listed !== undefined));
+  return {
+    gene_count: Object.keys(result).length,
+    ...(truncated && {
+      note: `Groups list at most ${maxAccessions} accessions (accessions_listed); 'count' is always the full number. ` +
+        `Pass max_accessions (up to ${VEP_MAX_ACCESSIONS}) for more, ideally for one gene at a time.`,
+    }),
+    genes: result,
+  };
 }
 
 // Enrichment analysis is intentionally NOT exposed as an MCP tool. It is
@@ -1715,7 +1909,34 @@ async function tool_solr_suggest(args, site) {
   if (!term && !q) throw new Error("solr_suggest requires 'term' or 'q'");
   // 'term' = free text, gets the boosts. 'q' = caller-built raw Solr query, verbatim.
   const query = term ? boostedSuggestQuery(term) : q;
-  return suggestFetch(site, { q: query, fq, rows, start });
+  const res = await suggestFetch(site, { q: query, fq, rows, start });
+  return args?.include_taxa ? res : slimSuggestions(res);
+}
+
+// A suggestion lists every genome it occurs in (taxon_id) with a gene count
+// for each (taxon_freq). On a pan-genome site that is two arrays of 100+
+// numbers per suggestion, and a common word returned ~50 kB — more than a
+// client will hand to the model. Keep short lists as they are; replace long
+// ones with the genome count and the five best-represented genomes.
+const SUGGEST_TAXA_INLINE = 8;
+function slimSuggestions(res) {
+  for (const group of res?.grouped?.category?.groups || []) {
+    for (const doc of group.doclist?.docs || []) {
+      delete doc._version_;
+      delete doc.score;
+      const taxa = doc.taxon_id;
+      if (!Array.isArray(taxa) || taxa.length <= SUGGEST_TAXA_INLINE) continue;
+      const freq = Array.isArray(doc.taxon_freq) ? doc.taxon_freq : [];
+      doc.n_genomes = taxa.length;
+      doc.top_genomes = taxa
+        .map((t, i) => ({ taxon_id: t, n_genes: freq[i] ?? null }))
+        .sort((x, y) => (y.n_genes ?? 0) - (x.n_genes ?? 0))
+        .slice(0, 5);
+      delete doc.taxon_id;
+      delete doc.taxon_freq;
+    }
+  }
+  return res;
 }
 
 async function tool_solr_search_bool(args, site) {
@@ -2014,7 +2235,7 @@ async function tool_gene_search(args, site) {
   return { query: q, fq, ...(savedView && { saved_view: savedView }), ...res };
 }
 
-// PTV ⊆ PAV ⊆ all. Counts are genes carrying the field, across all 128 genomes.
+// PTV ⊆ PAV ⊆ all. Counts are genes carrying the field, across all genomes of the site.
 const RSID_SEVERITY_FIELD = {
   all: "rsid__attr_ss",
   PAV: "rsid_PAV__attr_ss",
@@ -2115,16 +2336,23 @@ async function tool_expand_gene_set(args, site) {
   const res = await searchFetch(site, {
     q, fq, rows, fl: fl || DEFAULT_GENE_FL,
     sort: twoStep ? "gene_idx asc" : "system_name asc",
-    ...(facet_by_genome && { facet: { field: "system_name", limit: -1, mincount: 1 } }),
+    // mincount 0: a genome with no member is the interesting row in a
+    // presence/absence question, so list every genome on the site.
+    ...(facet_by_genome && { facet: { field: "system_name", limit: -1, mincount: 0 } }),
   });
   const ff = res.facet_counts?.facet_fields?.system_name || [];
   const byGenome = [];
   for (let i = 0; i < ff.length; i += 2) byGenome.push({ system_name: ff[i], n_genes: ff[i + 1] });
+  byGenome.sort((x, y) => y.n_genes - x.n_genes || x.system_name.localeCompare(y.system_name));
   return {
     mode, query: q,
     ...(twoStep && { window, seed_field: spec.seed, seeds }),
     n_genes: res.response?.numFound ?? 0,
-    n_genomes: byGenome.length,
+    ...(facet_by_genome && {
+      n_genomes: byGenome.filter((g) => g.n_genes > 0).length,
+      by_genome_note: "Every genome on the site is listed, and the seed gene is counted in its own genome. n_genes 0 means no member there: the gene is absent, " +
+        "was not annotated, the genome is not in the gene trees (maps.in_compara false), or it is outside the genomes filter.",
+    }),
     by_genome: byGenome,
     genes: res.response?.docs || [],
     note: twoStep
@@ -2483,13 +2711,10 @@ async function tool_gene_tree_view(args, site) {
   let geneCount = null;
   let genomes = null;
   try {
-    const r = await apiGet(site, "/search", {
+    const r = await searchFetch(site, {
       q: `${treeField}:${treeId}`,
       rows: 0,
-      facet: true,
-      "facet.field": "system_name",
-      "facet.limit": -1,
-      "facet.mincount": 1,
+      facet: { field: "system_name", limit: -1, mincount: 1 },
     });
     geneCount = r?.response?.numFound ?? null;
     const flat = r?.facet_counts?.facet_fields?.system_name;
@@ -2564,7 +2789,7 @@ const TOOL_REGISTRY = {
     definition: {
       name: "gene_search",
       description: [
-        "Search SorghumBase genes with the SAME filter tree the web UI uses. Start here for",
+        "Search this site's genes with the SAME filter tree the web UI uses. Start here for",
         "anything expressible as a filter; it is the only tool that can run a saved view.",
         "",
         "Routing:",
@@ -2578,12 +2803,14 @@ const TOOL_REGISTRY = {
         "Any node may carry negate:true (applies to the whole subtree) and",
         "expand:'orthologs'|'paralogs'|'neighborhood' (graph-expands that node's match set).",
         "",
-        "Worked leaves (counts verified against this release):",
+        "Worked leaves (ids and counts in the examples are from SorghumBase; fields are the same on every site):",
         "  expression, categorical",
         "    {fq_field:'expr_class__attr_ss',        fq_value:'tissue_specific'}",
         "    {fq_field:'expr_specific_to__attr_ss',  fq_value:'root'}       # 16 organs",
-        "    {fq_field:'expr_organ_level__attr_ss',  fq_value:'leaf:high'}  # ~16,638 genes",
+        "    {fq_field:'expr_organ_level__attr_ss',  fq_value:'leaf:high'}",
         "      pass organ:level RAW — the colon is escaped for you",
+        "      levels: not_expressed < low < medium < high < very_high. Each is a separate value:",
+        "      'leaf:high' does NOT include 'leaf:very_high', so OR the levels you mean.",
         "    {fq_field:'expressed_in_gxa_attr_ss',   fq_value:'E-MTAB-5956'}",
         "      note the SINGLE underscore before attr_ss, unlike every other expr_* field",
         "  expression, numeric (not in the suggestion index — only reachable here)",
@@ -2675,6 +2902,10 @@ const TOOL_REGISTRY = {
         "  neighborhood          +/- window genes in GENOME order",
         "  compara_neighborhood  +/- window genes in COMPARA order (syntenic, crosses genomes)",
         "",
+        "The seed genes are part of the result: they appear in `genes`, in `n_genes` and in their",
+        "own genome's row of `by_genome`. So paralogs of one gene returns the gene plus its paralogs,",
+        "and a single-copy ortholog shows 1 in every genome including the seed's.",
+        "",
         "The homology fields are INVERTED — a gene's record lists the ids it is a homolog OF —",
         "so this is one query per seed, not a traversal. The two neighbourhood modes are seeded",
         "from different index spaces (gene_idx vs compara_idx) and the tool picks the right one;",
@@ -2691,7 +2922,7 @@ const TOOL_REGISTRY = {
           genomes: { type: "array", items: { type: "integer" }, maxItems: 300 },
           fl: { type: "string" },
           rows: { type: "integer", minimum: 0, maximum: 200 },
-          facet_by_genome: { type: "boolean", description: "Per-genome counts. Default true." },
+          facet_by_genome: { type: "boolean", description: "Per-genome counts for every genome on the site, including zeros (see by_genome_note), plus n_genomes. Default true; false omits both." },
         },
         required: ["gene_ids", "mode"],
       },
@@ -2704,7 +2935,7 @@ const TOOL_REGISTRY = {
       name: "gene_sequence",
       description: [
         "Fetch sequence from the Ensembl REST mirror: genomic, CDS, cDNA or protein for genes,",
-        "or any genomic interval. Covers all 128 genomes in this release.",
+        "or any genomic interval. Covers the genomes of this site.",
         "",
         "Two ways to call it:",
         "  gene_ids:[…]  up to 25 ids; species is inferred from the index automatically",
@@ -2854,14 +3085,15 @@ const TOOL_REGISTRY = {
         `  - "All X-family genes" or other broad set → pick the candidate with the LARGEST num_genes,`,
         `    not the highest-ranked. InterPro/domain matches (fq_field=domains__ancestors) often`,
         `    give the cleanest, broadest scope. Example: 'lipoxygenase' → InterPro 'LipOase' with`,
-        `    fq_field=domains__ancestors covers ~1488 genes across 123 genomes.`,
+        `    fq_field=domains__ancestors covers every member in every genome (on SorghumBase,`,
+        `    about 1,500 genes across more than 100 genomes).`,
         ``,
         `IMPORTANT — looking up pathways and species:`,
         `  'term' ranks across all categories and is dominated by InterPro/GO. Pathway and species`,
         `  hits often miss the top. For exact lookups, use 'q' with a field-qualified match:`,
         `    Pathway:    q='name:"Jasmonic acid biosynthesis"'  → fq_field=pathways__ancestors`,
         `    Species:    q='name:"Sorghum bicolor"'             → fq_field=taxonomy__ancestors`,
-        `    TO term:    q='name:"plant height"' fq=['category:Trait Ontology']`,
+        `    TO term:    q='name:"plant height"' fq=['category:"Trait ontology"']`,
         `  Then use the returned fq_field + fq_value directly as fq filters in solr_search.`,
         ``,
         `Canonical two-step pattern for "genes in pathway X in species Y":`,
@@ -2874,9 +3106,10 @@ const TOOL_REGISTRY = {
         properties: {
           term: { type: "string", description: "Free-text search term — handed verbatim to the API's boosted suggester." },
           q:    { type: "string", description: "Field-qualified Solr query (e.g. 'name:\"Sorghum bicolor\"'). Overridden by 'term' if both are provided." },
-          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:Trait Ontology'])." },
+          fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:\"Trait ontology\"']). Category names are case-sensitive and must be quoted when they contain a space." },
           rows: { type: "integer", minimum: 0, maximum: 1000, description: "Max results to return (default 10)." },
           start: { type: "integer", minimum: 0, description: "Offset for pagination." },
+          include_taxa: { type: "boolean", description: "Return each suggestion's full taxon_id / taxon_freq arrays. By default a suggestion found in more than 8 genomes carries n_genomes and top_genomes (the five genomes with most genes) instead." },
         },
       },
     },
@@ -2929,7 +3162,9 @@ const TOOL_REGISTRY = {
         "index) instead.",
         "",
         "Common patterns:",
-        "  - Genome assembly metadata (Compara membership): filter:{ in_compara: true } on 'maps'",
+        "  - Genome assembly metadata (Compara membership): call 'maps' with NO filter and read",
+        "    in_compara on each document. Boolean values cannot be filtered: filter:{ in_compara: true }",
+        "    returns nothing.",
         "  - Ontology term lookup by ID: prefer mongo_lookup_by_ids over an ad-hoc find().",
         "  - Experiment metadata: filter:{ _id: { $in: [<exp_ids>] } } on 'experiments' or 'assays'",
         "",
@@ -3052,9 +3287,12 @@ const TOOL_REGISTRY = {
         `Returns genes where gene.start ≤ end AND gene.end ≥ start on the given region (chromosome).`,
         `Useful as the first step in QTL candidate gene analysis.`,
         ``,
-        `Species filter: pass the plain NCBI taxon ID via 'taxon_id' — it is applied internally`,
-        `as taxonomy__ancestors:<id>, matching all subspecies and assemblies under that taxon.`,
-        `Do NOT pass the NCBI×1000+suffix encoding (e.g. 4558001); use the plain ID (e.g. 4558).`,
+        `'map' is required: it names the assembly the coordinates are on (the _id of a 'maps'`,
+        `document, e.g. 'GCA_000003195.3'). Genomic coordinates are not stable across assemblies,`,
+        `so an interval is only meaningful on one. Find it with mongo_find(collection:'maps'), or`,
+        `read it from the record the interval came from: a gene's location.map, a QTL's location.map.`,
+        `An assembly can carry more than one annotation set (rice Nipponbare has three); request`,
+        `system_name in 'fl' to tell them apart.`,
         ``,
         `Key fields to request via 'fl':`,
         `  id, name, biotype, start, end, strand, system_name`,
@@ -3069,13 +3307,12 @@ const TOOL_REGISTRY = {
           region:   { type: "string",  description: "Chromosome / scaffold name (e.g. '6', 'Chr01')." },
           start:    { type: "integer", description: "Interval start coordinate (bp, inclusive)." },
           end:      { type: "integer", description: "Interval end coordinate (bp, inclusive)." },
-          taxon_id: { type: "integer", description: "Plain NCBI taxon ID (e.g. 4558 for Sorghum bicolor). Applied as taxonomy__ancestors filter; matches all subspecies/assemblies." },
-          map:      { type: "string",  description: "Assembly accession to filter by (e.g. 'GCA_000003195.3')." },
+          map:      { type: "string",  description: "Assembly the coordinates are on: the _id of a 'maps' document (e.g. 'GCA_000003195.3')." },
           fl:       { type: "string",  description: "Comma-separated Solr field list to return." },
           rows:     { type: "integer", minimum: 0, maximum: 1000, description: "Max genes to return (default 200)." },
           sort:     { type: "string",  description: "Sort clause, e.g. 'start asc'." },
         },
-        required: ["region", "start", "end"],
+        required: ["region", "start", "end", "map"],
       },
     },
     handler: tool_genes_in_region,
@@ -3102,6 +3339,24 @@ const TOOL_REGISTRY = {
         `                          contrast[]      — factor types whose value differs between`,
         `                                             control and treatment ({type, control, treatment})`,
         `                          shared_factors[] — factor types with identical values in both assays`,
+        ``,
+        `Result size (detail): one gene can have hundreds of sample rows. With detail:"auto"`,
+        `(default) the rows above are returned only when they total under about 25 kB;`,
+        `otherwise each gene gets a summary and the response says detail:"summary":`,
+        `  experiments[]         — { experiment, experiment_name } for the rows that were read`,
+        `  baseline_summary      — { n_rows, n_tissues, by_tissue: [{ tissue, n_samples, n_experiments,`,
+        `                            max, median, max_in: { experiment, experiment_name, group, factors } }] }`,
+        `                          max_in is the single sample behind max; its factors give the stage,`,
+        `                          cultivar or treatment. A tissue of "unspecified" means the sample has`,
+        `                          no organism-part label — read max_in.factors instead. Compare max with`,
+        `                          median: a high max with a low median is one outlying sample.`,
+        `                          sorted by max, so the first entry is where the gene peaks; the 20`,
+        `                          highest tissues are listed (tissues_not_listed counts the rest)`,
+        `  differential_summary  — { n_contrasts, n_significant, n_up, n_down, top_significant[] }`,
+        `                          significant = p_value < 0.05 and |l2fc| >= 1; top_significant`,
+        `                          lists the 12 largest fold changes with experiment, tissue and contrast`,
+        `Use detail:"summary" to always summarise, or detail:"full" for the rows — then narrow the`,
+        `request (experiment_type, po_terms, taxon_id, fewer genes) or the result may be too large.`,
         ``,
         `Filters:`,
         `  experiment_type = "Baseline" | "Differential" — narrow the field set returned.`,
@@ -3148,6 +3403,11 @@ const TOOL_REGISTRY = {
             items: { type: "integer" },
             description: "PO term int IDs to restrict to trait-relevant tissues/conditions. E.g. [9001, 9089] for grain/endosperm.",
           },
+          detail: {
+            type: "string",
+            enum: ["auto", "summary", "full"],
+            description: "auto (default): every row when they total under about 25 kB, otherwise a per-tissue / per-contrast summary. summary: always summarise. full: always return every row.",
+          },
         },
         required: ["gene_ids"],
       },
@@ -3171,6 +3431,11 @@ const TOOL_REGISTRY = {
         ``,
         `Also returns the merged EMS and NAT totals from VEP__merged__EMS/NAT__attr_ss.`,
         ``,
+        `Result size: each group reports its full 'count' but lists only the first`,
+        `max_accessions accessions (default ${VEP_DEFAULT_ACCESSIONS}; 'accessions_listed' marks a shortened group).`,
+        `A common gene can have over a thousand carriers. Use max_accessions:0 for counts only,`,
+        `or raise it (up to ${VEP_MAX_ACCESSIONS}) when the user needs the full list for one gene.`,
+        ``,
         `Germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) is enriched`,
         `from the /germplasm collection endpoint when available.`,
         ``,
@@ -3189,7 +3454,13 @@ const TOOL_REGISTRY = {
           },
           include_germplasm_details: {
             type: "boolean",
-            description: "Whether to enrich accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from the /germplasm endpoint. Default true. Set false for a count-only summary.",
+            description: "Whether to enrich the listed accession IDs with germplasm metadata (pub_id, stock_center, subpopulation, genebank URL) from the /germplasm endpoint. Default true. False returns bare accession IDs; it does not shorten the lists (use max_accessions for that).",
+          },
+          max_accessions: {
+            type: "integer",
+            minimum: 0,
+            maximum: VEP_MAX_ACCESSIONS,
+            description: `Accessions listed per consequence/zygosity/study group. Default ${VEP_DEFAULT_ACCESSIONS}. 0 = counts only. Each group's 'count' is the full number regardless.`,
           },
         },
         required: ["gene_ids"],
@@ -3319,7 +3590,7 @@ fetching detail records once you already have a specific ID.
 | Single gene by ID ("tell me about SORBI_…") | \`solr_search\` (q="id:…") | — (build a gene card) |
 | Gene name / function lookup | \`solr_suggest\` (term=) | \`gene_lookup\` |
 | "Genes in pathway X for species Y" | \`solr_suggest\` (q= for pathway and species) | \`pathway_genes\` |
-| Trait → QTL discovery ("QTLs for plant height") | \`solr_suggest\` (q='name:"…"' fq='category:Trait Ontology') | \`qtl_discovery\` |
+| Trait → QTL discovery ("QTLs for plant height") | \`solr_suggest\` (q='name:"…"' fq='category:"Trait ontology"') | \`qtl_discovery\` |
 | QTL interval / trait candidate analysis | \`genes_in_region\` | \`qtl_candidate_ranking\` |
 | "What's known about gene X?" | \`solr_search\` for metadata | \`literature_search\` |
 | Cross-species comparison for a gene | \`solr_search\` for \`gene_tree\` | \`cross_species_comparison\`, \`orthologs_paralogs\` |
@@ -3339,8 +3610,8 @@ two frequency arrays.
 **Taxon ID — use the plain NCBI ID.**
 - Filter with \`taxonomy__ancestors:<plain NCBI id>\` (e.g. \`4558\` sorghum,
   \`3702\` Arabidopsis, \`39947\` rice). Matches all subspecies/assemblies.
-- The \`genes_in_region\` \`taxon_id\` parameter takes the plain NCBI ID and
-  applies it as \`taxonomy__ancestors\` internally.
+- \`genes_in_region\` takes no taxon: it requires \`map\`, the assembly the
+  coordinates are on (a \`maps\` _id such as \`GCA_000003195.3\`).
 - The Solr \`taxon_id\` *field* on individual gene documents uses
   NCBI×1000+suffix (e.g. \`4558001\` for sorghum BTx623). Avoid filtering on
   it directly unless you specifically need a single assembly.
@@ -3545,6 +3816,7 @@ InterPro/GO and may not surface Reactome entries.
         { name: "start", description: "Interval start (bp, inclusive).", required: false },
         { name: "end", description: "Interval end (bp, inclusive).", required: false },
         { name: "taxon_id", description: "Plain NCBI taxon ID for the species (e.g. 4558 for sorghum). Applied as taxonomy__ancestors filter.", required: true },
+        { name: "map", description: "Assembly the interval's coordinates are on (a maps _id, e.g. 'GCA_000003195.3'). Required by genes_in_region; a QTL record carries it as location.map.", required: false },
       ],
     },
     template: `# Workflow: QTL candidate gene ranking
@@ -3563,7 +3835,7 @@ InterPro/GO and may not surface Reactome entries.
 ## Step 0 — Resolve the trait if only a name is known
 If the user gave a trait name rather than a TO ID:
 \`\`\`
-solr_suggest(q: 'name:"<trait>"', fq: ['category:Trait Ontology'])
+solr_suggest(q: 'name:"<trait>"', fq: ['category:"Trait ontology"'])
   → returns fq_value (TO integer ID) and the canonical TO:NNNNNNN string
 \`\`\`
 
@@ -3581,7 +3853,7 @@ genes_in_region(
   region: "{{region}}",
   start: {{start}},
   end: {{end}},
-  taxon_id: {{taxon_id}},
+  map: "{{map}}",   # assembly the coordinates are on; if blank, use the QTL's location.map or look it up in mongo maps
   fl: "id,name,biotype,start,end,gene_tree,TO__ancestors,GO__ancestors,compara_idx_multi,closest_rep_id,closest_rep_name,closest_rep_description,model_rep_id,model_rep_name,model_rep_description"
 )
 \`\`\`
@@ -4019,7 +4291,7 @@ questions; use the chained-graph variant when you also want ±10-gene
 neighborhood context, or to seed from any homolog rather than the gene tree.
 
 **Caveat:** not all genomes participated in the Compara gene tree analysis.
-Always check the \`maps\` MongoDB collection (\`in_compara: true\`) to get
+Always read \`in_compara\` from the \`maps\` MongoDB collection (fetched unfiltered) to get
 the genomes that *should* have homology data — that is the denominator when
 interpreting absence.
 
@@ -4036,8 +4308,9 @@ solr_search(q: "id:{{gene_id}}",
   → extract gene_tree id
 
 # 2. Genomes that participated in Compara (denominator)
-mongo_find(collection: "maps", filter: { in_compara: true },
-           projection: { _id: 1, name: 1, system_name: 1 })
+mongo_find(collection: "maps",
+           projection: { _id: 1, system_name: 1, in_compara: 1 })
+  → keep the documents with in_compara true (a boolean filter returns nothing)
 
 # 3. Facet members of the family by genome
 solr_search(q: "gene_tree:<tree_id>", rows: 0,
@@ -4190,7 +4463,7 @@ solr_search(
 \`\`\`
 solr_suggest(
   q:  'name:"{{trait}}"',
-  fq: ['category:Trait Ontology']
+  fq: ['category:"Trait ontology"']
 )
   → returns one or more matches; each has fq_field=TO__ancestors and
     fq_value=<TO integer id>. Note also the canonical TO:NNNNNNN string.
@@ -4198,7 +4471,7 @@ solr_suggest(
 
 If the exact name doesn't match, fall back to a fuzzy term lookup:
 \`\`\`
-solr_suggest(term: "{{trait}}", fq: ['category:Trait Ontology'])
+solr_suggest(term: "{{trait}}", fq: ['category:"Trait ontology"'])
 \`\`\`
 
 ## Step 2 — List QTLs annotated with that TO term

@@ -176,6 +176,83 @@ describe("gene_tree_view MCP App", () => {
   });
 });
 
+// ─── Facets, stats and suggestions that the API only half-forwards ───
+// The Gramene API passes facet.field, json.facet and stats.field to Solr and
+// drops the rest, so the server rewrites facet options into those three.
+
+describe("facet and stats translation", () => {
+  it("flat facet honours limit:-1 and mincount", async () => {
+    const all = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: "*:*", rows: 0, facet: { field: "system_name", limit: -1, mincount: 1 } } }));
+    const flat = all.facet_counts.facet_fields.system_name;
+    assert.ok(flat.length / 2 > 100, `Expected more than Solr's default 100 values, got ${flat.length / 2}`);
+    assert.ok(flat.every((v, i) => i % 2 === 0 || v > 0), "mincount:1 must drop zero counts");
+  });
+
+  it("pivot facet returns facet_pivot", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0, facet: { pivot: "gene_tree,system_name" } } }));
+    const [top] = res.facet_counts.facet_pivot["gene_tree,system_name"];
+    assert.equal(top.field, "gene_tree");
+    assert.equal(top.value, REAL.geneTree);
+    assert.ok(top.pivot.length > 1 && top.pivot[0].field === "system_name");
+  });
+
+  it("range facet returns facet_ranges", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0,
+      facet: { range: { field: "start", start: 0, end: 100000000, gap: 50000000, other: "after" } } } }));
+    const r = res.facet_counts.facet_ranges.start;
+    assert.deepEqual(r.counts.filter((_, i) => i % 2 === 0), [0, 50000000]);
+    assert.equal(typeof r.after, "number");
+  });
+
+  it("stats percentiles come back with the default statistics", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0, stats: { field: "start", percentiles: "25,50,75" } } }));
+    const st = res.stats.stats_fields.start;
+    assert.equal(st.percentiles.length, 6);
+    assert.equal(typeof st.mean, "number");
+  });
+
+  it("a top-level OR in q finds both genes", async () => {
+    const ids = [REAL.geneId, "AT1G17420"];
+    for (const q of [`id:${ids[0]} OR id:${ids[1]}`, `id:(${ids[0]} OR ${ids[1]})`]) {
+      const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: { q, fl: "id", rows: 5 } }));
+      assert.deepEqual(res.response.docs.map((d) => d.id).sort(), [...ids].sort(), q);
+    }
+  });
+
+  it("expand_gene_set accepts several seeds and counts them in the result", async () => {
+    const one = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0 } }));
+    const two = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId, "AT5G10140"], mode: "orthologs", rows: 0 } }));
+    assert.ok(one.n_genes > 1, "Expected orthologs for one seed");
+    assert.ok(two.n_genes > one.n_genes, "A second seed from another family must add genes");
+    const off = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0, facet_by_genome: false } }));
+    assert.equal(off.n_genomes, undefined);
+    assert.equal(off.n_genes, one.n_genes);
+  });
+
+  it("expand_gene_set lists every genome, zeros included", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0 } }));
+    assert.ok(res.by_genome.length > 100, `Expected every genome, got ${res.by_genome.length}`);
+    assert.equal(res.n_genomes, res.by_genome.filter((g) => g.n_genes > 0).length);
+  });
+
+  it("solr_suggest replaces long genome lists with a summary", async () => {
+    const slim = toolResult(await rpc("tools/call", { name: "solr_suggest", arguments: { term: "lipoxygenase" } }));
+    const docs = slim.grouped.category.groups.flatMap((g) => g.doclist.docs);
+    assert.ok(docs.every((d) => !Array.isArray(d.taxon_id) || d.taxon_id.length <= 8));
+    assert.ok(docs.some((d) => d.n_genomes > 8 && d.top_genomes.length === 5));
+    const full = toolResult(await rpc("tools/call", { name: "solr_suggest", arguments: { term: "lipoxygenase", include_taxa: true } }));
+    assert.ok(full.grouped.category.groups.flatMap((g) => g.doclist.docs).some((d) => d.taxon_id?.length > 8));
+  });
+});
+
 // ─── HTTP edge cases ─────────────────────────────────────────────────
 
 describe("HTTP edge cases", () => {
@@ -577,8 +654,8 @@ describe("solr_graph", () => {
 // ─── genes_in_region ─────────────────────────────────────────────────
 
 describe("genes_in_region", () => {
-  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb in sorghum bicolor (taxon 4558)
-  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, taxon_id: 4558 };
+  // msd2 (SORBI_3006G095600) is on chr 6, ~46.57 Mb of sorghum BTx623 v3.
+  const MSD2_REGION = { region: "6", start: 46500000, end: 46650000, map: "GCA_000003195.3" };
 
   it("returns a valid Solr response envelope", async () => {
     const res = await rpc("tools/call", {
@@ -601,25 +678,31 @@ describe("genes_in_region", () => {
     assert.ok(ids.includes(REAL.geneId), `Expected ${REAL.geneId} in region results`);
   });
 
-  it("returns fewer genes when taxon_id narrows to sorghum only", async () => {
-    const [all, sorghum] = await Promise.all([
-      rpc("tools/call", { name: "genes_in_region", arguments: { region: MSD2_REGION.region, start: MSD2_REGION.start, end: MSD2_REGION.end, rows: 0 } }),
-      rpc("tools/call", { name: "genes_in_region", arguments: { ...MSD2_REGION, rows: 0 } }),
-    ]);
-    const nAll     = toolResult(all).response.numFound;
-    const nSorghum = toolResult(sorghum).response.numFound;
-    assert.ok(nAll > 0,           "Expected genes without taxon filter");
-    assert.ok(nSorghum > 0,       "Expected sorghum genes in region");
-    assert.ok(nSorghum <= nAll,   "Taxon filter should not increase count");
+  it("returns only genes on the named assembly", async () => {
+    const res = await rpc("tools/call", {
+      name: "genes_in_region",
+      arguments: { ...MSD2_REGION, fl: "id,map", rows: 100 },
+    });
+    const docs = toolResult(res).response.docs;
+    assert.ok(docs.length > 0, "Expected genes in the interval");
+    assert.ok(docs.every((d) => d.map === MSD2_REGION.map), "Every gene must be on the requested map");
   });
 
   it("returns empty for a non-existent region", async () => {
     const res = await rpc("tools/call", {
       name: "genes_in_region",
-      arguments: { region: "99", start: 1, end: 1000 },
+      arguments: { region: "99", start: 1, end: 1000, map: MSD2_REGION.map },
     });
     const data = toolResult(res);
     assert.equal(data.response.numFound, 0);
+  });
+
+  it("missing map → tool error that says how to find one", async () => {
+    const res = await rpc("tools/call", {
+      name: "genes_in_region",
+      arguments: { region: "6", start: 46500000, end: 46650000 },
+    });
+    assert.match(res.error?.message || "", /requires 'map'/);
   });
 
   it("missing required fields → tool error", async () => {
@@ -637,7 +720,7 @@ describe("expression_for_genes", () => {
   it("returns expression data for a known sorghum gene", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId] },
+      arguments: { detail: "full", gene_ids: [REAL.geneId] },
     });
     const data = toolResult(res);
     assert.equal(data.gene_count, 1, "Expected gene_count to reflect requested gene_ids");
@@ -654,7 +737,7 @@ describe("expression_for_genes", () => {
   it("baseline rows expose value, tissue, and factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline" },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline" },
     });
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
@@ -672,7 +755,7 @@ describe("expression_for_genes", () => {
   it("differential rows expose contrast structure with control + treatment factors", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Differential" },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Differential" },
     });
     const data = toolResult(res);
     const gene = data.genes?.[REAL.geneId];
@@ -694,8 +777,8 @@ describe("expression_for_genes", () => {
 
   it("taxon_id filter reduces experiment count", async () => {
     const [all, sorghum] = await Promise.all([
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId] } }),
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], taxon_id: 4558 } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], taxon_id: 4558 } }),
     ]);
     const nAll    = toolResult(all).experiment_count;
     const nSorghum = toolResult(sorghum).experiment_count;
@@ -707,8 +790,8 @@ describe("expression_for_genes", () => {
   it("po_terms filter restricts to tissue-matched assays", async () => {
     // PO:0009001 (int_id 9001) = fruit/grain
     const [all, grain] = await Promise.all([
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline" } }),
-      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [9001] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline" } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { detail: "full", detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [9001] } }),
     ]);
     const allBaseline   = toolResult(all).genes?.[REAL.geneId]?.baseline ?? [];
     const grainBaseline = toolResult(grain).genes?.[REAL.geneId]?.baseline ?? [];
@@ -723,7 +806,7 @@ describe("expression_for_genes", () => {
     // but its ancestors include endosperm (9089) which does match.
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [5360] },
+      arguments: { detail: "full", gene_ids: [REAL.geneId], experiment_type: "Baseline", po_terms: [5360] },
     });
     const data = toolResult(res);
     assert.ok(data.po_filter, "Expected po_filter metadata");
@@ -737,7 +820,7 @@ describe("expression_for_genes", () => {
   it("non-existent gene returns an empty entry, not a missing one", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: ["FAKE_GENE_DOES_NOT_EXIST_XYZ"] },
+      arguments: { detail: "full", gene_ids: ["FAKE_GENE_DOES_NOT_EXIST_XYZ"] },
     });
     const data = toolResult(res);
     assert.equal(data.gene_count, 1, "gene_count counts requested ids, not Solr matches");
@@ -751,7 +834,7 @@ describe("expression_for_genes", () => {
   it("empty gene_ids → tool error", async () => {
     const res = await rpc("tools/call", {
       name: "expression_for_genes",
-      arguments: { gene_ids: [] },
+      arguments: { detail: "full", gene_ids: [] },
     });
     assert.ok(res.error || res.result?.isError, "Expected error for empty gene_ids");
   });
@@ -832,6 +915,47 @@ describe("solr_search — facets", () => {
 // For nested counts, build a `json.facet` clause and pass it through solr_search.
 // (No automated tests cover that here — verify by hand against your dataset.)
 
+
+describe("expression_for_genes — summary mode", () => {
+  it("detail:summary collapses rows by tissue and contrast", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "summary" } }));
+    assert.equal(data.detail, "summary");
+    const gene = data.genes[REAL.geneId];
+    assert.equal(gene.baseline, undefined, "summary must not carry the row arrays");
+    const tissues = gene.baseline_summary.by_tissue;
+    assert.ok(tissues.length > 0, "Expected per-tissue rows");
+    assert.ok(tissues.every((x, i) => i === 0 || tissues[i - 1].max >= x.max), "by_tissue must be sorted by max");
+    assert.ok(tissues[0].max_in.experiment.startsWith("E-"));
+    assert.ok(Array.isArray(tissues[0].max_in.factors), "max_in should carry the sample's factors");
+    assert.ok(tissues.length <= 20);
+    assert.equal(gene.baseline_summary.n_tissues, tissues.length + (gene.baseline_summary.tissues_not_listed ?? 0));
+    assert.ok(gene.baseline_summary.n_rows >= tissues.reduce((n, x) => n + x.n_samples, 0));
+    const d = gene.differential_summary;
+    assert.equal(d.n_significant, d.n_up + d.n_down);
+    assert.ok(d.top_significant.length <= 12);
+  });
+
+  it("detail:auto summarises a large result and stays small", async () => {
+    const [auto, full] = await Promise.all([
+      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId] } }),
+      rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "full" } }),
+    ]);
+    const big = JSON.stringify(toolResult(full).genes).length > 25000;
+    assert.equal(toolResult(auto).detail, big ? "summary" : "full");
+    if (big) {
+      assert.ok(auto.result.content[0].text.length < full.result.content[0].text.length / 2,
+        "summary should be much smaller than the rows");
+    }
+  });
+
+  it("rejects an unknown detail value", async () => {
+    const res = await rpc("tools/call", {
+      name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "everything" } });
+    assert.ok(res.error, "Expected a tool error");
+  });
+});
+
 // ─── vep_for_gene ─────────────────────────────────────────────────────
 
 describe("vep_for_gene — tool registration", () => {
@@ -874,6 +998,38 @@ describe("vep_for_gene — shape", () => {
     assert.ok(Array.isArray(gene.groups), "Expected groups array");
   });
 });
+describe("vep_for_gene — max_accessions", () => {
+  it("max_accessions:0 keeps the counts and lists no accessions", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], max_accessions: 0 } }));
+    for (const grp of data.genes[REAL.geneId].groups) {
+      assert.equal(grp.accessions.length, 0);
+      assert.ok(grp.count > 0);
+      assert.equal(grp.accessions_listed, 0);
+    }
+  });
+
+  it("the default lists at most 20 accessions per group but reports the full count", async () => {
+    const data = toolResult(await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], include_germplasm_details: false } }));
+    const g = data.genes[REAL.geneId];
+    for (const grp of g.groups) {
+      assert.ok(grp.accessions.length <= 20);
+      assert.equal(grp.accessions.length, Math.min(20, grp.count));
+    }
+    if (g.groups.length) {
+      const listed = g.groups.reduce((n, grp) => n + grp.count, 0);
+      assert.ok(listed >= g.summary.total_lof_accessions || g.summary.total_lof_accessions > 0);
+    }
+  });
+
+  it("rejects a negative max_accessions", async () => {
+    const res = await rpc("tools/call", {
+      name: "vep_for_gene", arguments: { gene_ids: [REAL.geneId], max_accessions: -1 } });
+    assert.ok(res.error, "Expected a tool error");
+  });
+});
+
 // ─── pubmed_for_genes ────────────────────────────────────────────────
 
 describe("pubmed_for_genes", () => {
@@ -1073,7 +1229,7 @@ const SB11 = {
   gene:      "SORBI_3001G000200",   // minus strand, exons emit start>end in BED
   midGene:   "SORBI_3001G100000",   // gene_idx 1059, compara_idx 1028 — different spaces
   legacyId:  "Sb01g000200",         // resolves to SORBI_3001G000100
-  rsidLarge: "rs872208282",         // 327 genes across 100 genomes
+  rsidLarge: "rs872208282",         // 327 genes across 102 genomes
   map:       "GCA_000003195.3",
 };
 
@@ -1109,8 +1265,10 @@ describe("SorghumBase v11 tools", () => {
     if (!(await sb11())) return t.skip();
     const out = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge }));
     assert.equal(out.n_genes, 327);
-    assert.equal(out.n_genomes, 100);
-    assert.equal(out.by_genome.length, 100);
+    // 102, not 100: the per-genome facet used to stop at Solr's default limit.
+    assert.equal(out.n_genomes, 102);
+    assert.equal(out.by_genome.length, 102);
+    assert.equal(out.by_genome.reduce((n, g) => n + g.n_genes, 0), out.n_genes);
     assert.ok(out.sample_genes.length <= 5);
   });
 

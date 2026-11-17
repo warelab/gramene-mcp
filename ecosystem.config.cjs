@@ -44,6 +44,22 @@ module.exports = {
               "plus outgroups (Leersia, maize, sorghum, Arabidopsis, grape, Selaginella, " +
               "Chlamydomonas, Drosophila).",
           },
+          {
+            id: "maize_v6",
+            apiBase: "https://data.gramene.org/maize_v6",
+            description:
+              "Gramene Maize release 6: a maize pan-genome resource with 56 Zea genomes " +
+              "plus outgroups (sorghum, rice, Arabidopsis, grape, Selaginella, " +
+              "Chlamydomonas, Drosophila).",
+          },
+          {
+            id: "grapevine_v5",
+            apiBase: "https://data.gramene.org/grapevine_v5",
+            description:
+              "Gramene Grapevine release 5: a grapevine pan-genome resource with 30 Vitis genomes " +
+              "plus outgroups (Arabidopsis, tomato, rice, sorghum, Selaginella, " +
+              "Chlamydomonas, Drosophila).",
+          },
         ]),
         MCP_HOST: "squam.cshl.edu",
         MCP_PORT: "11065",
