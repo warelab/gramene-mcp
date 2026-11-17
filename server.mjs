@@ -100,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.6.3";
+const SERVER_VERSION = "0.6.4";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -1404,7 +1404,7 @@ async function tool_expression_for_genes(args, site) {
         const exp = experimentDocs.get(ref.experiment);
         baseline.push({
           experiment:      ref.experiment,
-          experiment_name: exp?.name ?? null,
+          experiment_name: experimentLabel(exp),
           group:           ref.group,
           value:           ref.value,
           tissue:          assayTissue(assay),
@@ -1435,7 +1435,7 @@ async function tool_expression_for_genes(args, site) {
         const { contrast, shared } = diffAssayFactors(cAssay, tAssay);
         differential.push({
           experiment:      slot.experiment,
-          experiment_name: exp?.name ?? null,
+          experiment_name: experimentLabel(exp),
           control_group:   slot.control_group,
           treatment_group: slot.treatment_group,
           control_tissue:    assayTissue(cAssay),
@@ -1487,7 +1487,8 @@ async function tool_expression_for_genes(args, site) {
   // modest row count, hand back per-tissue and per-contrast summaries instead
   // unless the caller asked for the rows.
   const totalRows = Object.values(genes).reduce((n, g) => n + g.baseline.length + g.differential.length, 0);
-  const summarize = detail === "summary" || (detail === "auto" && totalRows > EXPRESSION_AUTO_FULL_ROWS);
+  const summarize = detail === "summary" ||
+    (detail === "auto" && Buffer.byteLength(JSON.stringify(genes)) > EXPRESSION_AUTO_FULL_BYTES);
   if (summarize) {
     for (const [id, g] of Object.entries(genes)) genes[id] = summarizeExpression(g);
   }
@@ -1507,8 +1508,18 @@ async function tool_expression_for_genes(args, site) {
   return result;
 }
 
-// Row count up to which detail:"auto" returns every row (about 25 kB).
-const EXPRESSION_AUTO_FULL_ROWS = 60;
+// Size up to which detail:"auto" returns every row. Measured in bytes, not
+// rows: a differential row carries both assays' factors and runs ~1.7 kB,
+// four times a baseline row.
+const EXPRESSION_AUTO_FULL_BYTES = 25_000;
+
+// Differential experiments have no short `name`, only a long description.
+function experimentLabel(exp) {
+  if (!exp) return null;
+  if (exp.name) return exp.name;
+  const d = typeof exp.description === "string" ? exp.description.trim() : "";
+  return d ? (d.length > 140 ? `${d.slice(0, 137)}…` : d) : null;
+}
 const EXPRESSION_TOP_CONTRASTS = 12;
 const EXPRESSION_TOP_TISSUES = 20;
 
@@ -1536,7 +1547,12 @@ function summarizeExpression(g) {
       n_experiments: new Set(rows.map((r) => r.experiment)).size,
       max: round(Number(top.value)),
       median: round(median(rows.map((r) => Number(r.value)))),
-      max_in: { experiment: top.experiment, experiment_name: top.experiment_name, group: top.group },
+      // The sample behind `max`, with its factors: a tissue label alone does
+      // not say which stage, cultivar or treatment gave the value.
+      max_in: {
+        experiment: top.experiment, experiment_name: top.experiment_name, group: top.group,
+        factors: (top.factors || []).map((f) => `${f.type}: ${f.label}`),
+      },
     };
   }).sort((a, b) => b.max - a.max);
 
@@ -3325,11 +3341,15 @@ const TOOL_REGISTRY = {
         `                          shared_factors[] — factor types with identical values in both assays`,
         ``,
         `Result size (detail): one gene can have hundreds of sample rows. With detail:"auto"`,
-        `(default) the rows above are returned only when there are at most 60 in total;`,
+        `(default) the rows above are returned only when they total under about 25 kB;`,
         `otherwise each gene gets a summary and the response says detail:"summary":`,
         `  experiments[]         — { experiment, experiment_name } for the rows that were read`,
         `  baseline_summary      — { n_rows, n_tissues, by_tissue: [{ tissue, n_samples, n_experiments,`,
-        `                            max, median, max_in: { experiment, experiment_name, group } }] }`,
+        `                            max, median, max_in: { experiment, experiment_name, group, factors } }] }`,
+        `                          max_in is the single sample behind max; its factors give the stage,`,
+        `                          cultivar or treatment. A tissue of "unspecified" means the sample has`,
+        `                          no organism-part label — read max_in.factors instead. Compare max with`,
+        `                          median: a high max with a low median is one outlying sample.`,
         `                          sorted by max, so the first entry is where the gene peaks; the 20`,
         `                          highest tissues are listed (tissues_not_listed counts the rest)`,
         `  differential_summary  — { n_contrasts, n_significant, n_up, n_down, top_significant[] }`,
@@ -3386,7 +3406,7 @@ const TOOL_REGISTRY = {
           detail: {
             type: "string",
             enum: ["auto", "summary", "full"],
-            description: "auto (default): every row when there are at most 60, otherwise a per-tissue / per-contrast summary. summary: always summarise. full: always return every row.",
+            description: "auto (default): every row when they total under about 25 kB, otherwise a per-tissue / per-contrast summary. summary: always summarise. full: always return every row.",
           },
         },
         required: ["gene_ids"],

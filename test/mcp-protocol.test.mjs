@@ -927,6 +927,7 @@ describe("expression_for_genes — summary mode", () => {
     assert.ok(tissues.length > 0, "Expected per-tissue rows");
     assert.ok(tissues.every((x, i) => i === 0 || tissues[i - 1].max >= x.max), "by_tissue must be sorted by max");
     assert.ok(tissues[0].max_in.experiment.startsWith("E-"));
+    assert.ok(Array.isArray(tissues[0].max_in.factors), "max_in should carry the sample's factors");
     assert.ok(tissues.length <= 20);
     assert.equal(gene.baseline_summary.n_tissues, tissues.length + (gene.baseline_summary.tissues_not_listed ?? 0));
     assert.ok(gene.baseline_summary.n_rows >= tissues.reduce((n, x) => n + x.n_samples, 0));
@@ -940,10 +941,9 @@ describe("expression_for_genes — summary mode", () => {
       rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId] } }),
       rpc("tools/call", { name: "expression_for_genes", arguments: { gene_ids: [REAL.geneId], detail: "full" } }),
     ]);
-    const f = toolResult(full).genes[REAL.geneId];
-    const rows = f.baseline.length + f.differential.length;
-    assert.equal(toolResult(auto).detail, rows > 60 ? "summary" : "full");
-    if (rows > 60) {
+    const big = JSON.stringify(toolResult(full).genes).length > 25000;
+    assert.equal(toolResult(auto).detail, big ? "summary" : "full");
+    if (big) {
       assert.ok(auto.result.content[0].text.length < full.result.content[0].text.length / 2,
         "summary should be much smaller than the rows");
     }
