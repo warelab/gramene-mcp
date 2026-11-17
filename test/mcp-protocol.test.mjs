@@ -1129,7 +1129,7 @@ const SB11 = {
   gene:      "SORBI_3001G000200",   // minus strand, exons emit start>end in BED
   midGene:   "SORBI_3001G100000",   // gene_idx 1059, compara_idx 1028 — different spaces
   legacyId:  "Sb01g000200",         // resolves to SORBI_3001G000100
-  rsidLarge: "rs872208282",         // 327 genes across 100 genomes
+  rsidLarge: "rs872208282",         // 327 genes across 102 genomes
   map:       "GCA_000003195.3",
 };
 
@@ -1165,8 +1165,10 @@ describe("SorghumBase v11 tools", () => {
     if (!(await sb11())) return t.skip();
     const out = toolResult(await callTool("variant_genes", { rsid: SB11.rsidLarge }));
     assert.equal(out.n_genes, 327);
-    assert.equal(out.n_genomes, 100);
-    assert.equal(out.by_genome.length, 100);
+    // 102, not 100: the per-genome facet used to stop at Solr's default limit.
+    assert.equal(out.n_genomes, 102);
+    assert.equal(out.by_genome.length, 102);
+    assert.equal(out.by_genome.reduce((n, g) => n + g.n_genes, 0), out.n_genes);
     assert.ok(out.sample_genes.length <= 5);
   });
 
