@@ -100,7 +100,7 @@ function siteInstructions(site) {
 // want to inspect transport, protocol versions, and capabilities without an
 // initialize round-trip — modeled on https://pubmed.caseyjhand.com/mcp).
 const SERVER_NAME = "gramene-mcp";
-const SERVER_VERSION = "0.6.0";
+const SERVER_VERSION = "0.6.1";
 const SERVER_DESCRIPTION =
   "MCP server bridging AI agents to the Gramene plant genomics database " +
   "via the public REST API at data.gramene.org. Tools cover gene search, " +
@@ -710,60 +710,112 @@ async function searchFetch(site, args) {
     throw new Error("search requires a non-empty string 'q'");
   }
 
-  // Classic Solr field faceting — expand the 'facet' convenience object into
-  // individual URL params (facet=true, facet.field=X, facet.pivot=A,B, etc.)
+  // Faceting and stats. The Gramene API forwards only `facet.field`,
+  // `json.facet` and `stats.field` to Solr; every other facet.* / f.<field>.*
+  // parameter is dropped without an error. So:
+  //   - per-field options (limit, mincount, missing) ride along as local
+  //     params on facet.field — `{!facet.limit=-1 facet.mincount=1}field`;
+  //   - pivot and range facets are sent as json.facet and their response is
+  //     folded back into the classic facet_counts.facet_pivot / facet_ranges
+  //     shapes (see foldJsonFacets);
+  //   - percentiles go as local params on stats.field.
+  // Without this a field facet silently fell back to Solr's default of 100
+  // values including zero counts, and pivots and ranges returned nothing.
   const facetParams = {};
+  const jsonFacet = {};
   if (facet) {
     facetParams["facet"] = "true";
+    const mincount = facet.mincount ?? 1;
     if (facet.field) {
-      facetParams["facet.field"] = Array.isArray(facet.field) ? facet.field : [facet.field];
+      const local = [`facet.mincount=${Number(mincount)}`];
+      if (facet.limit !== undefined) local.push(`facet.limit=${Number(facet.limit)}`);
+      if (facet.missing) local.push("facet.missing=true");
+      const fields = Array.isArray(facet.field) ? facet.field : [facet.field];
+      facetParams["facet.field"] = fields.map((f) =>
+        String(f).startsWith("{!") ? String(f) : `{!${local.join(" ")}}${f}`);
     }
-    if (facet.mincount !== undefined) facetParams["facet.mincount"] = String(facet.mincount);
-    if (facet.limit    !== undefined) facetParams["facet.limit"]    = String(facet.limit);
-    if (facet.missing  !== undefined) facetParams["facet.missing"]  = facet.missing ? "true" : "false";
-    // Pivot faceting: facet.pivot=field1,field2 gives nested counts.
-    // Pass a comma-separated string (one pivot) or array of strings (multiple pivots).
+    // Pivot: "field1,field2[,field3]" → nested terms facets.
     if (facet.pivot) {
-      facetParams["facet.pivot"] = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
+      const pivots = Array.isArray(facet.pivot) ? facet.pivot : [facet.pivot];
+      const limit = facet.limit !== undefined ? Number(facet.limit) : 100;
+      const pivotMin = Number(facet.pivot_mincount ?? mincount);
+      pivots.forEach((spec, i) => {
+        const fields = String(spec).split(",").map((f) => f.trim()).filter(Boolean);
+        let node = null;
+        for (const f of fields.reverse()) {
+          node = { type: "terms", field: f, limit, mincount: pivotMin, ...(node && { facet: { pivot: node } }) };
+        }
+        if (node) jsonFacet[`pivot_${i}`] = node;
+      });
     }
-    if (facet.pivot_mincount !== undefined) facetParams["facet.pivot.mincount"] = String(facet.pivot_mincount);
-    // Range faceting: distribute numeric values into fixed-width buckets.
-    // facet.range = { field, start, end, gap, include?, other?, hardend? }
-    // Returns facet_counts.facet_ranges.<field>.counts as [bucket_start, count, ...]
+    // Range: { field, start, end, gap, include?, other?, hardend? }.
     if (facet.range) {
       const ranges = Array.isArray(facet.range) ? facet.range : [facet.range];
-      for (const r of ranges) {
-        if (!r.field) continue;
-        facetParams["facet.range"]            = [...(facetParams["facet.range"] || []), r.field];
-        facetParams[`f.${r.field}.facet.range.start`] = String(r.start ?? 0);
-        facetParams[`f.${r.field}.facet.range.end`]   = String(r.end);
-        facetParams[`f.${r.field}.facet.range.gap`]   = String(r.gap);
-        if (r.include) facetParams[`f.${r.field}.facet.range.include`] = r.include;
-        if (r.other)   facetParams[`f.${r.field}.facet.range.other`]   = r.other;
-        if (r.hardend !== undefined) facetParams[`f.${r.field}.facet.range.hardend`] = r.hardend ? "true" : "false";
-      }
+      ranges.forEach((r, i) => {
+        if (!r?.field) return;
+        jsonFacet[`range_${i}`] = {
+          type: "range", field: r.field, start: r.start ?? 0, end: r.end, gap: r.gap,
+          ...(r.include && { include: r.include }),
+          ...(r.other && { other: r.other }),
+          ...(r.hardend !== undefined && { hardend: !!r.hardend }),
+        };
+      });
     }
+    if (Object.keys(jsonFacet).length) facetParams["json.facet"] = JSON.stringify(jsonFacet);
   }
 
-  // Solr field statistics: min, max, sum, mean, stddev, percentiles, count, missing.
-  // stats = { field: "field_name" } or { field: ["f1","f2"], percentiles: "25,50,75,95" }
   const statsParams = {};
   if (stats) {
     statsParams["stats"] = "true";
     const fields = Array.isArray(stats.field) ? stats.field : [stats.field];
-    statsParams["stats.field"] = fields;
-    if (stats.percentiles) {
-      // Apply percentile config to each field
-      for (const f of fields) {
-        statsParams[`f.${f}.stats.percentiles`] = String(stats.percentiles);
-      }
-    }
+    // Naming percentiles as a local param switches off the default statistics,
+    // so list those explicitly alongside it.
+    const pct = stats.percentiles ? String(stats.percentiles).replace(/[^0-9.,]/g, "") : "";
+    statsParams["stats.field"] = fields.map((f) => (pct
+      ? `{!percentiles="${pct}" min=true max=true sum=true count=true missing=true mean=true stddev=true}${f}`
+      : f));
   }
 
-  return apiGet(site, "/search", {
+  const res = await apiGet(site, "/search", {
     q, fq, fl, rows, start, sort, defType, wt: "json",
     ...facetParams, ...statsParams,
   });
+  return Object.keys(jsonFacet).length ? foldJsonFacets(res, facet, jsonFacet) : res;
+}
+
+// Rewrite a json.facet response (`facets`) into the classic shapes the tool
+// descriptions promise: facet_counts.facet_pivot["a,b"] = [{field, value,
+// count, pivot?}] and facet_counts.facet_ranges[field] = {counts: [start,
+// count, …], gap, start, end, before?, after?, between?}.
+function foldJsonFacets(res, facet, jsonFacet) {
+  const raw = res?.facets;
+  if (!raw || typeof raw !== "object") return res;
+  const fc = (res.facet_counts ??= {});
+  const pivotNode = (def, bucket) => ({
+    field: def.field, value: bucket.val, count: bucket.count,
+    ...(def.facet?.pivot && { pivot: (bucket.pivot?.buckets || []).map((b) => pivotNode(def.facet.pivot, b)) }),
+  });
+  const pivots = Array.isArray(facet.pivot) ? facet.pivot : facet.pivot ? [facet.pivot] : [];
+  pivots.forEach((spec, i) => {
+    const def = jsonFacet[`pivot_${i}`];
+    if (!def) return;
+    (fc.facet_pivot ??= {})[String(spec)] = (raw[`pivot_${i}`]?.buckets || []).map((b) => pivotNode(def, b));
+  });
+  const ranges = Array.isArray(facet.range) ? facet.range : facet.range ? [facet.range] : [];
+  ranges.forEach((r, i) => {
+    const def = jsonFacet[`range_${i}`];
+    const got = raw[`range_${i}`];
+    if (!def || !got) return;
+    (fc.facet_ranges ??= {})[r.field] = {
+      counts: (got.buckets || []).flatMap((b) => [b.val, b.count]),
+      gap: def.gap, start: def.start, end: def.end,
+      ...(got.before && { before: got.before.count }),
+      ...(got.after && { after: got.after.count }),
+      ...(got.between && { between: got.between.count }),
+    };
+  });
+  delete res.facets;
+  return res;
 }
 
 // /suggest wraps the Solr suggestions core. Only q / fq / rows / start are
@@ -1715,7 +1767,34 @@ async function tool_solr_suggest(args, site) {
   if (!term && !q) throw new Error("solr_suggest requires 'term' or 'q'");
   // 'term' = free text, gets the boosts. 'q' = caller-built raw Solr query, verbatim.
   const query = term ? boostedSuggestQuery(term) : q;
-  return suggestFetch(site, { q: query, fq, rows, start });
+  const res = await suggestFetch(site, { q: query, fq, rows, start });
+  return args?.include_taxa ? res : slimSuggestions(res);
+}
+
+// A suggestion lists every genome it occurs in (taxon_id) with a gene count
+// for each (taxon_freq). On a pan-genome site that is two arrays of 100+
+// numbers per suggestion, and a common word returned ~50 kB — more than a
+// client will hand to the model. Keep short lists as they are; replace long
+// ones with the genome count and the five best-represented genomes.
+const SUGGEST_TAXA_INLINE = 8;
+function slimSuggestions(res) {
+  for (const group of res?.grouped?.category?.groups || []) {
+    for (const doc of group.doclist?.docs || []) {
+      delete doc._version_;
+      delete doc.score;
+      const taxa = doc.taxon_id;
+      if (!Array.isArray(taxa) || taxa.length <= SUGGEST_TAXA_INLINE) continue;
+      const freq = Array.isArray(doc.taxon_freq) ? doc.taxon_freq : [];
+      doc.n_genomes = taxa.length;
+      doc.top_genomes = taxa
+        .map((t, i) => ({ taxon_id: t, n_genes: freq[i] ?? null }))
+        .sort((x, y) => (y.n_genes ?? 0) - (x.n_genes ?? 0))
+        .slice(0, 5);
+      delete doc.taxon_id;
+      delete doc.taxon_freq;
+    }
+  }
+  return res;
 }
 
 async function tool_solr_search_bool(args, site) {
@@ -2115,16 +2194,23 @@ async function tool_expand_gene_set(args, site) {
   const res = await searchFetch(site, {
     q, fq, rows, fl: fl || DEFAULT_GENE_FL,
     sort: twoStep ? "gene_idx asc" : "system_name asc",
-    ...(facet_by_genome && { facet: { field: "system_name", limit: -1, mincount: 1 } }),
+    // mincount 0: a genome with no member is the interesting row in a
+    // presence/absence question, so list every genome on the site.
+    ...(facet_by_genome && { facet: { field: "system_name", limit: -1, mincount: 0 } }),
   });
   const ff = res.facet_counts?.facet_fields?.system_name || [];
   const byGenome = [];
   for (let i = 0; i < ff.length; i += 2) byGenome.push({ system_name: ff[i], n_genes: ff[i + 1] });
+  byGenome.sort((x, y) => y.n_genes - x.n_genes || x.system_name.localeCompare(y.system_name));
   return {
     mode, query: q,
     ...(twoStep && { window, seed_field: spec.seed, seeds }),
     n_genes: res.response?.numFound ?? 0,
-    n_genomes: byGenome.length,
+    n_genomes: byGenome.filter((g) => g.n_genes > 0).length,
+    ...(facet_by_genome && {
+      by_genome_note: "Every genome on the site is listed. n_genes 0 means no member there: the gene is absent, " +
+        "was not annotated, the genome is not in the gene trees (maps.in_compara false), or it is outside the genomes filter.",
+    }),
     by_genome: byGenome,
     genes: res.response?.docs || [],
     note: twoStep
@@ -2483,13 +2569,10 @@ async function tool_gene_tree_view(args, site) {
   let geneCount = null;
   let genomes = null;
   try {
-    const r = await apiGet(site, "/search", {
+    const r = await searchFetch(site, {
       q: `${treeField}:${treeId}`,
       rows: 0,
-      facet: true,
-      "facet.field": "system_name",
-      "facet.limit": -1,
-      "facet.mincount": 1,
+      facet: { field: "system_name", limit: -1, mincount: 1 },
     });
     geneCount = r?.response?.numFound ?? null;
     const flat = r?.facet_counts?.facet_fields?.system_name;
@@ -2564,7 +2647,7 @@ const TOOL_REGISTRY = {
     definition: {
       name: "gene_search",
       description: [
-        "Search SorghumBase genes with the SAME filter tree the web UI uses. Start here for",
+        "Search this site's genes with the SAME filter tree the web UI uses. Start here for",
         "anything expressible as a filter; it is the only tool that can run a saved view.",
         "",
         "Routing:",
@@ -2691,7 +2774,7 @@ const TOOL_REGISTRY = {
           genomes: { type: "array", items: { type: "integer" }, maxItems: 300 },
           fl: { type: "string" },
           rows: { type: "integer", minimum: 0, maximum: 200 },
-          facet_by_genome: { type: "boolean", description: "Per-genome counts. Default true." },
+          facet_by_genome: { type: "boolean", description: "Per-genome counts for every genome on the site, including zeros (see by_genome_note). Default true." },
         },
         required: ["gene_ids", "mode"],
       },
@@ -2877,6 +2960,7 @@ const TOOL_REGISTRY = {
           fq:   { type: "array", items: { type: "string" }, description: "Filter query strings (e.g. ['category:Trait Ontology'])." },
           rows: { type: "integer", minimum: 0, maximum: 1000, description: "Max results to return (default 10)." },
           start: { type: "integer", minimum: 0, description: "Offset for pagination." },
+          include_taxa: { type: "boolean", description: "Return each suggestion's full taxon_id / taxon_freq arrays. By default a suggestion found in more than 8 genomes carries n_genomes and top_genomes (the five genomes with most genes) instead." },
         },
       },
     },

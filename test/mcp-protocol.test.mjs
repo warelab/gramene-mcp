@@ -176,6 +176,62 @@ describe("gene_tree_view MCP App", () => {
   });
 });
 
+// ─── Facets, stats and suggestions that the API only half-forwards ───
+// The Gramene API passes facet.field, json.facet and stats.field to Solr and
+// drops the rest, so the server rewrites facet options into those three.
+
+describe("facet and stats translation", () => {
+  it("flat facet honours limit:-1 and mincount", async () => {
+    const all = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: "*:*", rows: 0, facet: { field: "system_name", limit: -1, mincount: 1 } } }));
+    const flat = all.facet_counts.facet_fields.system_name;
+    assert.ok(flat.length / 2 > 100, `Expected more than Solr's default 100 values, got ${flat.length / 2}`);
+    assert.ok(flat.every((v, i) => i % 2 === 0 || v > 0), "mincount:1 must drop zero counts");
+  });
+
+  it("pivot facet returns facet_pivot", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0, facet: { pivot: "gene_tree,system_name" } } }));
+    const [top] = res.facet_counts.facet_pivot["gene_tree,system_name"];
+    assert.equal(top.field, "gene_tree");
+    assert.equal(top.value, REAL.geneTree);
+    assert.ok(top.pivot.length > 1 && top.pivot[0].field === "system_name");
+  });
+
+  it("range facet returns facet_ranges", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0,
+      facet: { range: { field: "start", start: 0, end: 100000000, gap: 50000000, other: "after" } } } }));
+    const r = res.facet_counts.facet_ranges.start;
+    assert.deepEqual(r.counts.filter((_, i) => i % 2 === 0), [0, 50000000]);
+    assert.equal(typeof r.after, "number");
+  });
+
+  it("stats percentiles come back with the default statistics", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "solr_search", arguments: {
+      q: `gene_tree:${REAL.geneTree}`, rows: 0, stats: { field: "start", percentiles: "25,50,75" } } }));
+    const st = res.stats.stats_fields.start;
+    assert.equal(st.percentiles.length, 6);
+    assert.equal(typeof st.mean, "number");
+  });
+
+  it("expand_gene_set lists every genome, zeros included", async () => {
+    const res = toolResult(await rpc("tools/call", { name: "expand_gene_set", arguments: {
+      gene_ids: [REAL.geneId], mode: "orthologs", rows: 0 } }));
+    assert.ok(res.by_genome.length > 100, `Expected every genome, got ${res.by_genome.length}`);
+    assert.equal(res.n_genomes, res.by_genome.filter((g) => g.n_genes > 0).length);
+  });
+
+  it("solr_suggest replaces long genome lists with a summary", async () => {
+    const slim = toolResult(await rpc("tools/call", { name: "solr_suggest", arguments: { term: "lipoxygenase" } }));
+    const docs = slim.grouped.category.groups.flatMap((g) => g.doclist.docs);
+    assert.ok(docs.every((d) => !Array.isArray(d.taxon_id) || d.taxon_id.length <= 8));
+    assert.ok(docs.some((d) => d.n_genomes > 8 && d.top_genomes.length === 5));
+    const full = toolResult(await rpc("tools/call", { name: "solr_suggest", arguments: { term: "lipoxygenase", include_taxa: true } }));
+    assert.ok(full.grouped.category.groups.flatMap((g) => g.doclist.docs).some((d) => d.taxon_id?.length > 8));
+  });
+});
+
 // ─── HTTP edge cases ─────────────────────────────────────────────────
 
 describe("HTTP edge cases", () => {
