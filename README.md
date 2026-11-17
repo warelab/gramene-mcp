@@ -95,9 +95,12 @@ The same `server.mjs` handles both — pass `--stdio` (or set `MCP_STDIO=1`) to 
 
 | Connector | URL |
 |---|---|
+| Gramene v70 | `https://data.gramene.org/mcp/v70` |
 | Gramene v69 | `https://data.gramene.org/mcp/v69` |
 | SorghumBase v11 | `https://data.gramene.org/mcp/sorghum_v11` |
 | Gramene Oryza v9 | `https://data.gramene.org/mcp/oryza_v9` |
+| Gramene Maize v6 | `https://data.gramene.org/mcp/maize_v6` |
+| Gramene Grapevine v5 | `https://data.gramene.org/mcp/grapevine_v5` |
 
 Claude reaches connectors from Anthropic's cloud, so the URL must be publicly reachable over HTTPS; a `127.0.0.1` or firewalled address won't work. Connectors belong to your Claude account, so one added on claude.ai also appears in Claude Desktop. On Team and Enterprise plans an organization owner may need to add them. All sites expose the same tool names, so name connectors clearly and enable only the site a chat needs.
 
